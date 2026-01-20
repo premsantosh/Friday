@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+Jarvis Voice Assistant - Main Entry Point
+
+Usage:
+    python main.py                    # Run with default settings
+    python main.py --debug            # Run with debug output
+    python main.py --keyboard         # Use keyboard activation (no wake word)
+    python main.py --test "Hello"     # Test with text input (no voice)
+
+Environment Variables:
+    ANTHROPIC_API_KEY     - Required for Claude LLM
+    ELEVENLABS_API_KEY    - Required for ElevenLabs TTS
+    PORCUPINE_ACCESS_KEY  - Required for Porcupine wake word (free at picovoice.ai)
+    OPENAI_API_KEY        - Optional, for OpenAI TTS/LLM/Whisper API
+    HASS_URL              - Optional, Home Assistant URL
+    HASS_TOKEN            - Optional, Home Assistant access token
+"""
+
+import argparse
+import os
+import sys
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from config import (
+    AssistantConfig,
+    PersonalityConfig,
+    TTSConfig,
+    STTConfig,
+    LLMConfig,
+    WakeWordConfig,
+    SarcasmLevel,
+    FormalityLevel,
+    WarmthLevel,
+)
+from core import VoiceAssistant, create_assistant
+from workflows import (
+    WorkflowManager,
+    create_default_workflow_manager,
+    HomeAssistantLightsWorkflow,
+    HomeAssistantLockWorkflow,
+    HomeAssistantClimateWorkflow,
+)
+
+
+def check_api_keys():
+    """Check for required API keys and warn if missing."""
+    warnings = []
+    
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        warnings.append("ANTHROPIC_API_KEY not set - Claude LLM won't work")
+    
+    if not os.getenv("ELEVENLABS_API_KEY"):
+        warnings.append("ELEVENLABS_API_KEY not set - will fall back to system TTS")
+    
+    if not os.getenv("PORCUPINE_ACCESS_KEY"):
+        warnings.append("PORCUPINE_ACCESS_KEY not set - wake word detection disabled")
+    
+    if warnings:
+        print("\n⚠️  Configuration Warnings:")
+        for w in warnings:
+            print(f"   • {w}")
+        print()
+    
+    return len(warnings) == 0
+
+
+def create_custom_config(args) -> AssistantConfig:
+    """Create configuration based on command line arguments."""
+    
+    # Determine wake word provider
+    wake_provider = "keyboard" if args.keyboard else "porcupine"
+    
+    # Determine TTS provider
+    tts_provider = "elevenlabs"
+    if not os.getenv("ELEVENLABS_API_KEY"):
+        tts_provider = "system"
+        print("ℹ️  Using system TTS (set ELEVENLABS_API_KEY for better voice)")
+    
+    return AssistantConfig(
+        personality=PersonalityConfig(
+            name="Jarvis",
+            user_title="sir",
+            sarcasm_level=SarcasmLevel.MODERATE,
+            formality_level=FormalityLevel.BUTLER,
+            warmth_level=WarmthLevel.WARM,
+            wit_enabled=True,
+            self_aware_ai_jokes=True,
+            observational_humor=True,
+            use_british_vocabulary=True,
+            use_contractions=False,
+        ),
+        tts=TTSConfig(
+            provider=tts_provider,
+            elevenlabs_voice_id="pNInz6obpgDQGcFmaJgB",  # Adam - British male
+        ),
+        stt=STTConfig(
+            provider="whisper",
+            whisper_model="base",  # Use "small" or "medium" for better accuracy
+        ),
+        llm=LLMConfig(
+            provider="anthropic",
+            anthropic_model="claude-sonnet-4-20250514",
+        ),
+        wake_word=WakeWordConfig(
+            provider=wake_provider,
+            porcupine_keyword="jarvis",
+            porcupine_sensitivity=0.5,
+        ),
+        debug_mode=args.debug,
+    )
+
+
+def create_workflow_manager() -> WorkflowManager:
+    """
+    Create workflow manager with all available integrations.
+    
+    Customize this function to add your own workflows!
+    """
+    manager = create_default_workflow_manager()
+    
+    # Add Home Assistant workflows if configured
+    if os.getenv("HASS_TOKEN"):
+        print("ℹ️  Home Assistant integration enabled")
+        
+        # Replace default light workflow with Home Assistant version
+        manager.unregister("lights")
+        manager.register(HomeAssistantLightsWorkflow())
+        
+        # Add lock and climate control
+        manager.register(HomeAssistantLockWorkflow())
+        manager.register(HomeAssistantClimateWorkflow())
+    
+    return manager
+
+
+def run_text_test(text: str, config: AssistantConfig):
+    """Run a text-based test without voice."""
+    print(f"\n📝 Testing with: \"{text}\"")
+    print("-" * 40)
+    
+    workflow_manager = create_workflow_manager()
+    assistant = VoiceAssistant(config, workflow_manager)
+    
+    response = assistant.run_single_interaction(text)
+    print(f"\n🤖 {config.personality.name}: {response}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Jarvis Voice Assistant",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output",
+    )
+    
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        help="Use keyboard activation instead of wake word",
+    )
+    
+    parser.add_argument(
+        "--test",
+        type=str,
+        metavar="TEXT",
+        help="Test with text input (no voice)",
+    )
+    
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available audio devices and exit",
+    )
+    
+    args = parser.parse_args()
+    
+    # List audio devices
+    if args.list_devices:
+        from utils import list_audio_devices
+        list_audio_devices()
+        return
+    
+    # Check API keys
+    check_api_keys()
+    
+    # Create configuration
+    config = create_custom_config(args)
+    
+    # Text test mode
+    if args.test:
+        run_text_test(args.test, config)
+        return
+    
+    # Create workflow manager
+    workflow_manager = create_workflow_manager()
+    
+    # Create and run assistant
+    assistant = VoiceAssistant(config, workflow_manager)
+    
+    # Optional: Add callbacks for UI integration
+    if args.debug:
+        assistant.on_transcript = lambda t: print(f"📢 You: {t}")
+        assistant.on_response = lambda r: print(f"🤖 Jarvis: {r}")
+        assistant.on_error = lambda e: print(f"❌ Error: {e}")
+    
+    # Run!
+    assistant.run()
+
+
+if __name__ == "__main__":
+    main()
