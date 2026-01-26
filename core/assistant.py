@@ -371,20 +371,24 @@ class VoiceAssistant:
     def update_personality(self, **kwargs):
         """
         Update personality settings on the fly.
-        
+
         Example:
             assistant.update_personality(sarcasm_level=SarcasmLevel.HEAVY)
         """
         from config import PersonalityConfig
-        
+
         for key, value in kwargs.items():
             if hasattr(self.config.personality, key):
                 setattr(self.config.personality, key, value)
-        
+
         # Regenerate LLM prompt
         self.llm.update_personality(self.config.personality)
-        
+
         self._log(f"Personality updated: {kwargs}")
+
+    def clear_history(self):
+        """Clear the conversation history."""
+        self.llm.clear_history()
 
 
 def create_assistant(

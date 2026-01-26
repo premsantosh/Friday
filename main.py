@@ -6,7 +6,8 @@ Usage:
     python main.py                    # Run with default settings
     python main.py --debug            # Run with debug output
     python main.py --keyboard         # Use keyboard activation (no wake word)
-    python main.py --test "Hello"     # Test with text input (no voice)
+    python main.py --chat             # Interactive text mode (no microphone)
+    python main.py --test "Hello"     # Test with single text input (no voice)
 
 Environment Variables:
     ANTHROPIC_API_KEY     - Required for Claude LLM
@@ -140,13 +141,58 @@ def run_text_test(text: str, config: AssistantConfig):
     """Run a text-based test without voice."""
     print(f"\n📝 Testing with: \"{text}\"")
     print("-" * 40)
-    
+
     workflow_manager = create_workflow_manager()
     assistant = VoiceAssistant(config, workflow_manager)
-    
+
     response = assistant.run_single_interaction(text)
     print(f"\n🤖 {config.personality.name}: {response}")
     print()
+
+
+def run_text_chat(config: AssistantConfig):
+    """Run interactive chat mode - type input, voice output."""
+    workflow_manager = create_workflow_manager()
+    assistant = VoiceAssistant(config, workflow_manager)
+
+    name = config.personality.name
+    print(f"\n{'='*50}")
+    print(f"  {name} - Chat Mode")
+    print(f"{'='*50}")
+    print(f"  TTS: {assistant.tts.get_name()}")
+    print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"{'='*50}")
+    print(f"Type your messages below. Commands:")
+    print(f"  'quit' or 'exit' - End the conversation")
+    print(f"  'clear'          - Clear conversation history")
+    print(f"{'='*50}\n")
+
+    while True:
+        try:
+            user_input = input("You: ").strip()
+
+            if not user_input:
+                continue
+
+            if user_input.lower() in ("quit", "exit"):
+                assistant.speak(f"Very good, {config.personality.user_title}. Until next time.")
+                break
+
+            if user_input.lower() == "clear":
+                assistant.clear_history()
+                print("[Conversation history cleared]\n")
+                continue
+
+            response = assistant.run_single_interaction(user_input)
+            assistant.speak(response)
+
+        except KeyboardInterrupt:
+            print()
+            assistant.speak(f"Very good, {config.personality.user_title}. Until next time.")
+            break
+        except EOFError:
+            print()
+            break
 
 
 def main():
@@ -167,12 +213,18 @@ def main():
         action="store_true",
         help="Use keyboard activation instead of wake word",
     )
-    
+
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Interactive text chat mode (no microphone required)",
+    )
+
     parser.add_argument(
         "--test",
         type=str,
         metavar="TEXT",
-        help="Test with text input (no voice)",
+        help="Test with single text input (no voice)",
     )
     
     parser.add_argument(
@@ -199,7 +251,12 @@ def main():
     if args.test:
         run_text_test(args.test, config)
         return
-    
+
+    # Interactive text chat mode
+    if args.chat:
+        run_text_chat(config)
+        return
+
     # Create workflow manager
     workflow_manager = create_workflow_manager()
     
