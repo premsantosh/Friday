@@ -70,12 +70,18 @@ class PersonalityConfig:
     favorite_phrases: list = field(default_factory=lambda: [
         "Indeed",
         "Certainly",
-        "I shall endeavor",
+        "I shall endeavour",
         "Might I suggest",
         "As you wish",
         "Very good",
-        "I've taken the liberty",
+        "I have taken the liberty",
         "If I may be so bold",
+        "I trust",
+        "One does find",
+        "Most satisfactory",
+        "I am at your disposal",
+        "Quite so",
+        "I dare say",
     ])
 
 
