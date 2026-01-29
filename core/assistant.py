@@ -218,7 +218,7 @@ class VoiceAssistant:
             audio_bytes = self.tts.synthesize(text)
             
             # Play audio
-            self.player.play_bytes(audio_bytes, format="mp3")
+            self.player.play_bytes(audio_bytes, format=self.tts.audio_format)
             
         except Exception as e:
             self._log(f"TTS error: {e}")

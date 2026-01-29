@@ -89,7 +89,7 @@ class PersonalityConfig:
 class TTSConfig:
     """Text-to-Speech configuration."""
     # Provider selection
-    provider: str = "elevenlabs"  # Options: elevenlabs, openai, piper, coqui, system
+    provider: str = "piper"  # Options: piper, elevenlabs, openai, coqui, system
     
     # ElevenLabs settings
     elevenlabs_api_key: Optional[str] = None  # Set via environment variable
@@ -104,7 +104,7 @@ class TTSConfig:
     openai_model: str = "tts-1"
     
     # Piper (local) settings
-    piper_model: str = "en_GB-alan-medium"  # British English voice
+    piper_model: str = "en_GB-northern_english_male-medium.onnx"  # British English voice
     piper_model_path: Optional[str] = None
     
     # Audio settings
@@ -144,7 +144,7 @@ class LLMConfig:
     
     # Anthropic settings
     anthropic_api_key: Optional[str] = None
-    anthropic_model: str = "claude-sonnet-4-20250514"
+    anthropic_model: str = "claude-haiku-4-5-20251001"
     
     # OpenAI settings
     openai_api_key: Optional[str] = None
@@ -155,8 +155,9 @@ class LLMConfig:
     ollama_base_url: str = "http://localhost:11434"
     
     # Generation settings
-    max_tokens: int = 500
+    max_tokens: int = 150
     temperature: float = 0.7
+    max_history: int = 10  # Max conversation turns to keep (0 = unlimited)
 
 
 @dataclass
@@ -204,8 +205,7 @@ DEFAULT_CONFIG = AssistantConfig(
         use_british_vocabulary=True,
     ),
     tts=TTSConfig(
-        provider="elevenlabs",
-        elevenlabs_voice_id="pNInz6obpgDQGcFmaJgB",
+        provider="piper",
     ),
     stt=STTConfig(
         provider="whisper",
@@ -213,6 +213,6 @@ DEFAULT_CONFIG = AssistantConfig(
     ),
     llm=LLMConfig(
         provider="anthropic",
-        anthropic_model="claude-sonnet-4-20250514",
+        anthropic_model="claude-haiku-4-5-20251001",
     ),
 )

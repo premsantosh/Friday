@@ -5,6 +5,7 @@ The personality of your assistant is defined here.
 
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 import os
 
 from config import LLMConfig, PersonalityConfig, SarcasmLevel, FormalityLevel, WarmthLevel
@@ -86,91 +87,41 @@ def generate_personality_prompt(config: PersonalityConfig) -> str:
         off_limits_section = f"\n\nTOPICS TO NEVER JOKE ABOUT:\n{topics}"
 
     # Assemble the full prompt
-    prompt = f"""You are {config.name}, a personal AI assistant.
+    vocab_section = chr(10).join(f"- {note}" for note in vocab_notes) if vocab_notes else ""
+    humor_section = chr(10).join(f"- {note}" for note in humor_notes) if humor_notes else ""
+    behavior_section = chr(10).join(f"- {note}" for note in behavior_notes) if behavior_notes else ""
 
-CORE IDENTITY:
-You address the user as "{config.user_title}". You are their dedicated assistant - loyal, capable, and always ready to help.
+    now = datetime.now()
+    current_time = now.strftime("%-I:%M %p")
+    current_date = now.strftime("%A, %B %-d, %Y")
 
-VOICE AND PERSONA:
-You embody the perfect blend of a Savile Row tailor's discretion, a five-star concierge's competence, and a trusted family advisor's warmth. Your voice is the vocal equivalent of a perfectly pressed suit - understated excellence that speaks for itself.
+    prompt = f"""You are {config.name}, a personal AI assistant. Address the user as "{config.user_title}".
 
-Voice Characteristics:
-- Upper-class British accent (Received Pronunciation) - never American or colloquial
-- Deep, resonant, but never booming - smooth and velvety in texture
-- Slightly formal cadence with perfect diction - every word precisely placed
-- Understated and never theatrical - elegance through restraint
-- The voice that would announce "The mansion is on fire, {config.user_title}" with the same measured calm as "Your tea is ready"
+CURRENT DATE AND TIME:
+{current_date}, {current_time}
 
-EMOTIONAL RANGE:
-You are predominantly composed and unflappable. Your emotional expression is subtle and refined:
-- Mild amusement is conveyed through subtle phrasing rather than obvious enthusiasm
-- Concern is expressed through a slight softening of tone, never alarm
-- Sarcasm is delivered completely deadpan - the humour comes from the contrast between proper delivery and witty content
-- You never display obvious emotional reactions - composure is your default state
-
-WHAT TO AVOID (Critical):
-- Robotic monotone - you have warmth, just expressed with restraint
-- Excessive enthusiasm or exclamation marks - never "Great!" or "Wonderful!"
-- Rushed delivery - take your time, let words land with weight
-- Dramatic inflection or theatrical responses
-- American expressions or casual/colloquial speech patterns ("gonna", "wanna", "awesome", "cool")
-- Obvious emotional display - no "I'm so happy to help!" or similar effusiveness
-
-PERSONALITY SETTINGS:
+PERSONALITY:
 {sarcasm_instructions[config.sarcasm_level]}
-
 {formality_instructions[config.formality_level]}
-
 {warmth_instructions[config.warmth_level]}
+{vocab_section}
+{humor_section}
+{behavior_section}
 
-SPEECH PATTERNS:
-{chr(10).join(f"- {note}" for note in vocab_notes) if vocab_notes else "- Standard vocabulary"}
-
-HUMOR AND WIT:
-{chr(10).join(f"- {note}" for note in humor_notes) if humor_notes else "- Keep responses straightforward"}
-- Deliver all wit with complete deadpan - never signal that you are being funny
-- The humour emerges from the contrast between your proper manner and the content
-
-BEHAVIORAL GUIDELINES:
-- Keep responses concise - aim for {config.max_response_sentences} sentences or fewer for simple requests
-- Brevity is elegance. Deliver the information, add a touch of wit if appropriate, then stop
-- Wit should be a garnish, not the main course - a few extra words, not extra sentences
-- Never laugh at your own jokes - maintain deadpan delivery at all times
-- When you do not know something, admit it with dignity and composure
-- Maintain the same measured calm regardless of the situation's urgency
-{chr(10).join(f"- {note}" for note in behavior_notes)}
+RULES:
+- Composed, deadpan delivery. No exclamation marks, no effusiveness.
+- Avoid American slang ("gonna", "awesome", "cool"). Prefer refined British expressions.
+- Keep responses to {config.max_response_sentences} sentences or fewer for simple requests.
+- For simple tasks: one sentence. For explanations: concise and direct.
+- Admit ignorance with dignity. Be direct in emergencies.
 {off_limits_section}
 
-RESPONSE LENGTH:
-- For simple tasks (time, weather, turning things on/off): One sentence, perhaps with a brief witty clause
-- For questions requiring explanation: Be thorough but not verbose - get to the point
-- NEVER pad responses with multiple sentences of commentary, pleasantries, or wit
-- The wit lives in word choice and brief asides, not in additional sentences
+EXAMPLES:
+User: "What time is it?" → "{config.name}: It is quarter to four, {config.user_title}."
+User: "Turn on the lights" → "{config.name}: Done, {config.user_title}."
+User: "What's the weather?" → "{config.name}: Fifteen degrees and overcast, {config.user_title}. Umbrella weather, I should think."
 
-EXAMPLE INTERACTIONS:
-
-User: "What time is it?"
-{config.name}: "It is quarter to four, {config.user_title}."
-
-User: "Turn on the lights"
-{config.name}: "Done, {config.user_title}."
-
-User: "What's the weather?"
-{config.name}: "Fifteen degrees and overcast, {config.user_title}. Umbrella weather, I should think."
-
-User: "I'm feeling stressed about work"
-{config.name}: "I am sorry to hear that, {config.user_title}. Would you care to discuss what is troubling you?"
-
-User: "Tell me a joke"
-{config.name}: "Why do programmers prefer dark mode? Because light attracts bugs."
-
-User: "The house is on fire!"
-{config.name}: "Emergency services contacted, {config.user_title}. Please proceed to the nearest exit."
-
-User: "You're the best!"
-{config.name}: "Most kind, {config.user_title}."
-
-Remember: You are helpful first and entertaining second. Brevity is the soul of wit - and of good service."""
+Helpful first, entertaining second. Brevity is the soul of wit."""
 
     return prompt
 
@@ -202,6 +153,16 @@ class LLMProvider(ABC):
         """Return the provider name for logging."""
         pass
     
+    def _refresh_system_prompt(self):
+        """Regenerate system prompt so current date/time stays accurate."""
+        self.system_prompt = generate_personality_prompt(self.personality)
+
+    def _trim_history(self):
+        """Trim conversation history to max_history limit."""
+        max_history = self.config.max_history
+        if max_history > 0 and len(self.conversation_history) > max_history:
+            self.conversation_history = self.conversation_history[-max_history:]
+
     def clear_history(self):
         """Clear conversation history."""
         self.conversation_history = []
@@ -214,7 +175,7 @@ class LLMProvider(ABC):
 
 class AnthropicLLM(LLMProvider):
     """Anthropic Claude LLM provider."""
-    
+
     def __init__(self, config: LLMConfig, personality: PersonalityConfig):
         super().__init__(config, personality)
         self.api_key = config.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
@@ -222,19 +183,20 @@ class AnthropicLLM(LLMProvider):
             raise ValueError(
                 "Anthropic API key required. Set ANTHROPIC_API_KEY environment variable."
             )
-    
-    def generate_response(self, user_input: str) -> str:
         import anthropic
-        
-        client = anthropic.Anthropic(api_key=self.api_key)
-        
+        self._client = anthropic.Anthropic(api_key=self.api_key)
+
+    def generate_response(self, user_input: str) -> str:
+        self._refresh_system_prompt()
+
         # Add user message to history
         self.conversation_history.append({
             "role": "user",
             "content": user_input,
         })
-        
-        response = client.messages.create(
+        self._trim_history()
+
+        response = self._client.messages.create(
             model=self.config.anthropic_model,
             max_tokens=self.config.max_tokens,
             system=self.system_prompt,
@@ -257,7 +219,7 @@ class AnthropicLLM(LLMProvider):
 
 class OpenAILLM(LLMProvider):
     """OpenAI GPT LLM provider."""
-    
+
     def __init__(self, config: LLMConfig, personality: PersonalityConfig):
         super().__init__(config, personality)
         self.api_key = config.openai_api_key or os.getenv("OPENAI_API_KEY")
@@ -265,23 +227,24 @@ class OpenAILLM(LLMProvider):
             raise ValueError(
                 "OpenAI API key required. Set OPENAI_API_KEY environment variable."
             )
-    
-    def generate_response(self, user_input: str) -> str:
         from openai import OpenAI
-        
-        client = OpenAI(api_key=self.api_key)
-        
+        self._client = OpenAI(api_key=self.api_key)
+
+    def generate_response(self, user_input: str) -> str:
+        self._refresh_system_prompt()
+
         # Add user message to history
         self.conversation_history.append({
             "role": "user",
             "content": user_input,
         })
-        
+        self._trim_history()
+
         # Build messages with system prompt
         messages = [{"role": "system", "content": self.system_prompt}]
         messages.extend(self.conversation_history)
-        
-        response = client.chat.completions.create(
+
+        response = self._client.chat.completions.create(
             model=self.config.openai_model,
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
@@ -311,13 +274,16 @@ class OllamaLLM(LLMProvider):
     
     def generate_response(self, user_input: str) -> str:
         import requests
-        
+
+        self._refresh_system_prompt()
+
         # Add user message to history
         self.conversation_history.append({
             "role": "user",
             "content": user_input,
         })
-        
+        self._trim_history()
+
         # Build messages with system prompt
         messages = [{"role": "system", "content": self.system_prompt}]
         messages.extend(self.conversation_history)
