@@ -54,7 +54,7 @@ def check_api_keys():
         warnings.append("ANTHROPIC_API_KEY not set - Claude LLM won't work")
     
     if not os.getenv("ELEVENLABS_API_KEY"):
-        warnings.append("ELEVENLABS_API_KEY not set - will fall back to system TTS")
+        warnings.append("ELEVENLABS_API_KEY not set - ElevenLabs TTS unavailable (using Piper by default)")
     
     if not os.getenv("PORCUPINE_ACCESS_KEY"):
         warnings.append("PORCUPINE_ACCESS_KEY not set - wake word detection disabled")
@@ -74,11 +74,9 @@ def create_custom_config(args) -> AssistantConfig:
     # Determine wake word provider
     wake_provider = "keyboard" if args.keyboard else "porcupine"
     
-    # Determine TTS provider
-    tts_provider = "elevenlabs"
-    if not os.getenv("ELEVENLABS_API_KEY"):
-        tts_provider = "system"
-        print("ℹ️  Using system TTS (set ELEVENLABS_API_KEY for better voice)")
+    # Determine TTS provider - default to piper (local, fast)
+    # Switch to "elevenlabs" or "openai" here for cloud TTS
+    tts_provider = "piper"
     
     return AssistantConfig(
         personality=PersonalityConfig(
@@ -95,7 +93,6 @@ def create_custom_config(args) -> AssistantConfig:
         ),
         tts=TTSConfig(
             provider=tts_provider,
-            elevenlabs_voice_id="pNInz6obpgDQGcFmaJgB",  # Adam - British male
         ),
         stt=STTConfig(
             provider="whisper",
@@ -103,7 +100,7 @@ def create_custom_config(args) -> AssistantConfig:
         ),
         llm=LLMConfig(
             provider="anthropic",
-            anthropic_model="claude-sonnet-4-20250514",
+            anthropic_model="claude-haiku-4-5-20251001",
         ),
         wake_word=WakeWordConfig(
             provider=wake_provider,

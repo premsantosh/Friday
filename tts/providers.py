@@ -14,20 +14,25 @@ from config import TTSConfig
 
 class TTSProvider(ABC):
     """Base class for all TTS providers. Implement this to add new TTS services."""
-    
+
+    @property
+    def audio_format(self) -> str:
+        """Return the audio format produced by this provider (e.g. 'mp3', 'wav')."""
+        return "wav"
+
     @abstractmethod
     def synthesize(self, text: str) -> bytes:
         """
         Convert text to speech audio.
-        
+
         Args:
             text: The text to synthesize
-            
+
         Returns:
             Audio data as bytes (format depends on provider config)
         """
         pass
-    
+
     @abstractmethod
     def get_name(self) -> str:
         """Return the provider name for logging."""
@@ -36,7 +41,11 @@ class TTSProvider(ABC):
 
 class ElevenLabsTTS(TTSProvider):
     """ElevenLabs TTS provider - high quality, requires API key."""
-    
+
+    @property
+    def audio_format(self) -> str:
+        return "mp3"
+
     def __init__(self, config: TTSConfig):
         self.config = config
         self.api_key = config.elevenlabs_api_key or os.getenv("ELEVENLABS_API_KEY")
@@ -77,7 +86,11 @@ class ElevenLabsTTS(TTSProvider):
 
 class OpenAITTS(TTSProvider):
     """OpenAI TTS provider."""
-    
+
+    @property
+    def audio_format(self) -> str:
+        return "mp3"
+
     def __init__(self, config: TTSConfig):
         self.config = config
         self.api_key = config.openai_api_key or os.getenv("OPENAI_API_KEY")
