@@ -21,6 +21,12 @@ from .home_assistant import (
     HomeAssistantClimateWorkflow,
 )
 
+from .philips_hue import (
+    PhilipsHueConfig,
+    PhilipsHueClient,
+    PhilipsHueLightsWorkflow,
+)
+
 __all__ = [
     # Base classes
     "Workflow",
@@ -44,4 +50,9 @@ __all__ = [
     "HomeAssistantLightsWorkflow",
     "HomeAssistantLockWorkflow",
     "HomeAssistantClimateWorkflow",
+
+    # Philips Hue
+    "PhilipsHueConfig",
+    "PhilipsHueClient",
+    "PhilipsHueLightsWorkflow",
 ]
