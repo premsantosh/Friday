@@ -124,83 +124,6 @@ Example commands:
 # EXAMPLE WORKFLOWS - Use these as templates for your own
 # =============================================================================
 
-class LightsWorkflow(Workflow):
-    """Control smart lights. Template for smart home integration."""
-    
-    def __init__(self, light_controller=None):
-        """
-        Args:
-            light_controller: Your light control implementation
-                              (e.g., Philips Hue, Home Assistant client)
-        """
-        self.controller = light_controller
-    
-    @property
-    def name(self) -> str:
-        return "lights"
-    
-    @property
-    def description(self) -> str:
-        return "Control smart lights - turn on/off, dim, change colors"
-    
-    @property
-    def trigger(self) -> WorkflowTrigger:
-        return WorkflowTrigger(
-            keywords=["light", "lights", "lamp", "illuminate", "bright", "dim"],
-            patterns=[
-                r"turn (on|off) .*(light|lamp)",
-                r"(light|lamp).* (on|off)",
-                r"dim .*(light|lamp)",
-                r"set .*(light|lamp).* to",
-                r"(bright|dark)en",
-            ],
-            examples=[
-                "Turn on the living room lights",
-                "Dim the bedroom lights to 50%",
-                "Turn off all the lights",
-                "Set the kitchen lights to warm white",
-            ]
-        )
-    
-    async def execute(self, intent: str, entities: Dict[str, Any]) -> WorkflowResult:
-        # Extract what action to take
-        action = entities.get("action", "toggle")  # on, off, dim, toggle
-        room = entities.get("room", "all")
-        brightness = entities.get("brightness", None)
-        
-        if self.controller is None:
-            return WorkflowResult(
-                status=WorkflowStatus.FAILURE,
-                message="I'm afraid the light control system is not configured yet, sir.",
-                error="No light controller configured"
-            )
-        
-        try:
-            # This is where you'd call your actual light controller
-            # await self.controller.set_lights(room, action, brightness)
-            
-            if action == "on":
-                message = f"I've illuminated the {room}, sir."
-            elif action == "off":
-                message = f"The {room} is now appropriately dark, sir."
-            elif brightness is not None:
-                message = f"I've adjusted the {room} lights to {brightness}%, sir."
-            else:
-                message = f"The lights have been adjusted, sir."
-            
-            return WorkflowResult(
-                status=WorkflowStatus.SUCCESS,
-                message=message,
-                data={"room": room, "action": action, "brightness": brightness}
-            )
-        except Exception as e:
-            return WorkflowResult(
-                status=WorkflowStatus.FAILURE,
-                message=f"I encountered some difficulty with the lights, sir. {str(e)}",
-                error=str(e)
-            )
-
-
 class DoorbellWorkflow(Workflow):
     """Handle doorbell events and door lock control."""
     
@@ -540,11 +463,17 @@ class WorkflowManager:
         return self.workflows.get(name)
     
     def find_matching_workflow(self, text: str) -> Optional[Workflow]:
-        """Find a workflow that matches the given text."""
+        """Find a workflow that matches the given text.
+
+        When multiple workflows match, prefer the one registered later since
+        real integrations (Philips Hue, Home Assistant) are registered after
+        the default template workflows and should take priority.
+        """
+        matched = None
         for workflow in self.workflows.values():
             if workflow.matches(text):
-                return workflow
-        return None
+                matched = workflow
+        return matched
     
     def get_all_context_for_llm(self) -> str:
         """Get context about all workflows for the LLM."""
@@ -565,14 +494,17 @@ def create_default_workflow_manager() -> WorkflowManager:
     Modify this to add your actual smart home integrations.
     """
     manager = WorkflowManager()
-    
+
     # Register example workflows (without actual controllers)
     # Replace None with your actual controller implementations
-    manager.register(LightsWorkflow(light_controller=None))
     manager.register(DoorbellWorkflow(doorbell_controller=None, lock_controller=None))
     manager.register(ThermostatWorkflow(thermostat_controller=None))
-    manager.register(MediaWorkflow(media_controller=None))
     manager.register(WeatherWorkflow())
     manager.register(TimerWorkflow())
-    
+
+    # NOTE: MediaWorkflow is not registered by default because its trigger
+    # keywords ("movie", "play", "pause") overlap heavily with other workflows
+    # (e.g. Philips Hue mood "movie night"). Register it explicitly when you
+    # have a real media controller configured.
+
     return manager

@@ -42,7 +42,6 @@ from core import VoiceAssistant, create_assistant
 from workflows import (
     WorkflowManager,
     create_default_workflow_manager,
-    HomeAssistantLightsWorkflow,
     HomeAssistantLockWorkflow,
     HomeAssistantClimateWorkflow,
     PhilipsHueLightsWorkflow,
@@ -128,21 +127,11 @@ def create_workflow_manager() -> WorkflowManager:
     # Add Philips Hue workflow if configured
     if os.getenv("HUE_BRIDGE_IP"):
         print("ℹ️  Philips Hue integration enabled")
-        manager.unregister("lights")
         manager.register(PhilipsHueLightsWorkflow())
 
     # Add Home Assistant workflows if configured
     if os.getenv("HASS_TOKEN"):
         print("ℹ️  Home Assistant integration enabled")
-
-        # Replace default light workflow with Home Assistant version
-        if "hue_lights" in manager.workflows:
-            manager.unregister("hue_lights")
-        elif "lights" in manager.workflows:
-            manager.unregister("lights")
-        manager.register(HomeAssistantLightsWorkflow())
-
-        # Add lock and climate control
         manager.register(HomeAssistantLockWorkflow())
         manager.register(HomeAssistantClimateWorkflow())
 

@@ -170,6 +170,10 @@ class VoiceAssistant:
             entities["action"] = "on"
         elif any(word in text_lower for word in ["turn off", "switch off", "disable"]):
             entities["action"] = "off"
+        elif any(word in text_lower for word in ["increase", "raise", "brighten", "brighter", "more bright", "turn up", "bump up"]):
+            entities["action"] = "on"
+        elif any(word in text_lower for word in ["decrease", "lower", "darken", "darker", "less bright", "turn down"]):
+            entities["action"] = "dim"
         elif "dim" in text_lower:
             entities["action"] = "dim"
         elif "lock" in text_lower and "unlock" not in text_lower:

@@ -338,8 +338,9 @@ class PhilipsHueLightsWorkflow(Workflow):
                     state["dimming"] = {"brightness": self._pct_to_bri(brightness)}
             elif action == "off":
                 state = {"on": {"on": False}}
-            elif action == "dim" and brightness is not None:
-                state = {"on": {"on": True}, "dimming": {"brightness": self._pct_to_bri(brightness)}}
+            elif action == "dim":
+                bri = self._pct_to_bri(brightness) if brightness is not None else 30.0
+                state = {"on": {"on": True}, "dimming": {"brightness": bri}}
             else:
                 # Toggle: send on=True as a reasonable default
                 state = {"on": {"on": True}}
