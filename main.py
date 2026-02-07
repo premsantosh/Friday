@@ -17,8 +17,7 @@ Environment Variables:
     HASS_URL              - Optional, Home Assistant URL
     HASS_TOKEN            - Optional, Home Assistant access token
     HUE_BRIDGE_IP         - Optional, Philips Hue Bridge IP address
-    HUE_BRIDGE_PORT       - Optional, Philips Hue Bridge port (default: 443)
-    HUE_USERNAME          - Optional, Philips Hue API username
+    HUE_APPLICATION_KEY   - Optional, Philips Hue API application key
 """
 
 import argparse
@@ -63,8 +62,8 @@ def check_api_keys():
     if not os.getenv("PORCUPINE_ACCESS_KEY"):
         warnings.append("PORCUPINE_ACCESS_KEY not set - wake word detection disabled")
 
-    if os.getenv("HUE_BRIDGE_IP") and not os.getenv("HUE_USERNAME"):
-        warnings.append("HUE_BRIDGE_IP is set but HUE_USERNAME is missing - Philips Hue integration won't work")
+    if os.getenv("HUE_BRIDGE_IP") and not (os.getenv("HUE_APPLICATION_KEY") or os.getenv("HUE_USERNAME")):
+        warnings.append("HUE_BRIDGE_IP is set but HUE_APPLICATION_KEY is missing - Philips Hue integration won't work")
 
     if warnings:
         print("\n⚠️  Configuration Warnings:")

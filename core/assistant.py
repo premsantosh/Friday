@@ -199,7 +199,7 @@ class VoiceAssistant:
             "relax": ["relax", "relaxing", "chill", "calm", "unwind", "wind down", "peaceful"],
             "energize": ["energize", "energetic", "energy", "pump up", "motivated", "productive"],
             "party": ["party", "dance", "celebrate", "celebration", "fiesta"],
-            "bedtime": ["bed", "sleep", "bedtime", "good night", "goodnight", "going to bed", "sleepy", "night night"],
+            "bedtime": ["bedtime", "good night", "goodnight", "going to bed", "sleepy", "night night", "time for bed"],
             "focus": ["focus", "concentrate", "study", "reading", "work mode"],
             "movie": ["movie", "cinema", "film", "movie night", "watching"],
             "morning": ["morning", "wake up", "sunrise", "good morning"],

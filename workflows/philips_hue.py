@@ -1,18 +1,17 @@
 """
-Philips Hue Integration
+Philips Hue Integration (API v2 / CLIP v2)
 
 This module provides integration with Philips Hue Bridge for controlling
-smart lights directly via the Hue REST API.
+smart lights directly via the Hue CLIP v2 REST API.
 
 Prerequisites:
 - Philips Hue Bridge accessible on the network
-- API username (press the bridge button and create one via the API)
+- Application key (press the bridge button and create one via the API)
 - pip install aiohttp
 
 Configuration:
 - Set HUE_BRIDGE_IP environment variable (e.g., 10.0.0.242)
-- Set HUE_BRIDGE_PORT environment variable (default: 443)
-- Set HUE_USERNAME environment variable (your API username)
+- Set HUE_APPLICATION_KEY environment variable (your API application key)
 """
 
 import os
@@ -30,144 +29,207 @@ logger = logging.getLogger(__name__)
 class PhilipsHueConfig:
     """Configuration for Philips Hue Bridge connection."""
     bridge_ip: str = ""
-    bridge_port: int = 443
-    username: str = ""
+    application_key: str = ""
 
     @classmethod
     def from_env(cls) -> "PhilipsHueConfig":
         return cls(
             bridge_ip=os.getenv("HUE_BRIDGE_IP", ""),
-            bridge_port=int(os.getenv("HUE_BRIDGE_PORT", "443")),
-            username=os.getenv("HUE_USERNAME", ""),
+            application_key=os.getenv("HUE_APPLICATION_KEY", os.getenv("HUE_USERNAME", "")),
         )
 
 
 class PhilipsHueClient:
     """
-    Async REST client for the Philips Hue Bridge.
+    Async REST client for the Philips Hue Bridge (API v2 / CLIP v2).
 
     Uses HTTPS with SSL verification disabled (Hue Bridge uses a self-signed cert).
+    Authentication is via the `hue-application-key` header.
     """
 
     def __init__(self, config: PhilipsHueConfig):
         self.config = config
-        self.base_url = f"https://{config.bridge_ip}:{config.bridge_port}/api/{config.username}"
+        self.base_url = f"https://{config.bridge_ip}/clip/v2/resource"
         self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self._ssl_context.check_hostname = False
         self._ssl_context.verify_mode = ssl.CERT_NONE
+        self._headers = {"hue-application-key": config.application_key}
         # Name-to-ID lookup maps populated by discover()
         self._light_names: Dict[str, str] = {}
-        self._group_names: Dict[str, str] = {}
+        self._group_names: Dict[str, str] = {}  # room name -> grouped_light ID
+        self._all_lights_group_id: Optional[str] = None  # bridge_home grouped_light
         self._discovered = False
 
     async def discover(self):
-        """Fetch all lights and groups, building name-to-ID lookup maps."""
+        """Fetch all lights, rooms, and grouped_lights, building name-to-ID lookup maps."""
         lights = await self.get_lights()
-        groups = await self.get_groups()
+        rooms = await self.get_rooms()
+        grouped_lights = await self.get_grouped_lights()
 
-        self._light_names = {
-            info.get("name", "").lower(): lid
-            for lid, info in lights.items()
-        }
-        self._group_names = {
-            info.get("name", "").lower(): gid
-            for gid, info in groups.items()
-        }
+        # Build light name -> light resource ID
+        self._light_names = {}
+        for light in lights:
+            name = light.get("metadata", {}).get("name", "")
+            if name:
+                self._light_names[name.lower()] = light["id"]
+
+        # Build a service rid -> grouped_light ID lookup
+        gl_by_id = {gl["id"]: gl for gl in grouped_lights}
+
+        # Build room name -> grouped_light ID
+        self._group_names = {}
+        for room in rooms:
+            room_name = room.get("metadata", {}).get("name", "")
+            if not room_name:
+                continue
+            # Each room has services; find the grouped_light service
+            for svc in room.get("services", []):
+                if svc.get("rtype") == "grouped_light" and svc.get("rid") in gl_by_id:
+                    self._group_names[room_name.lower()] = svc["rid"]
+                    break
+
+        # Find the bridge_home grouped_light for "all lights" control
+        bridge_homes = await self._get_resource("bridge_home")
+        for bh in bridge_homes:
+            for svc in bh.get("services", []):
+                if svc.get("rtype") == "grouped_light":
+                    self._all_lights_group_id = svc["rid"]
+                    break
+            if self._all_lights_group_id:
+                break
+
         self._discovered = True
         logger.info(
-            "Hue discovery complete: %d lights, %d groups",
+            "Hue discovery complete: %d lights, %d rooms",
             len(self._light_names),
             len(self._group_names),
         )
 
-    async def get_lights(self) -> Dict[str, Any]:
-        """GET /lights — returns all lights keyed by ID."""
+    async def _get_resource(self, resource_type: str) -> List[Dict[str, Any]]:
+        """GET /clip/v2/resource/{type} — returns the data array."""
         import aiohttp
 
-        url = f"{self.base_url}/lights"
-        async with aiohttp.ClientSession() as session:
+        url = f"{self.base_url}/{resource_type}"
+        async with aiohttp.ClientSession(headers=self._headers) as session:
             async with session.get(url, ssl=self._ssl_context) as resp:
-                data = await resp.json()
-                self._check_hue_errors(data)
-                return data
+                result = await resp.json(content_type=None)
+                self._check_hue_errors(result)
+                return result.get("data", [])
 
-    async def get_groups(self) -> Dict[str, Any]:
-        """GET /groups — returns all groups/rooms keyed by ID."""
-        import aiohttp
+    async def get_lights(self) -> List[Dict[str, Any]]:
+        """GET /clip/v2/resource/light — returns all light resources."""
+        return await self._get_resource("light")
 
-        url = f"{self.base_url}/groups"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, ssl=self._ssl_context) as resp:
-                data = await resp.json()
-                self._check_hue_errors(data)
-                return data
+    async def get_rooms(self) -> List[Dict[str, Any]]:
+        """GET /clip/v2/resource/room — returns all room resources."""
+        return await self._get_resource("room")
+
+    async def get_grouped_lights(self) -> List[Dict[str, Any]]:
+        """GET /clip/v2/resource/grouped_light — returns all grouped_light resources."""
+        return await self._get_resource("grouped_light")
 
     async def set_light_state(self, light_id: str, state: Dict[str, Any]) -> List[Dict]:
-        """PUT /lights/{id}/state — set state for a single light."""
+        """PUT /clip/v2/resource/light/{id} — set state for a single light."""
         import aiohttp
 
-        url = f"{self.base_url}/lights/{light_id}/state"
-        async with aiohttp.ClientSession() as session:
+        url = f"{self.base_url}/light/{light_id}"
+        logger.debug("PUT %s body=%s", url, state)
+        async with aiohttp.ClientSession(headers=self._headers) as session:
             async with session.put(url, json=state, ssl=self._ssl_context) as resp:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
+                logger.debug("Hue response: %s", data)
                 self._check_hue_errors(data)
-                return data
+                return data.get("data", [])
 
-    async def set_group_action(self, group_id: str, action: Dict[str, Any]) -> List[Dict]:
-        """PUT /groups/{id}/action — set action for a group/room."""
+    async def set_group_action(self, grouped_light_id: str, action: Dict[str, Any]) -> List[Dict]:
+        """PUT /clip/v2/resource/grouped_light/{id} — set action for a grouped light."""
         import aiohttp
 
-        url = f"{self.base_url}/groups/{group_id}/action"
-        async with aiohttp.ClientSession() as session:
+        url = f"{self.base_url}/grouped_light/{grouped_light_id}"
+        logger.debug("PUT %s body=%s", url, action)
+        async with aiohttp.ClientSession(headers=self._headers) as session:
             async with session.put(url, json=action, ssl=self._ssl_context) as resp:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
+                logger.debug("Hue response: %s", data)
                 self._check_hue_errors(data)
-                return data
+                return data.get("data", [])
 
     def find_light_id(self, name: str) -> Optional[str]:
         """Case-insensitive light name lookup."""
         return self._light_names.get(name.lower())
 
     def find_group_id(self, name: str) -> Optional[str]:
-        """Case-insensitive group/room name lookup."""
+        """Case-insensitive room name lookup, returns the grouped_light ID."""
         return self._group_names.get(name.lower())
 
     @staticmethod
     def _check_hue_errors(data: Any):
         """
-        Hue API returns HTTP 200 even for errors. The response is a list
-        containing dicts with an 'error' key when something goes wrong.
+        Hue API v2 returns errors in an `errors` array within the response.
         """
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and "error" in item:
-                    err = item["error"]
-                    raise RuntimeError(
-                        f"Hue API error {err.get('type', '?')}: {err.get('description', 'unknown')}"
-                    )
+        if not isinstance(data, dict):
+            return
+        errors = data.get("errors", [])
+        if errors:
+            descriptions = "; ".join(
+                e.get("description", "unknown error") for e in errors
+            )
+            raise RuntimeError(f"Hue API error: {descriptions}")
 
 
 class PhilipsHueLightsWorkflow(Workflow):
     """
-    Control lights through a Philips Hue Bridge.
+    Control lights through a Philips Hue Bridge (API v2).
 
     Prefers group (room) control and falls back to individual light lookup.
-    Group "0" is the special Hue group representing all lights.
+    Uses bridge_home grouped_light for "all lights" control.
     Supports mood-based lighting scenes.
     """
 
-    # Mood-to-Hue-state mappings.
-    # bri: 0-254, ct: color temp in mireds (153=cool daylight, 500=warm candlelight),
-    # hue: 0-65535, sat: 0-254
+    # Mood-to-Hue-state mappings (API v2 format).
+    # brightness: 0.0-100.0, mirek: color temp in mirek (153=cool daylight, 500=warm candlelight)
+    # color: xy color space
     MOODS: Dict[str, Dict[str, Any]] = {
-        "romantic": {"on": True, "bri": 77, "ct": 500},            # dim, warm candlelight
-        "relax": {"on": True, "bri": 127, "ct": 447},              # medium-low, warm
-        "energize": {"on": True, "bri": 254, "ct": 250},           # full bright, cool white
-        "party": {"on": True, "bri": 254, "sat": 254, "hue": 47000},  # bright, vibrant color
-        "bedtime": {"on": True, "bri": 25, "ct": 500},             # very dim, warmest
-        "focus": {"on": True, "bri": 254, "ct": 300},              # bright, neutral white
-        "movie": {"on": True, "bri": 38, "ct": 400},               # low, warm-ish
-        "morning": {"on": True, "bri": 200, "ct": 350},            # bright-ish, neutral warm
+        "romantic": {
+            "on": {"on": True},
+            "dimming": {"brightness": 30.3},
+            "color_temperature": {"mirek": 500},
+        },
+        "relax": {
+            "on": {"on": True},
+            "dimming": {"brightness": 50.0},
+            "color_temperature": {"mirek": 447},
+        },
+        "energize": {
+            "on": {"on": True},
+            "dimming": {"brightness": 100.0},
+            "color_temperature": {"mirek": 250},
+        },
+        "party": {
+            "on": {"on": True},
+            "dimming": {"brightness": 100.0},
+            "color": {"xy": {"x": 0.1532, "y": 0.0475}},
+        },
+        "bedtime": {
+            "on": {"on": True},
+            "dimming": {"brightness": 9.8},
+            "color_temperature": {"mirek": 500},
+        },
+        "focus": {
+            "on": {"on": True},
+            "dimming": {"brightness": 100.0},
+            "color_temperature": {"mirek": 300},
+        },
+        "movie": {
+            "on": {"on": True},
+            "dimming": {"brightness": 15.0},
+            "color_temperature": {"mirek": 400},
+        },
+        "morning": {
+            "on": {"on": True},
+            "dimming": {"brightness": 78.7},
+            "color_temperature": {"mirek": 350},
+        },
     }
 
     MOOD_RESPONSES: Dict[str, str] = {
@@ -187,7 +249,7 @@ class PhilipsHueLightsWorkflow(Workflow):
     def _create_default_client(self) -> Optional[PhilipsHueClient]:
         """Create client from environment variables."""
         config = PhilipsHueConfig.from_env()
-        if config.bridge_ip and config.username:
+        if config.bridge_ip and config.application_key:
             return PhilipsHueClient(config)
         return None
 
@@ -239,7 +301,7 @@ class PhilipsHueLightsWorkflow(Workflow):
         if self.client is None:
             return WorkflowResult(
                 status=WorkflowStatus.FAILURE,
-                message="Philips Hue is not configured. Please set HUE_BRIDGE_IP and HUE_USERNAME environment variables.",
+                message="Philips Hue is not configured. Please set HUE_BRIDGE_IP and HUE_APPLICATION_KEY environment variables.",
                 error="No Hue client",
             )
 
@@ -260,7 +322,7 @@ class PhilipsHueLightsWorkflow(Workflow):
         mood = entities.get("mood")
 
         try:
-            # Build the state/action payload
+            # Build the state/action payload (API v2 nested format)
             if action == "mood" and mood:
                 state = self.MOODS.get(mood)
                 if state is None:
@@ -271,22 +333,27 @@ class PhilipsHueLightsWorkflow(Workflow):
                     )
                 state = dict(state)  # copy so we don't mutate the class-level dict
             elif action == "on":
-                state = {"on": True}
+                state: Dict[str, Any] = {"on": {"on": True}}
                 if brightness is not None:
-                    state["bri"] = self._pct_to_bri(brightness)
+                    state["dimming"] = {"brightness": self._pct_to_bri(brightness)}
             elif action == "off":
-                state = {"on": False}
+                state = {"on": {"on": False}}
             elif action == "dim" and brightness is not None:
-                state = {"on": True, "bri": self._pct_to_bri(brightness)}
+                state = {"on": {"on": True}, "dimming": {"brightness": self._pct_to_bri(brightness)}}
             else:
-                # Toggle: Hue doesn't have a native toggle on groups, but we
-                # can send on=True as a reasonable default for "toggle"
-                state = {"on": True}
+                # Toggle: send on=True as a reasonable default
+                state = {"on": {"on": True}}
 
             # Determine target: prefer group (room), fallback to individual light
-            # Mood commands with no room specified target all lights
             if room in ("all", "everywhere", "everything", "every room"):
-                await self.client.set_group_action("0", state)
+                if self.client._all_lights_group_id:
+                    await self.client.set_group_action(self.client._all_lights_group_id, state)
+                else:
+                    return WorkflowResult(
+                        status=WorkflowStatus.FAILURE,
+                        message="I could not find the bridge home group for all lights, sir.",
+                        error="No bridge_home grouped_light found",
+                    )
             else:
                 group_id = self.client.find_group_id(room)
                 if group_id is not None:
@@ -322,9 +389,9 @@ class PhilipsHueLightsWorkflow(Workflow):
             )
 
     @staticmethod
-    def _pct_to_bri(pct: int) -> int:
-        """Convert brightness 0-100% to Hue's 0-254 scale."""
-        return max(0, min(254, round(pct * 254 / 100)))
+    def _pct_to_bri(pct: int) -> float:
+        """Convert brightness 0-100% to Hue API v2's 0.0-100.0 scale."""
+        return max(0.0, min(100.0, float(pct)))
 
     @staticmethod
     def _build_response(action: str, room: str, brightness: Optional[int]) -> str:
