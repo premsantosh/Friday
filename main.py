@@ -16,6 +16,8 @@ Environment Variables:
     OPENAI_API_KEY        - Optional, for OpenAI TTS/LLM/Whisper API
     HASS_URL              - Optional, Home Assistant URL
     HASS_TOKEN            - Optional, Home Assistant access token
+    HUE_BRIDGE_IP         - Optional, Philips Hue Bridge IP address
+    HUE_APPLICATION_KEY   - Optional, Philips Hue API application key
 """
 
 import argparse
@@ -40,9 +42,9 @@ from core import VoiceAssistant, create_assistant
 from workflows import (
     WorkflowManager,
     create_default_workflow_manager,
-    HomeAssistantLightsWorkflow,
     HomeAssistantLockWorkflow,
     HomeAssistantClimateWorkflow,
+    PhilipsHueLightsWorkflow,
 )
 
 
@@ -58,7 +60,10 @@ def check_api_keys():
     
     if not os.getenv("PORCUPINE_ACCESS_KEY"):
         warnings.append("PORCUPINE_ACCESS_KEY not set - wake word detection disabled")
-    
+
+    if os.getenv("HUE_BRIDGE_IP") and not (os.getenv("HUE_APPLICATION_KEY") or os.getenv("HUE_USERNAME")):
+        warnings.append("HUE_BRIDGE_IP is set but HUE_APPLICATION_KEY is missing - Philips Hue integration won't work")
+
     if warnings:
         print("\n⚠️  Configuration Warnings:")
         for w in warnings:
@@ -119,18 +124,17 @@ def create_workflow_manager() -> WorkflowManager:
     """
     manager = create_default_workflow_manager()
     
+    # Add Philips Hue workflow if configured
+    if os.getenv("HUE_BRIDGE_IP"):
+        print("ℹ️  Philips Hue integration enabled")
+        manager.register(PhilipsHueLightsWorkflow())
+
     # Add Home Assistant workflows if configured
     if os.getenv("HASS_TOKEN"):
         print("ℹ️  Home Assistant integration enabled")
-        
-        # Replace default light workflow with Home Assistant version
-        manager.unregister("lights")
-        manager.register(HomeAssistantLightsWorkflow())
-        
-        # Add lock and climate control
         manager.register(HomeAssistantLockWorkflow())
         manager.register(HomeAssistantClimateWorkflow())
-    
+
     return manager
 
 

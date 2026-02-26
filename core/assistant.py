@@ -170,6 +170,10 @@ class VoiceAssistant:
             entities["action"] = "on"
         elif any(word in text_lower for word in ["turn off", "switch off", "disable"]):
             entities["action"] = "off"
+        elif any(word in text_lower for word in ["increase", "raise", "brighten", "brighter", "more bright", "turn up", "bump up"]):
+            entities["action"] = "on"
+        elif any(word in text_lower for word in ["decrease", "lower", "darken", "darker", "less bright", "turn down"]):
+            entities["action"] = "dim"
         elif "dim" in text_lower:
             entities["action"] = "dim"
         elif "lock" in text_lower and "unlock" not in text_lower:
@@ -193,6 +197,23 @@ class VoiceAssistant:
                 entities["door"] = door
                 break
         
+        # Extract mood
+        mood_keywords = {
+            "romantic": ["romantic", "romance", "date night", "intimate", "candlelight"],
+            "relax": ["relax", "relaxing", "chill", "calm", "unwind", "wind down", "peaceful"],
+            "energize": ["energize", "energetic", "energy", "pump up", "motivated", "productive"],
+            "party": ["party", "dance", "celebrate", "celebration", "fiesta"],
+            "bedtime": ["bedtime", "good night", "goodnight", "going to bed", "sleepy", "night night", "time for bed"],
+            "focus": ["focus", "concentrate", "study", "reading", "work mode"],
+            "movie": ["movie", "cinema", "film", "movie night", "watching"],
+            "morning": ["morning", "wake up", "sunrise", "good morning"],
+        }
+        for mood, keywords in mood_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                entities["mood"] = mood
+                entities["action"] = "mood"
+                break
+
         # Extract numbers (brightness, temperature)
         numbers = re.findall(r'\d+', text)
         if numbers:
@@ -201,7 +222,7 @@ class VoiceAssistant:
                 entities["brightness"] = num
             else:
                 entities["temperature"] = num
-        
+
         return entities
     
     def speak(self, text: str):
