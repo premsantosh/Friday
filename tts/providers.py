@@ -8,6 +8,7 @@ from typing import Optional
 import os
 import tempfile
 import subprocess
+import sys
 
 from config import TTSConfig
 
@@ -137,7 +138,7 @@ class PiperTTS(TTSProvider):
             # Run piper command
             process = subprocess.run(
                 [
-                    "piper",
+                    sys.executable, "-m", "piper",
                     "--model", self.model_path,
                     "--output_file", output_path,
                 ],
