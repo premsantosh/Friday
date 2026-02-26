@@ -45,6 +45,7 @@ from workflows import (
     HomeAssistantLockWorkflow,
     HomeAssistantClimateWorkflow,
     PhilipsHueLightsWorkflow,
+    TimeWorkflow,
 )
 
 
@@ -81,7 +82,7 @@ def create_custom_config(args) -> AssistantConfig:
     
     # Determine TTS provider - default to piper (local, fast)
     # Switch to "elevenlabs" or "openai" here for cloud TTS
-    tts_provider = "piper"
+    tts_provider = "elevenlabs"
     
     return AssistantConfig(
         personality=PersonalityConfig(
@@ -119,10 +120,13 @@ def create_custom_config(args) -> AssistantConfig:
 def create_workflow_manager() -> WorkflowManager:
     """
     Create workflow manager with all available integrations.
-    
+
     Customize this function to add your own workflows!
     """
     manager = create_default_workflow_manager()
+
+    # Time workflow - always available
+    manager.register(TimeWorkflow())
     
     # Add Philips Hue workflow if configured
     if os.getenv("HUE_BRIDGE_IP"):

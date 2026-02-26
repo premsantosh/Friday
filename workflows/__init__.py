@@ -24,6 +24,8 @@ from .philips_hue import (
     PhilipsHueLightsWorkflow,
 )
 
+from .time import TimeWorkflow
+
 __all__ = [
     # Base classes
     "Workflow",
@@ -49,4 +51,7 @@ __all__ = [
     "PhilipsHueConfig",
     "PhilipsHueClient",
     "PhilipsHueLightsWorkflow",
+
+    # Time
+    "TimeWorkflow",
 ]
