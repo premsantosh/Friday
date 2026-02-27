@@ -153,6 +153,7 @@ class LLMConfig:
     # Ollama (local) settings
     ollama_model: str = "llama3.1"
     ollama_base_url: str = "http://localhost:11434"
+    extractor_model: str = "phi3:mini"  # Local model used for background fact extraction
     
     # Generation settings
     max_tokens: int = 150
