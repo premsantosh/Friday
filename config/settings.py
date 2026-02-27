@@ -178,6 +178,17 @@ class WakeWordConfig:
 
 
 @dataclass
+class SearchConfig:
+    """Web search configuration."""
+    enabled: bool = True
+    classifier_model: str = "phi3:mini"
+    classifier_timeout: int = 10
+    provider: str = "tavily"
+    tavily_api_key: Optional[str] = None
+    max_results: int = 5
+
+
+@dataclass
 class AssistantConfig:
     """Master configuration combining all settings."""
     personality: PersonalityConfig = field(default_factory=PersonalityConfig)
@@ -185,6 +196,7 @@ class AssistantConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     wake_word: WakeWordConfig = field(default_factory=WakeWordConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     
     # General settings
     debug_mode: bool = False
