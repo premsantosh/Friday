@@ -7,8 +7,13 @@ from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import os
+import threading
 
 from config import LLMConfig, PersonalityConfig, SarcasmLevel, FormalityLevel, WarmthLevel
+from memory.store import FridayStore
+from memory.cache import FridayCache
+from memory.context_builder import ContextBuilder
+from memory.extractor import FactExtractor
 
 
 def generate_personality_prompt(config: PersonalityConfig) -> str:
@@ -134,6 +139,22 @@ class LLMProvider(ABC):
         self.personality = personality
         self.system_prompt = generate_personality_prompt(personality)
         self.conversation_history: List[Dict[str, str]] = []
+        self.store = FridayStore()
+        self.cache = FridayCache()
+        self.context_builder = ContextBuilder(self.cache, self.store)
+        self.extractor = FactExtractor(
+            base_url=config.ollama_base_url,
+            model=config.extractor_model,
+        )
+        self._last_retrieved_fact_keys: List[str] = []
+        self._pending_fact_keys: List[str] = []
+        self.stats = {
+            "total_requests": 0,
+            "cache_hits": 0,
+            "llm_calls": 0,
+            "ollama_extractions": 0,
+            "facts_stored": 0,
+        }
     
     @abstractmethod
     def generate_response(self, user_input: str) -> str:
@@ -163,6 +184,75 @@ class LLMProvider(ABC):
         if max_history > 0 and len(self.conversation_history) > max_history:
             self.conversation_history = self.conversation_history[-max_history:]
 
+    def _prepare_request(self, user_input: str) -> tuple[Optional[str], str]:
+        """Check cache and build the augmented system prompt.
+
+        Returns (cached_response, augmented_prompt). If cached_response is not
+        None the caller should return it immediately without hitting the LLM.
+        """
+        self.stats["total_requests"] += 1
+        context = self.context_builder.build_context(user_input)
+        self._pending_fact_keys = context.get("retrieved_fact_keys", [])
+        if context.get("cached_response"):
+            self.stats["cache_hits"] += 1
+            return context["cached_response"], self.system_prompt
+        augmented_prompt = self.context_builder.format_system_prompt(self.system_prompt, context)
+        return None, augmented_prompt
+
+    def _record_exchange(self, user_input: str, response: str):
+        """Persist the exchange to the store and cache the response."""
+        # Apply feedback: user_input is the signal for facts retrieved in the previous turn
+        if self._last_retrieved_fact_keys:
+            if self.extractor.is_correction(user_input):
+                for key in self._last_retrieved_fact_keys:
+                    self.store.drop_confidence(key)
+            else:
+                for key in self._last_retrieved_fact_keys:
+                    self.store.bump_confidence(key)
+
+        self.store.log_turn("user", user_input)
+        self.store.log_turn("assistant", response)
+        fp = self.context_builder.query_fingerprint(user_input)
+        self.cache.cache_response(fp, response)
+
+        self.stats["llm_calls"] += 1
+
+        # Advance pending keys → last, ready for next turn's feedback
+        self._last_retrieved_fact_keys = self._pending_fact_keys
+        self._pending_fact_keys = []
+
+        # Background: extract facts from this exchange, store for future turns
+        threading.Thread(
+            target=self._extract_and_store,
+            args=(user_input, response),
+            daemon=True,
+        ).start()
+
+    def _extract_and_store(self, user_input: str, response: str):
+        """Run fact extraction in background and persist results."""
+        self.stats["ollama_extractions"] += 1
+        facts = self.extractor.extract(user_input, response)
+        self.stats["facts_stored"] += len(facts)
+        for fact in facts:
+            self.store.remember(
+                key=fact["key"],
+                value=fact["value"],
+                category=fact["category"],
+                confidence=fact["confidence"],
+            )
+
+    def get_stats(self) -> str:
+        s = self.stats
+        total = s["total_requests"]
+        hit_rate = (s["cache_hits"] / total * 100) if total else 0
+        return (
+            f"Requests: {total} | "
+            f"Cache hits: {s['cache_hits']} ({hit_rate:.0f}%) | "
+            f"LLM calls: {s['llm_calls']} | "
+            f"Ollama extractions: {s['ollama_extractions']} | "
+            f"Facts stored: {s['facts_stored']}"
+        )
+
     def clear_history(self):
         """Clear conversation history."""
         self.conversation_history = []
@@ -189,30 +279,27 @@ class AnthropicLLM(LLMProvider):
     def generate_response(self, user_input: str) -> str:
         self._refresh_system_prompt()
 
-        # Add user message to history
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_input,
-        })
+        cached, augmented_prompt = self._prepare_request(user_input)
+        if cached:
+            return cached
+
+        self.conversation_history.append({"role": "user", "content": user_input})
         self._trim_history()
 
         response = self._client.messages.create(
             model=self.config.anthropic_model,
             max_tokens=self.config.max_tokens,
-            system=self.system_prompt,
+            system=augmented_prompt,
             messages=self.conversation_history,
         )
-        
+
         assistant_message = response.content[0].text
-        
-        # Add assistant response to history
-        self.conversation_history.append({
-            "role": "assistant",
-            "content": assistant_message,
-        })
-        
+
+        self.conversation_history.append({"role": "assistant", "content": assistant_message})
+        self._record_exchange(user_input, assistant_message)
+
         return assistant_message
-    
+
     def get_name(self) -> str:
         return f"Anthropic ({self.config.anthropic_model})"
 
@@ -233,15 +320,14 @@ class OpenAILLM(LLMProvider):
     def generate_response(self, user_input: str) -> str:
         self._refresh_system_prompt()
 
-        # Add user message to history
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_input,
-        })
+        cached, augmented_prompt = self._prepare_request(user_input)
+        if cached:
+            return cached
+
+        self.conversation_history.append({"role": "user", "content": user_input})
         self._trim_history()
 
-        # Build messages with system prompt
-        messages = [{"role": "system", "content": self.system_prompt}]
+        messages = [{"role": "system", "content": augmented_prompt}]
         messages.extend(self.conversation_history)
 
         response = self._client.chat.completions.create(
@@ -250,17 +336,14 @@ class OpenAILLM(LLMProvider):
             temperature=self.config.temperature,
             messages=messages,
         )
-        
+
         assistant_message = response.choices[0].message.content
-        
-        # Add assistant response to history
-        self.conversation_history.append({
-            "role": "assistant",
-            "content": assistant_message,
-        })
-        
+
+        self.conversation_history.append({"role": "assistant", "content": assistant_message})
+        self._record_exchange(user_input, assistant_message)
+
         return assistant_message
-    
+
     def get_name(self) -> str:
         return f"OpenAI ({self.config.openai_model})"
 
@@ -277,17 +360,16 @@ class OllamaLLM(LLMProvider):
 
         self._refresh_system_prompt()
 
-        # Add user message to history
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_input,
-        })
+        cached, augmented_prompt = self._prepare_request(user_input)
+        if cached:
+            return cached
+
+        self.conversation_history.append({"role": "user", "content": user_input})
         self._trim_history()
 
-        # Build messages with system prompt
-        messages = [{"role": "system", "content": self.system_prompt}]
+        messages = [{"role": "system", "content": augmented_prompt}]
         messages.extend(self.conversation_history)
-        
+
         response = requests.post(
             f"{self.base_url}/api/chat",
             json={
@@ -301,16 +383,13 @@ class OllamaLLM(LLMProvider):
             },
         )
         response.raise_for_status()
-        
+
         result = response.json()
         assistant_message = result["message"]["content"]
-        
-        # Add assistant response to history
-        self.conversation_history.append({
-            "role": "assistant",
-            "content": assistant_message,
-        })
-        
+
+        self.conversation_history.append({"role": "assistant", "content": assistant_message})
+        self._record_exchange(user_input, assistant_message)
+
         return assistant_message
     
     def get_name(self) -> str:
