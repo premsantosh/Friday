@@ -47,6 +47,7 @@ from workflows import (
     PhilipsHueLightsWorkflow,
     TimeWorkflow,
 )
+from search import OllamaSearchClassifier, TavilySearchProvider, SearchEnhancer
 
 
 def check_api_keys():
@@ -142,6 +143,21 @@ def create_workflow_manager() -> WorkflowManager:
     return manager
 
 
+def create_search_enhancer(config: AssistantConfig):
+    """Create and return a SearchEnhancer, or None if search is disabled/unconfigured."""
+    if not config.search.enabled:
+        return None
+    api_key = config.search.tavily_api_key or os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return None
+    classifier = OllamaSearchClassifier(
+        base_url=config.llm.ollama_base_url,
+        model=config.search.classifier_model,
+    )
+    provider = TavilySearchProvider(api_key=api_key)
+    return SearchEnhancer(classifier, provider, max_results=config.search.max_results)
+
+
 def run_text_test(text: str, config: AssistantConfig):
     """Run a text-based test without voice."""
     print(f"\n📝 Testing with: \"{text}\"")
@@ -149,6 +165,7 @@ def run_text_test(text: str, config: AssistantConfig):
 
     workflow_manager = create_workflow_manager()
     assistant = VoiceAssistant(config, workflow_manager)
+    assistant.llm.search_enhancer = create_search_enhancer(config)
 
     response = assistant.run_single_interaction(text)
     print(f"\n🤖 {config.personality.name}: {response}")
@@ -159,6 +176,7 @@ def run_text_chat(config: AssistantConfig):
     """Run interactive chat mode - type input, voice output."""
     workflow_manager = create_workflow_manager()
     assistant = VoiceAssistant(config, workflow_manager)
+    assistant.llm.search_enhancer = create_search_enhancer(config)
 
     name = config.personality.name
     print(f"\n{'='*50}")
@@ -267,7 +285,8 @@ def main():
     
     # Create and run assistant
     assistant = VoiceAssistant(config, workflow_manager)
-    
+    assistant.llm.search_enhancer = create_search_enhancer(config)
+
     # Optional: Add callbacks for UI integration
     if args.debug:
         assistant.on_transcript = lambda t: print(f"📢 You: {t}")

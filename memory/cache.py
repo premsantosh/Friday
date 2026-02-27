@@ -49,6 +49,8 @@ class FridayCache:
         self.entities = TTLCache(max_size=200, ttl_sec=7200)         # 2 hrs
         # Response cache - skip Claude entirely for repeated queries
         self.response_cache = TTLCache(max_size=100, ttl_sec=600)    # 10 min
+        # Search results cache - avoid re-searching identical queries
+        self.search_results = TTLCache(max_size=50, ttl_sec=900)     # 15 min
 
     def cache_response(self, query_fingerprint: str, response: str):
         """Cache a Claude response to serve identical/similar queries instantly."""
@@ -57,4 +59,12 @@ class FridayCache:
     def get_cached_response(self, query_fingerprint: str) -> Optional[str]:
         """Check if we can skip Claude entirely."""
         return self.response_cache.fetch(query_fingerprint)
+
+    def cache_search(self, fingerprint: str, results: str):
+        """Cache a search context block."""
+        self.search_results.insert(fingerprint, results)
+
+    def get_cached_search(self, fingerprint: str) -> Optional[str]:
+        """Return cached search context or None."""
+        return self.search_results.fetch(fingerprint)
 

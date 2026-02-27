@@ -153,12 +153,14 @@ class LLMProvider(ABC):
         )
         self._last_retrieved_fact_keys: List[str] = []
         self._pending_fact_keys: List[str] = []
+        self.search_enhancer = None
         self.stats = {
             "total_requests": 0,
             "cache_hits": 0,
             "llm_calls": 0,
             "ollama_extractions": 0,
             "facts_stored": 0,
+            "search_queries": 0,
         }
     
     @abstractmethod
@@ -225,6 +227,18 @@ class LLMProvider(ABC):
             self.stats["cache_hits"] += 1
             return context["cached_response"], self.system_prompt
         augmented_prompt = self.context_builder.format_system_prompt(self.system_prompt, context)
+
+        if self.search_enhancer:
+            fp = self.context_builder.query_fingerprint(user_input)
+            search_context = self.cache.get_cached_search(fp)
+            if search_context is None:
+                search_context = self.search_enhancer.enhance(user_input)
+                if search_context:
+                    self.cache.cache_search(fp, search_context)
+                    self.stats["search_queries"] += 1
+            if search_context:
+                augmented_prompt += search_context
+
         return None, augmented_prompt
 
     def _record_exchange(self, user_input: str, response: str):
@@ -277,6 +291,7 @@ class LLMProvider(ABC):
             f"Requests: {total} | "
             f"Cache hits: {s['cache_hits']} ({hit_rate:.0f}%) | "
             f"LLM calls: {s['llm_calls']} | "
+            f"Search queries: {s['search_queries']} | "
             f"Ollama extractions: {s['ollama_extractions']} | "
             f"Facts stored: {s['facts_stored']}"
         )
