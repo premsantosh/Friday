@@ -11,6 +11,11 @@ import threading
 
 from config import LLMConfig, PersonalityConfig, SarcasmLevel, FormalityLevel, WarmthLevel
 from memory.store import FridayStore
+
+_SARCASM_UP = {"more sarcastic", "dial up", "increase sarcasm", "more sarcasm", "turn up the sarcasm"}
+_SARCASM_DOWN = {"less sarcastic", "dial down", "decrease sarcasm", "less sarcasm", "turn down the sarcasm", "tone it down"}
+_SARCASM_NONE = {"no sarcasm", "stop being sarcastic", "be serious", "be professional"}
+_SARCASM_MAX = {"maximum sarcasm", "full sarcasm", "glados", "max sarcasm"}
 from memory.cache import FridayCache
 from memory.context_builder import ContextBuilder
 from memory.extractor import FactExtractor
@@ -184,12 +189,35 @@ class LLMProvider(ABC):
         if max_history > 0 and len(self.conversation_history) > max_history:
             self.conversation_history = self.conversation_history[-max_history:]
 
+    def _check_sarcasm_command(self, user_input: str) -> bool:
+        """Detect sarcasm level adjustments and apply them immediately.
+
+        Returns True if an adjustment was made.
+        """
+        lower = user_input.lower()
+        current = self.personality.sarcasm_level
+
+        if any(kw in lower for kw in _SARCASM_MAX):
+            self.personality.sarcasm_level = SarcasmLevel.MAXIMUM
+        elif any(kw in lower for kw in _SARCASM_NONE):
+            self.personality.sarcasm_level = SarcasmLevel.NONE
+        elif any(kw in lower for kw in _SARCASM_UP):
+            self.personality.sarcasm_level = SarcasmLevel(min(current.value + 1, len(SarcasmLevel) - 1))
+        elif any(kw in lower for kw in _SARCASM_DOWN):
+            self.personality.sarcasm_level = SarcasmLevel(max(current.value - 1, 0))
+        else:
+            return False
+
+        self._refresh_system_prompt()
+        return True
+
     def _prepare_request(self, user_input: str) -> tuple[Optional[str], str]:
         """Check cache and build the augmented system prompt.
 
         Returns (cached_response, augmented_prompt). If cached_response is not
         None the caller should return it immediately without hitting the LLM.
         """
+        self._check_sarcasm_command(user_input)
         self.stats["total_requests"] += 1
         context = self.context_builder.build_context(user_input)
         self._pending_fact_keys = context.get("retrieved_fact_keys", [])
