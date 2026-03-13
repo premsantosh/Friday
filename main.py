@@ -18,6 +18,14 @@ Environment Variables:
     HASS_TOKEN            - Optional, Home Assistant access token
     HUE_BRIDGE_IP         - Optional, Philips Hue Bridge IP address
     HUE_APPLICATION_KEY   - Optional, Philips Hue API application key
+    SHELLY_DEVICES        - Optional, JSON list of Shelly devices, e.g.:
+                            '[{"name":"desk lamp","ip":"192.168.1.50","type":"plug"}]'
+    COFFEE_MACHINE_IP     - Optional, IP of the Shelly plug on the coffee machine
+    COFFEE_MACHINE_WEEKDAY_ON - HH:MM auto-on time on weekdays (default: 07:00)
+    COFFEE_MACHINE_WEEKEND_ON - HH:MM auto-on time on weekends (default: 09:00)
+    COFFEE_MACHINE_AUTO_ON    - true/false, enable scheduled auto-on (default: true)
+    COFFEE_MACHINE_IDLE_ALERT_MIN - minutes idle before alert (default: 45)
+    COFFEE_MACHINE_WARMUP_MINUTES - warm-up time in minutes (default: 20)
 """
 
 import argparse
@@ -46,6 +54,8 @@ from workflows import (
     HomeAssistantClimateWorkflow,
     PhilipsHueLightsWorkflow,
     TimeWorkflow,
+    ShellyWorkflow,
+    CoffeeMachineWorkflow,
 )
 from search import OllamaSearchClassifier, TavilySearchProvider, SearchEnhancer
 
@@ -75,16 +85,44 @@ def check_api_keys():
     return len(warnings) == 0
 
 
+def _build_home_context() -> str:
+    """
+    Assemble a plain-text knowledge block about configured home appliances.
+    This is injected into the LLM system prompt so the assistant knows
+    device-specific facts even in general conversation (not just workflows).
+    """
+    parts = []
+
+    if os.getenv("COFFEE_MACHINE_IP"):
+        warmup = int(os.getenv("COFFEE_MACHINE_WARMUP_MINUTES", "20"))
+        wd_on = os.getenv("COFFEE_MACHINE_WEEKDAY_ON", "07:00")
+        we_on = os.getenv("COFFEE_MACHINE_WEEKEND_ON", "09:00")
+        name = os.getenv("COFFEE_MACHINE_NAME", "coffee machine")
+        parts.append(
+            f"Coffee machine ({name}):\n"
+            f"- Takes approximately {warmup} minutes to heat up from cold and be ready to brew.\n"
+            f"  Always mention this warm-up time when starting the machine.\n"
+            f"- Auto-start schedule: {wd_on} on weekdays, {we_on} on weekends.\n"
+            f"- Any mention of a coffee drink (espresso, latte, cappuccino, americano,\n"
+            f"  macchiato, mocha, flat white, cortado, lungo, etc.) — whether from the user\n"
+            f"  or on behalf of guests — is an implicit request to start the machine.\n"
+            f"- If asked 'can I have coffee in X minutes?', compare X to the {warmup}-min warm-up\n"
+            f"  and answer honestly."
+        )
+
+    return "\n\n".join(parts)
+
+
 def create_custom_config(args) -> AssistantConfig:
     """Create configuration based on command line arguments."""
-    
+
     # Determine wake word provider
     wake_provider = "keyboard" if args.keyboard else "porcupine"
-    
+
     # Determine TTS provider - default to piper (local, fast)
     # Switch to "elevenlabs" or "openai" here for cloud TTS
     tts_provider = "elevenlabs"
-    
+
     return AssistantConfig(
         personality=PersonalityConfig(
             name="Jarvis",
@@ -97,6 +135,7 @@ def create_custom_config(args) -> AssistantConfig:
             observational_humor=True,
             use_british_vocabulary=True,
             use_contractions=False,
+            home_context=_build_home_context(),
         ),
         tts=TTSConfig(
             provider=tts_provider,
@@ -139,6 +178,16 @@ def create_workflow_manager() -> WorkflowManager:
         print("ℹ️  Home Assistant integration enabled")
         manager.register(HomeAssistantLockWorkflow())
         manager.register(HomeAssistantClimateWorkflow())
+
+    # Add Shelly smart plug workflow if devices are configured
+    if os.getenv("SHELLY_DEVICES"):
+        print("ℹ️  Shelly integration enabled")
+        manager.register(ShellyWorkflow())
+
+    # Add Coffee Machine workflow if configured
+    if os.getenv("COFFEE_MACHINE_IP"):
+        print("ℹ️  Coffee machine integration enabled")
+        manager.register(CoffeeMachineWorkflow())
 
     return manager
 
@@ -282,7 +331,7 @@ def main():
 
     # Create workflow manager
     workflow_manager = create_workflow_manager()
-    
+
     # Create and run assistant
     assistant = VoiceAssistant(config, workflow_manager)
     assistant.llm.search_enhancer = create_search_enhancer(config)
@@ -292,9 +341,18 @@ def main():
         assistant.on_transcript = lambda t: print(f"📢 You: {t}")
         assistant.on_response = lambda r: print(f"🤖 Jarvis: {r}")
         assistant.on_error = lambda e: print(f"❌ Error: {e}")
-    
+
+    # Start background monitors that need a speak callback
+    coffee_workflow = workflow_manager.get_workflow("coffee_machine")
+    if coffee_workflow is not None:
+        coffee_workflow.start_monitor(assistant.speak)
+
     # Run!
     assistant.run()
+
+    # Clean up background monitors on exit
+    if coffee_workflow is not None:
+        coffee_workflow.stop_monitor()
 
 
 if __name__ == "__main__":

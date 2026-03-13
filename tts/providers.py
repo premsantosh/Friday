@@ -55,11 +55,20 @@ class ElevenLabsTTS(TTSProvider):
                 "ElevenLabs API key required. Set ELEVENLABS_API_KEY environment variable "
                 "or pass elevenlabs_api_key in TTSConfig."
             )
+        self.voice_id = (
+            config.elevenlabs_voice_id
+            or os.getenv("ELEVENLABS_VOICE_ID")
+        )
+        if not self.voice_id:
+            raise ValueError(
+                "ElevenLabs voice ID required. Set ELEVENLABS_VOICE_ID environment variable "
+                "or pass elevenlabs_voice_id in TTSConfig."
+            )
     
     def synthesize(self, text: str) -> bytes:
         import requests
         
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.config.elevenlabs_voice_id}"
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}"
         
         headers = {
             "Accept": "audio/mpeg",

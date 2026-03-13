@@ -66,6 +66,11 @@ class PersonalityConfig:
     # Topics
     off_limits_topics: list = field(default_factory=list)  # Topics to never joke about
     
+    # Home appliance / device knowledge baked into the system prompt.
+    # Populated at startup by integrations that want the LLM to have persistent
+    # background knowledge (e.g. "coffee machine takes 20 min to warm up").
+    home_context: str = ""
+
     # Custom phrases the assistant likes to use
     favorite_phrases: list = field(default_factory=lambda: [
         "Indeed",
@@ -93,7 +98,7 @@ class TTSConfig:
     
     # ElevenLabs settings
     elevenlabs_api_key: Optional[str] = None  # Set via environment variable
-    elevenlabs_voice_id: str = "7p1Ofvcwsv7UBPoFNcpI"  # "Adam" - British male
+    elevenlabs_voice_id: Optional[str] = None  # Set via ELEVENLABS_VOICE_ID env var
     elevenlabs_model: str = "eleven_monolingual_v1"
     elevenlabs_stability: float = 0.5
     elevenlabs_similarity_boost: float = 0.75

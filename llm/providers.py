@@ -133,6 +133,9 @@ User: "What's the weather?" → "Fifteen degrees and overcast, {config.user_titl
 
 Helpful first, entertaining second. Brevity is the soul of wit."""
 
+    if config.home_context.strip():
+        prompt += f"\n\nHOME & APPLIANCES:\n{config.home_context}"
+
     return prompt
 
 

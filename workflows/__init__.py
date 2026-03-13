@@ -26,6 +26,26 @@ from .philips_hue import (
 
 from .time import TimeWorkflow
 
+from .shelly import (
+    ShellyClient,
+    ShellyRPCError,
+    ShellyDevice,
+    DeviceInfo,
+    ShellyPlug,
+    SwitchStatus,
+    CoffeeMachine,
+    BrewState,
+    ShellyWorkflow,
+    DEVICE_REGISTRY,
+)
+
+from .coffee_machine import (
+    CoffeeSchedule,
+    CoffeeMonitorConfig,
+    CoffeeMachineMonitor,
+    CoffeeMachineWorkflow,
+)
+
 __all__ = [
     # Base classes
     "Workflow",
@@ -54,4 +74,22 @@ __all__ = [
 
     # Time
     "TimeWorkflow",
+
+    # Shelly
+    "ShellyClient",
+    "ShellyRPCError",
+    "ShellyDevice",
+    "DeviceInfo",
+    "ShellyPlug",
+    "SwitchStatus",
+    "CoffeeMachine",
+    "BrewState",
+    "ShellyWorkflow",
+    "DEVICE_REGISTRY",
+
+    # Coffee Machine
+    "CoffeeSchedule",
+    "CoffeeMonitorConfig",
+    "CoffeeMachineMonitor",
+    "CoffeeMachineWorkflow",
 ]
