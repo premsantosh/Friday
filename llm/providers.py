@@ -147,13 +147,18 @@ class LLMProvider(ABC):
         self.personality = personality
         self.system_prompt = generate_personality_prompt(personality)
         self.conversation_history: List[Dict[str, str]] = []
-        self.store = FridayStore()
         self.cache = FridayCache()
-        self.context_builder = ContextBuilder(self.cache, self.store)
-        self.extractor = FactExtractor(
-            base_url=config.ollama_base_url,
-            model=config.extractor_model,
-        )
+        if config.ephemeral:
+            self.store = None
+            self.context_builder = None
+            self.extractor = None
+        else:
+            self.store = FridayStore()
+            self.context_builder = ContextBuilder(self.cache, self.store)
+            self.extractor = FactExtractor(
+                base_url=config.ollama_base_url,
+                model=config.extractor_model,
+            )
         self._last_retrieved_fact_keys: List[str] = []
         self._pending_fact_keys: List[str] = []
         self.search_enhancer = None
@@ -224,6 +229,17 @@ class LLMProvider(ABC):
         """
         self._check_sarcasm_command(user_input)
         self.stats["total_requests"] += 1
+
+        if self.context_builder is None:
+            # Ephemeral mode: no persistent context, no response cache
+            augmented_prompt = self.system_prompt
+            if self.search_enhancer:
+                search_context = self.search_enhancer.enhance(user_input)
+                if search_context:
+                    augmented_prompt += search_context
+                    self.stats["search_queries"] += 1
+            return None, augmented_prompt
+
         context = self.context_builder.build_context(user_input)
         self._pending_fact_keys = context.get("retrieved_fact_keys", [])
         if context.get("cached_response"):
@@ -246,6 +262,12 @@ class LLMProvider(ABC):
 
     def _record_exchange(self, user_input: str, response: str):
         """Persist the exchange to the store and cache the response."""
+        self.stats["llm_calls"] += 1
+
+        if self.store is None:
+            # Ephemeral mode: nothing to persist
+            return
+
         # Apply feedback: user_input is the signal for facts retrieved in the previous turn
         if self._last_retrieved_fact_keys:
             if self.extractor.is_correction(user_input):
@@ -259,8 +281,6 @@ class LLMProvider(ABC):
         self.store.log_turn("assistant", response)
         fp = self.context_builder.query_fingerprint(user_input)
         self.cache.cache_response(fp, response)
-
-        self.stats["llm_calls"] += 1
 
         # Advance pending keys → last, ready for next turn's feedback
         self._last_retrieved_fact_keys = self._pending_fact_keys

@@ -7,6 +7,7 @@ from .providers import (
     get_llm_provider,
     generate_personality_prompt,
 )
+from .router import IntentRouter, RouteResult
 
 __all__ = [
     "LLMProvider",
@@ -16,4 +17,6 @@ __all__ = [
     "LLM_PROVIDERS",
     "get_llm_provider",
     "generate_personality_prompt",
+    "IntentRouter",
+    "RouteResult",
 ]
