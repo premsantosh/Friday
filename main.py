@@ -42,6 +42,7 @@ from config import (
     STTConfig,
     LLMConfig,
     WakeWordConfig,
+    IntentCacheConfig,
     SarcasmLevel,
     FormalityLevel,
     WarmthLevel,
@@ -123,6 +124,8 @@ def create_custom_config(args) -> AssistantConfig:
     # Switch to "elevenlabs" or "openai" here for cloud TTS
     tts_provider = "elevenlabs"
 
+    is_ephemeral = bool(args.chat or args.test)
+
     return AssistantConfig(
         personality=PersonalityConfig(
             name="Jarvis",
@@ -147,12 +150,14 @@ def create_custom_config(args) -> AssistantConfig:
         llm=LLMConfig(
             provider="anthropic",
             anthropic_model="claude-haiku-4-5-20251001",
+            ephemeral=is_ephemeral,
         ),
         wake_word=WakeWordConfig(
             provider=wake_provider,
             porcupine_keyword="jarvis",
             porcupine_sensitivity=0.5,
         ),
+        intent_cache=IntentCacheConfig(enabled=not is_ephemeral),
         debug_mode=args.debug,
     )
 

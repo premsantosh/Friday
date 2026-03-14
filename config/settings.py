@@ -165,6 +165,10 @@ class LLMConfig:
     temperature: float = 0.7
     max_history: int = 10  # Max conversation turns to keep (0 = unlimited)
 
+    # When True, no data is read from or written to any persistent store.
+    # Used by --chat and --test modes so test sessions don't pollute long-term memory.
+    ephemeral: bool = False
+
 
 @dataclass
 class WakeWordConfig:
@@ -194,6 +198,15 @@ class SearchConfig:
 
 
 @dataclass
+class IntentCacheConfig:
+    """Configuration for the semantic intent cache (ChromaDB)."""
+    enabled: bool = True
+    path: str = "~/.friday/intent_cache"
+    similarity_threshold: float = 0.75
+    collection_name: str = "intents"
+
+
+@dataclass
 class AssistantConfig:
     """Master configuration combining all settings."""
     personality: PersonalityConfig = field(default_factory=PersonalityConfig)
@@ -202,7 +215,8 @@ class AssistantConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     wake_word: WakeWordConfig = field(default_factory=WakeWordConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
-    
+    intent_cache: IntentCacheConfig = field(default_factory=IntentCacheConfig)
+
     # General settings
     debug_mode: bool = False
     log_conversations: bool = True

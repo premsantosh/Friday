@@ -11,8 +11,9 @@ import time
 from config import AssistantConfig, DEFAULT_CONFIG
 from tts import get_tts_provider, TTSProvider
 from stt import get_stt_provider, STTProvider
-from llm import get_llm_provider, LLMProvider
+from llm import get_llm_provider, LLMProvider, IntentRouter
 from workflows import WorkflowManager, create_default_workflow_manager, WorkflowStatus
+from .intent_cache import IntentCache
 from utils import (
     AudioRecorder,
     AudioPlayer,
@@ -65,6 +66,15 @@ class VoiceAssistant:
         
         # Workflow manager for smart home and other capabilities
         self.workflows = workflow_manager or create_default_workflow_manager()
+
+        # Semantic intent cache and router (enhanced fallback)
+        cache_cfg = self.config.intent_cache
+        self.intent_cache = IntentCache(
+            path=cache_cfg.path,
+            collection_name=cache_cfg.collection_name,
+            similarity_threshold=cache_cfg.similarity_threshold,
+        ) if cache_cfg.enabled else None
+        self.intent_router = IntentRouter(self.config.llm)
         
         # Audio components
         self.recorder = AudioRecorder(AudioConfig(
@@ -104,126 +114,75 @@ class VoiceAssistant:
     
     async def process_input(self, text: str) -> str:
         """
-        Process user input and generate response.
-        
-        This is the core processing pipeline:
-        1. Check for matching workflow
-        2. If workflow matches, execute it
-        3. Otherwise, send to LLM
-        4. Return response text
-        
-        Args:
-            text: User's transcribed speech
-            
-        Returns:
-            Response text to speak
+        Process user input and generate a response.
+
+        Pipeline:
+        1. Fast keyword/pattern match  → execute workflow directly
+        2. Semantic intent cache       → execute cached workflow routing
+        3. Claude routing prompt       → classify intent, store result, execute workflow
+           └ no workflow found         → Claude generates a conversational response
         """
         self._log(f"Processing: {text}")
-        
-        # Check if any workflow matches
+
+        # Step 1: fast keyword/pattern matching
         matching_workflow = self.workflows.find_matching_workflow(text)
-        
         if matching_workflow:
-            self._log(f"Matched workflow: {matching_workflow.name}")
-            
-            # Extract entities (simplified - in production you'd use NLU)
-            entities = self._extract_entities(text)
-            
-            # Execute workflow
-            result = await matching_workflow.execute(text, entities)
-            
+            self._log(f"Keyword match: {matching_workflow.name}")
+            result = await matching_workflow.execute(text, {})
             if result.status == WorkflowStatus.SUCCESS:
                 return result.message
             elif result.status == WorkflowStatus.FAILURE:
-                # Let LLM handle the failure gracefully
-                failure_context = f"The user asked: '{text}'. The {matching_workflow.name} system responded with an error: {result.error or result.message}"
+                failure_context = (
+                    f"The user asked: '{text}'. "
+                    f"The {matching_workflow.name} system responded with an error: "
+                    f"{result.error or result.message}"
+                )
                 return self.llm.generate_response(failure_context)
-            else:
+            return result.message
+
+        # Step 2: semantic intent cache
+        if self.intent_cache:
+            cached = self.intent_cache.query(text)
+            if cached:
+                workflow_name, entities = cached
+                workflow = self.workflows.workflows.get(workflow_name)
+                if workflow:
+                    self._log(f"Cache hit: {workflow_name}")
+                    result = await workflow.execute(text, entities)
+                    if result.status == WorkflowStatus.SUCCESS:
+                        return result.message
+                    elif result.status == WorkflowStatus.FAILURE:
+                        failure_context = (
+                            f"The user asked: '{text}'. "
+                            f"The {workflow_name} system responded with an error: "
+                            f"{result.error or result.message}"
+                        )
+                        return self.llm.generate_response(failure_context)
+                    return result.message
+
+        # Step 3: Claude routing (enhanced fallback)
+        self._log("Routing via Claude")
+        route = self.intent_router.route(text, self.workflows)
+
+        if route.workflow_name:
+            workflow = self.workflows.workflows.get(route.workflow_name)
+            if workflow:
+                result = await workflow.execute(text, route.entities)
+                if result.status == WorkflowStatus.SUCCESS:
+                    if self.intent_cache:
+                        self.intent_cache.store(text, route.workflow_name, route.entities)
+                    return result.message
+                elif result.status == WorkflowStatus.FAILURE:
+                    failure_context = (
+                        f"The user asked: '{text}'. "
+                        f"The {route.workflow_name} system responded with an error: "
+                        f"{result.error or result.message}"
+                    )
+                    return self.llm.generate_response(failure_context)
                 return result.message
-        
-        # No workflow matched - send to LLM
-        # Include workflow context so LLM knows what it can do
-        workflow_context = self.workflows.get_all_context_for_llm()
-        
-        # Add context about available capabilities
-        enhanced_input = text
-        if workflow_context and "No special capabilities" not in workflow_context:
-            # The LLM already has the personality prompt
-            # Just send the user input
-            pass
-        
-        response = self.llm.generate_response(text)
-        return response
-    
-    def _extract_entities(self, text: str) -> dict:
-        """
-        Simple entity extraction from text.
-        In production, you'd use proper NLU or let the LLM extract entities.
-        """
-        import re
-        
-        entities = {}
-        text_lower = text.lower()
-        
-        # Extract action
-        if any(word in text_lower for word in ["turn on", "switch on", "enable"]):
-            entities["action"] = "on"
-        elif any(word in text_lower for word in ["turn off", "switch off", "disable"]):
-            entities["action"] = "off"
-        elif any(word in text_lower for word in ["increase", "raise", "brighten", "brighter", "more bright", "turn up", "bump up"]):
-            entities["action"] = "on"
-        elif any(word in text_lower for word in ["decrease", "lower", "darken", "darker", "less bright", "turn down"]):
-            entities["action"] = "dim"
-        elif "dim" in text_lower:
-            entities["action"] = "dim"
-        elif "lock" in text_lower and "unlock" not in text_lower:
-            entities["action"] = "lock"
-        elif "unlock" in text_lower:
-            entities["action"] = "unlock"
-        elif "check" in text_lower or "who" in text_lower:
-            entities["action"] = "check"
-        
-        # Extract room/location
-        rooms = ["living room", "bedroom", "kitchen", "bathroom", "office", "garage", "basement", "attic"]
-        for room in rooms:
-            if room in text_lower:
-                entities["room"] = room
-                break
-        
-        # Extract door
-        doors = ["front", "back", "side", "garage"]
-        for door in doors:
-            if door in text_lower:
-                entities["door"] = door
-                break
-        
-        # Extract mood
-        mood_keywords = {
-            "romantic": ["romantic", "romance", "date night", "intimate", "candlelight"],
-            "relax": ["relax", "relaxing", "chill", "calm", "unwind", "wind down", "peaceful"],
-            "energize": ["energize", "energetic", "energy", "pump up", "motivated", "productive"],
-            "party": ["party", "dance", "celebrate", "celebration", "fiesta"],
-            "bedtime": ["bedtime", "good night", "goodnight", "going to bed", "sleepy", "night night", "time for bed"],
-            "focus": ["focus", "concentrate", "study", "reading", "work mode"],
-            "movie": ["movie", "cinema", "film", "movie night", "watching"],
-            "morning": ["morning", "wake up", "sunrise", "good morning"],
-        }
-        for mood, keywords in mood_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                entities["mood"] = mood
-                entities["action"] = "mood"
-                break
 
-        # Extract numbers (brightness, temperature)
-        numbers = re.findall(r'\d+', text)
-        if numbers:
-            num = int(numbers[0])
-            if num <= 100:
-                entities["brightness"] = num
-            else:
-                entities["temperature"] = num
-
-        return entities
+        # No workflow matched — use Claude's conversational response or fall back
+        return route.response or self.llm.generate_response(text)
     
     def speak(self, text: str):
         """
