@@ -44,6 +44,18 @@ tavily-python>=0.5.0
 # Semantic intent cache
 chromadb>=0.5.0
 
+# Multi-turn conversational context register (Layer A), pinned by commit SHA
+turnstile-ctx @ git+https://github.com/premsantosh/turnstile-ctx.git@e1778258f01f4252ffdd048d80805db67c95f499
+
+# Reservations agent — browser channels (M2). After install, run: playwright install chromium
+# Imports are guarded, so the rest of Friday works without it installed.
+playwright>=1.40.0
+
+# Reservations agent — Google Calendar (M4, optional). Only needed if you set
+# GOOGLE_APPLICATION_CREDENTIALS; imports are guarded so it's not required.
+# google-api-python-client>=2.0.0
+# google-auth>=2.0.0
+
 # Development
 pytest>=7.0.0
 pytest-asyncio>=0.21.0

@@ -15,11 +15,16 @@ To add a new workflow:
 Example workflows are provided for common use cases.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, TYPE_CHECKING
 from dataclasses import dataclass, field
 from enum import Enum
 import re
+
+if TYPE_CHECKING:
+    from core.conversation.session import Session, TurnResult
 
 
 class WorkflowStatus(Enum):
@@ -118,6 +123,57 @@ Description: {self.description}
 Example commands:
 {examples_text}
 """
+
+
+# =============================================================================
+# CONVERSATIONAL (MULTI-TURN) WORKFLOWS
+# =============================================================================
+
+class InterruptPolicy(Enum):
+    """How a conversational workflow handles unrelated input mid-session."""
+    STICKY = "sticky"               # all input goes to the session until done/cancelled
+    ALLOW_READONLY = "allow_readonly"  # let read-only one-off queries answer, then resume
+
+
+class ConversationalWorkflow(Workflow):
+    """
+    Base class for multi-turn workflows (slot-filling, confirmation gates,
+    long-running "do it later" tasks). Entered via the SessionManager rather
+    than single-shot execute().
+
+    Implement name/description/trigger (from Workflow) plus start() and resume().
+    Override on_tick() for WAITING sessions advanced by the background runner.
+    """
+
+    interrupt_policy: InterruptPolicy = InterruptPolicy.STICKY
+    session_timeout_s: int = 600
+    read_only: bool = False
+
+    @abstractmethod
+    async def start(self, intent: str, entities: Dict[str, Any], session: "Session") -> "TurnResult":
+        """First turn: seed slots from the utterance, return the next prompt/confirmation."""
+        ...
+
+    @abstractmethod
+    async def resume(self, text: str, session: "Session") -> "TurnResult":
+        """A subsequent user turn while this session is ACTIVE/AWAITING_CONFIRMATION."""
+        ...
+
+    async def on_tick(self, session: "Session") -> "Optional[TurnResult]":
+        """Called by the background runner for WAITING sessions. Return None to keep waiting."""
+        return None
+
+    async def execute(self, intent: str, entities: Dict[str, Any]) -> WorkflowResult:
+        """
+        Conversational workflows are entered through the SessionManager, not via
+        single-shot execute(). This satisfies the Workflow interface and is a
+        safety net if something calls it directly.
+        """
+        return WorkflowResult(
+            status=WorkflowStatus.PENDING,
+            message="",
+            error=f"{self.name} is a conversational workflow; enter it via the SessionManager.",
+        )
 
 
 # =============================================================================

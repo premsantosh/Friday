@@ -194,6 +194,12 @@ def create_workflow_manager() -> WorkflowManager:
         print("ℹ️  Coffee machine integration enabled")
         manager.register(CoffeeMachineWorkflow())
 
+    # Add Reservations agent if enabled
+    if os.getenv("RESERVATIONS_ENABLED", "").lower() in ("1", "true", "yes"):
+        print("ℹ️  Reservations agent enabled")
+        from workflows.reservations import ReservationWorkflow
+        manager.register(ReservationWorkflow())
+
     return manager
 
 

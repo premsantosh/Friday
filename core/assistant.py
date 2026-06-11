@@ -4,6 +4,7 @@ Orchestrates STT, LLM, TTS, wake word detection, and workflows.
 """
 
 import asyncio
+import os
 from typing import Optional, Callable
 from enum import Enum
 import time
@@ -12,8 +13,20 @@ from config import AssistantConfig, DEFAULT_CONFIG
 from tts import get_tts_provider, TTSProvider
 from stt import get_stt_provider, STTProvider
 from llm import get_llm_provider, LLMProvider, IntentRouter
-from workflows import WorkflowManager, create_default_workflow_manager, WorkflowStatus
+from workflows import (
+    WorkflowManager,
+    create_default_workflow_manager,
+    WorkflowStatus,
+    ConversationalWorkflow,
+)
 from .intent_cache import IntentCache
+from .conversation import (
+    ConversationContext,
+    SessionManager,
+    SqliteSessionStore,
+    InMemorySessionStore,
+    BackgroundTaskRunner,
+)
 from utils import (
     AudioRecorder,
     AudioPlayer,
@@ -75,7 +88,44 @@ class VoiceAssistant:
             similarity_threshold=cache_cfg.similarity_threshold,
         ) if cache_cfg.enabled else None
         self.intent_router = IntentRouter(self.config.llm)
-        
+
+        # Conversational layers (multi-turn agent framework)
+        conv_cfg = self.config.conversation
+        self._context_enabled = conv_cfg.context_enabled
+        context_persist = (
+            os.path.expanduser(conv_cfg.context_persist_path)
+            if conv_cfg.context_enabled and not self.config.llm.ephemeral
+            else None
+        )
+        self.context = ConversationContext(
+            persist_path=context_persist,
+            max_turns=conv_cfg.context_max_turns,
+        )
+
+        if conv_cfg.sessions_enabled:
+            session_store = (
+                InMemorySessionStore()
+                if self.config.llm.ephemeral
+                else SqliteSessionStore(os.path.expanduser(conv_cfg.session_store_path))
+            )
+            self.sessions: Optional[SessionManager] = SessionManager(
+                store=session_store,
+                workflows=self.workflows,
+                default_timeout_s=conv_cfg.default_session_timeout_s,
+                context=self.context,
+            )
+            # Drives WAITING sessions + expiry sweep; started in run(), stopped in stop().
+            # Not started for ephemeral one-shot interactions (--test / --chat).
+            self.background_runner: Optional[BackgroundTaskRunner] = (
+                None if self.config.llm.ephemeral
+                else BackgroundTaskRunner(
+                    self.sessions, self.speak, tick_seconds=conv_cfg.background_tick_seconds
+                )
+            )
+        else:
+            self.sessions = None
+            self.background_runner = None
+
         # Audio components
         self.recorder = AudioRecorder(AudioConfig(
             sample_rate=self.config.stt.input_sample_rate,
@@ -112,32 +162,64 @@ class VoiceAssistant:
         if self.config.debug_mode:
             print(f"[Debug] {message}")
     
-    async def process_input(self, text: str) -> str:
+    async def _maybe_start_session(self, workflow, text: str, entities: dict, user_id: str):
+        """If `workflow` is conversational, open a multi-turn session and return its
+        first spoken message. Returns None when the workflow is single-shot."""
+        if self.sessions is not None and isinstance(workflow, ConversationalWorkflow):
+            turn = await self.sessions.open(workflow, text, entities, user_id)
+            self.context.update(workflow.name, entities, text)
+            return turn.message
+        return None
+
+    def _handle_workflow_failure(self, text: str, workflow_name: str, result) -> str:
+        failure_context = (
+            f"The user asked: '{text}'. "
+            f"The {workflow_name} system responded with an error: "
+            f"{result.error or result.message}"
+        )
+        return self.llm.generate_response(failure_context)
+
+    async def process_input(self, text: str, user_id: str = "default") -> str:
         """
         Process user input and generate a response.
 
         Pipeline:
-        1. Fast keyword/pattern match  → execute workflow directly
-        2. Semantic intent cache       → execute cached workflow routing
-        3. Claude routing prompt       → classify intent, store result, execute workflow
+        0. Active multi-turn session   → route the turn into it (global "cancel" aborts)
+        1. Fast keyword/pattern match  → conversational? open session, else execute
+        2. Semantic intent cache       → conversational? open session, else execute
+        3. Claude routing prompt       → classify (context-enriched), open/execute workflow
            └ no workflow found         → Claude generates a conversational response
         """
         self._log(f"Processing: {text}")
+
+        # Step 0: an active dialogue session takes the turn.
+        if self.sessions is not None and self.sessions.has_active(user_id):
+            if self.sessions.is_global_escape(text):
+                self.sessions.cancel(user_id, "user aborted")
+                return "Very well, sir. I've set that aside."
+            self._log("Routing to active session")
+            result = await self.sessions.handle(user_id, text)
+            return result.message
+
+        # Layer A: enrich for routing continuity (raw text is kept for keyword/cache
+        # matching so an injected context prefix can't cause false keyword hits).
+        enriched = self.context.enrich(text) if self._context_enabled else text
+        if enriched != text:
+            self._log(f"Context-enriched: {enriched}")
 
         # Step 1: fast keyword/pattern matching
         matching_workflow = self.workflows.find_matching_workflow(text)
         if matching_workflow:
             self._log(f"Keyword match: {matching_workflow.name}")
+            started = await self._maybe_start_session(matching_workflow, text, {}, user_id)
+            if started is not None:
+                return started
             result = await matching_workflow.execute(text, {})
             if result.status == WorkflowStatus.SUCCESS:
+                self.context.update(matching_workflow.name, {}, text)
                 return result.message
             elif result.status == WorkflowStatus.FAILURE:
-                failure_context = (
-                    f"The user asked: '{text}'. "
-                    f"The {matching_workflow.name} system responded with an error: "
-                    f"{result.error or result.message}"
-                )
-                return self.llm.generate_response(failure_context)
+                return self._handle_workflow_failure(text, matching_workflow.name, result)
             return result.message
 
         # Step 2: semantic intent cache
@@ -148,37 +230,35 @@ class VoiceAssistant:
                 workflow = self.workflows.workflows.get(workflow_name)
                 if workflow:
                     self._log(f"Cache hit: {workflow_name}")
+                    started = await self._maybe_start_session(workflow, text, entities, user_id)
+                    if started is not None:
+                        return started
                     result = await workflow.execute(text, entities)
                     if result.status == WorkflowStatus.SUCCESS:
+                        self.context.update(workflow_name, entities, text)
                         return result.message
                     elif result.status == WorkflowStatus.FAILURE:
-                        failure_context = (
-                            f"The user asked: '{text}'. "
-                            f"The {workflow_name} system responded with an error: "
-                            f"{result.error or result.message}"
-                        )
-                        return self.llm.generate_response(failure_context)
+                        return self._handle_workflow_failure(text, workflow_name, result)
                     return result.message
 
-        # Step 3: Claude routing (enhanced fallback)
+        # Step 3: Claude routing (enhanced fallback, uses context-enriched text)
         self._log("Routing via Claude")
-        route = self.intent_router.route(text, self.workflows)
+        route = self.intent_router.route(enriched, self.workflows)
 
         if route.workflow_name:
             workflow = self.workflows.workflows.get(route.workflow_name)
             if workflow:
+                started = await self._maybe_start_session(workflow, text, route.entities, user_id)
+                if started is not None:
+                    return started
                 result = await workflow.execute(text, route.entities)
                 if result.status == WorkflowStatus.SUCCESS:
                     if self.intent_cache:
                         self.intent_cache.store(text, route.workflow_name, route.entities)
+                    self.context.update(route.workflow_name, route.entities, text)
                     return result.message
                 elif result.status == WorkflowStatus.FAILURE:
-                    failure_context = (
-                        f"The user asked: '{text}'. "
-                        f"The {route.workflow_name} system responded with an error: "
-                        f"{result.error or result.message}"
-                    )
-                    return self.llm.generate_response(failure_context)
+                    return self._handle_workflow_failure(text, route.workflow_name, result)
                 return result.message
 
         # No workflow matched — use Claude's conversational response or fall back
@@ -301,7 +381,11 @@ class VoiceAssistant:
         print(f"{'='*50}\n")
         
         self._running = True
-        
+
+        # Start the multi-turn background runner (WAITING sessions + expiry sweep)
+        if self.background_runner is not None:
+            self.background_runner.start()
+
         # Initialize wake word detector
         try:
             self._wake_detector = get_wake_word_detector(self.config.wake_word)
@@ -340,11 +424,14 @@ class VoiceAssistant:
     def stop(self):
         """Stop the assistant."""
         self._running = False
-        
+
+        if self.background_runner is not None:
+            self.background_runner.stop()
+
         if self._wake_detector:
             self._wake_detector.stop()
             self._wake_detector = None
-        
+
         self._set_state(AssistantState.IDLE)
         print("Assistant stopped.")
     
