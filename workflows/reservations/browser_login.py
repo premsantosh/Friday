@@ -18,7 +18,8 @@ from __future__ import annotations
 import os
 import stat
 import sys
-import time
+
+from .channels.base import persistent_context_options
 
 LOGIN_URLS = {
     "opentable": "https://www.opentable.com/signin",
@@ -56,27 +57,28 @@ def main(argv: list[str]) -> int:
         return 1
 
     profile = _profile_dir(platform)
+    opts = persistent_context_options(profile)
     print(f"Opening {url}\nProfile: {profile}")
-    print("Log in (and finish any 2FA), then close the browser window.")
+    if opts.get("channel"):
+        print(f"Using your installed '{opts['channel']}' browser.")
+    print("Log in (and finish any 2FA / human check), then close the browser window.")
 
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(profile, headless=False)
+        ctx = p.chromium.launch_persistent_context(**opts)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(url)
-        closed = False
         try:
-            while ctx.pages:
-                time.sleep(1)
-            closed = True
+            # Blocks until the user closes the browser window. (Don't poll with
+            # time.sleep here — that starves the sync-API event loop and hangs.)
+            ctx.wait_for_event("close", timeout=0)
         except Exception:
-            closed = True  # window closed under us — that's the expected exit
+            pass  # window closed under us — that's the expected exit
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
-    if closed:
-        print(f"Done — {platform} session saved. The booking channel will reuse it.")
+    print(f"Done — {platform} session saved. The booking channel will reuse it.")
     return 0
 
 

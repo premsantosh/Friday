@@ -28,6 +28,29 @@ def kill_switch_on() -> bool:
     return bool(os.getenv("RESERVATION_KILL_SWITCH"))
 
 
+def persistent_context_options(profile_dir: str) -> Dict[str, Any]:
+    """Launch kwargs shared by the booking channels and the login bootstrap.
+
+    These reduce *false-positive* bot flagging when driving a site with the
+    user's own logged-in account — they don't actively evade detection (the spec
+    forbids CAPTCHA-solving / stealth; §5.1, §8.3):
+      - `--disable-blink-features=AutomationControlled` drops the
+        `navigator.webdriver` tell that Playwright otherwise sets.
+      - RESERVATION_BROWSER_CHANNEL (e.g. "chrome", "msedge") uses the user's real
+        installed browser instead of bundled Chromium, which fingerprints as a
+        normal consumer browser. Empty → bundled Chromium.
+    """
+    opts: Dict[str, Any] = {
+        "user_data_dir": profile_dir,
+        "headless": False,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    channel = os.getenv("RESERVATION_BROWSER_CHANNEL", "").strip()
+    if channel:
+        opts["channel"] = channel
+    return opts
+
+
 class AvailabilityStatus(Enum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
@@ -194,4 +217,5 @@ class BrowserChannel(ReservationChannel):
         """Launch a persistent Chromium context so the user's login/cookies are reused."""
         os.makedirs(self.profile_dir, exist_ok=True)
         os.chmod(self.profile_dir, 0o700)  # session cookies are account-takeover tokens (§8 L3)
-        return await p.chromium.launch_persistent_context(self.profile_dir, headless=False)
+        return await p.chromium.launch_persistent_context(
+            **persistent_context_options(self.profile_dir))
