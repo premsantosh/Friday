@@ -158,9 +158,11 @@ class VoiceAssistant:
             print(f"[State] {state.value}")
     
     def _log(self, message: str):
-        """Log message if debug mode is enabled."""
+        """Log message if debug mode is enabled. Raw utterances can carry PII
+        (names, numbers, even card digits read aloud) — always redact (§8 L1)."""
         if self.config.debug_mode:
-            print(f"[Debug] {message}")
+            from core.harness import redact_text
+            print(f"[Debug] {redact_text(message)}")
     
     async def _maybe_start_session(self, workflow, text: str, entities: dict, user_id: str):
         """If `workflow` is conversational, open a multi-turn session and return its

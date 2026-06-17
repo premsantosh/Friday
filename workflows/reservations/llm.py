@@ -1,24 +1,37 @@
 """
-ReservationLLM — small structured-completion helper for the reservations agent.
+Reservation LLM tasks — declarations only.
 
-Three uses (all optional refinements over deterministic fallbacks):
+The generic machinery (JSON client, schema validation, grounding, fallback
+provenance, egress checks) lives in core/harness/extract.py. This module
+declares the three tasks the reservations agent uses, all optional refinements
+over deterministic fallbacks:
+
   - slot extraction from the opening utterance (fallback: regexes in workflow.py),
   - discovery method classification (fallback: heuristic in discovery.py),
   - email drafting (fallback: template in channels/email.py).
 
-`from_env()` returns None when ANTHROPIC_API_KEY or the SDK is missing, and every
-helper returns None/falls back on any failure, so nothing here is load-bearing.
-Card data is never included in any prompt (spec §8 L4), and classification
-prompts carry only business evidence — no user PII (L5).
+Anti-hallucination is declarative: `url`/`email` are grounded fields — they
+are dropped unless they literally appear in the evidence. Card data is never
+included in any prompt (spec §8 L4); classification prompts carry only
+business evidence — no user PII (L5). Both rules are enforced by the sinks.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from core.harness import (
+    FieldSpec,
+    JsonLLMClient,
+    LLMTask,
+    Sink,
+    SinkMode,
+    guard,
+    run_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,55 +39,23 @@ DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
+# Prompts are free text (the utterance/slots are the point), but nothing
+# card- or secret-shaped may ever reach the provider (spec §8 L4); the
+# classification sink additionally allows only business evidence (L5).
+LLM_TEXT_SINK = Sink("llm", SinkMode.SCAN)
+LLM_CLASSIFY_SINK = Sink("llm.classify", SinkMode.ALLOWLIST,
+                         frozenset({"business", "search_results"}))
 
-class ReservationLLM:
+
+class ReservationLLM(JsonLLMClient):
     """One-shot, history-free JSON completions (the personality-laden
     LLMProvider in llm/providers.py is unsuitable for structured extraction)."""
 
-    def __init__(self, client, model: str = DEFAULT_MODEL):
-        self.client = client
-        self.model = model
-
     @classmethod
     def from_env(cls) -> Optional["ReservationLLM"]:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            return None
-        try:
-            import anthropic
-        except Exception:
-            logger.warning("anthropic SDK unavailable; reservation LLM refinement off")
-            return None
-        model = os.getenv("RESERVATION_LLM_MODEL", DEFAULT_MODEL)
-        return cls(anthropic.Anthropic(api_key=api_key), model)
-
-    def complete_json(self, system: str, user: str,
-                      max_tokens: int = 700) -> Optional[Dict[str, Any]]:
-        """Returns the parsed JSON object, or None on any failure."""
-        try:
-            resp = self.client.messages.create(
-                model=self.model, max_tokens=max_tokens, system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            text = "".join(
-                b.text for b in resp.content if getattr(b, "type", None) == "text"
-            )
-            return _parse_json(text)
-        except Exception:
-            logger.warning("Reservation LLM call failed", exc_info=True)
-            return None
-
-
-def _parse_json(text: str) -> Optional[Dict[str, Any]]:
-    """Tolerates code fences and prose around the JSON object."""
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        parsed = json.loads(text[start:end + 1])
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        base = JsonLLMClient.from_env(model_env="RESERVATION_LLM_MODEL",
+                                      default_model=DEFAULT_MODEL)
+        return cls(base.client, base.model) if base is not None else None
 
 
 # --------------------------------------------------------------------- slot extraction
@@ -87,37 +68,52 @@ Reply with ONLY a JSON object — no prose. Keys (use null when not stated; neve
   party_size: integer number of people
   service_type: e.g. "dinner", "haircut", "60-minute massage" (null if not stated)
   special_requests: any notes (window seat, allergies, stylist preference...)
-  location: city/neighbourhood if the user states one"""
+  location: city/neighbourhood if the user states one
+  release_days_ahead: integer, ONLY if the user says how many days in advance
+    bookings open (e.g. "tables drop 30 days in advance" -> 30); else null
+  release_time: the time bookings open, verbatim, ONLY if stated
+    (e.g. "at 10am", "9:00 ET"); else null
+  release_timezone: a timezone the user attaches to the release time
+    (e.g. "ET", "PT", "America/New_York"); else null"""
 
-_STR_SLOTS = ("business_name", "date", "time", "service_type", "special_requests", "location")
+
+def _filler_business(name: str) -> bool:
+    """A business name made of filler words means the model ignored the rules."""
+    return any(w in name.lower() for w in ("reservation", "booking", "appointment", "table"))
+
+
+def _coerce_party(v: Any) -> Optional[int]:
+    if isinstance(v, str) and v.isdigit():
+        v = int(v)
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+EXTRACT_TASK = LLMTask(
+    name="slot_extraction",
+    system_prompt=_EXTRACT_SYSTEM,
+    sink=LLM_TEXT_SINK,
+    max_tokens=300,
+    fields=(
+        FieldSpec("business_name", str, max_len=120, reject_if=_filler_business),
+        FieldSpec("date", str, max_len=120),
+        FieldSpec("time", str, max_len=120),
+        FieldSpec("service_type", str, max_len=120),
+        FieldSpec("special_requests", str, max_len=120),
+        FieldSpec("location", str, max_len=120),
+        FieldSpec("party_size", int, coerce=_coerce_party,
+                  valid=lambda n: 1 <= n <= 100),
+        FieldSpec("release_days_ahead", int, coerce=_coerce_party,
+                  valid=lambda n: 1 <= n <= 365),
+        FieldSpec("release_time", str, max_len=40),
+        FieldSpec("release_timezone", str, max_len=40),
+    ),
+)
 
 
 def extract_slots(llm: Optional[ReservationLLM], text: str) -> Optional[Dict[str, Any]]:
     """LLM slot extraction. Returns a validated dict, or None (→ caller's regex fallback)."""
-    if llm is None:
-        return None
-    raw = llm.complete_json(_EXTRACT_SYSTEM, text, max_tokens=300)
-    if raw is None:
-        return None
-
-    slots: Dict[str, Any] = {}
-    for key in _STR_SLOTS:
-        v = raw.get(key)
-        if isinstance(v, str):
-            v = v.strip()
-            if v and len(v) <= 120 and v.lower() not in ("null", "none", "n/a"):
-                slots[key] = v
-    party = raw.get("party_size")
-    if isinstance(party, str) and party.isdigit():
-        party = int(party)
-    if isinstance(party, int) and 1 <= party <= 100:
-        slots["party_size"] = party
-
-    # A business name made of filler words means the model ignored the rules.
-    biz = slots.get("business_name", "").lower()
-    if biz and any(w in biz for w in ("reservation", "booking", "appointment", "table")):
-        slots.pop("business_name")
-    return slots or None
+    result = run_task(llm, EXTRACT_TASK, text)
+    return result.values if result.from_llm else None
 
 
 # ----------------------------------------------------------------- method classification
@@ -141,38 +137,117 @@ Rules:
 _VALID_METHODS = {"opentable", "resy", "yelp", "generic_web", "phone", "email", "unknown"}
 
 
+def _coerce_confidence(v: Any) -> float:
+    return min(1.0, max(0.0, float(v)))
+
+
+def _finalize_classification(values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    values.setdefault("url", None)
+    values.setdefault("email", None)
+    values.setdefault("requires_card", False)
+    values.setdefault("confidence", 0.5)
+    values.setdefault("notes", "")
+    if values["method"] == "email" and not values["email"]:
+        return None  # an email decision without a grounded address is useless
+    return values
+
+
+CLASSIFY_TASK = LLMTask(
+    name="method_classification",
+    system_prompt=_CLASSIFY_SYSTEM,
+    sink=LLM_TEXT_SINK,     # payload is the evidence JSON; allowlist applied upstream
+    max_tokens=300,
+    fields=(
+        FieldSpec("method", str, required=True, valid=lambda m: m in _VALID_METHODS),
+        FieldSpec("url", str, grounded=True),
+        FieldSpec("email", str, grounded=True,
+                  valid=lambda e: bool(_EMAIL_RE.fullmatch(e))),
+        FieldSpec("requires_card", bool, coerce=bool),
+        FieldSpec("confidence", float, coerce=_coerce_confidence),
+        FieldSpec("notes", str, max_len=300),
+    ),
+    finalize=_finalize_classification,
+)
+
+
 def classify_method(llm: Optional[ReservationLLM],
                     evidence: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """LLM method classification over discovery evidence. Returns a validated dict
-    {method, url, email, requires_card, confidence, notes} or None (→ heuristic)."""
+    {method, url, email, requires_card, confidence, notes} or None (→ heuristic).
+    Contact details are grounded fields: hallucinated ones are dropped."""
     if llm is None:
         return None
+    guard(LLM_CLASSIFY_SINK, evidence)
     evidence_json = json.dumps(evidence, ensure_ascii=False, default=str)
-    raw = llm.complete_json(_CLASSIFY_SYSTEM, evidence_json, max_tokens=300)
-    if raw is None or raw.get("method") not in _VALID_METHODS:
+    result = run_task(llm, CLASSIFY_TASK, evidence_json, evidence=evidence_json)
+    return result.values if result.from_llm else None
+
+
+# ------------------------------------------------------- reservation-release policy
+
+_RELEASE_SYSTEM = """You determine WHEN a venue releases its reservations, from
+search evidence (which may include forum/Reddit threads). Reply with ONLY a JSON object:
+  opens_days_in_advance: integer days before the dining date that booking opens
+    (e.g. "tables drop 30 days out" -> 30) or null
+  release_time: the local clock time bookings open, copied verbatim from the
+    evidence (e.g. "10am", "9:00 AM") or null
+  release_timezone: the timezone for that time, copied from the evidence
+    (e.g. "ET", "PT", "America/New_York") or null
+  rolling: true if a new day opens each day at that lead time; false for a batch
+    drop (e.g. all of next month at once)
+  confidence: 0.0-1.0 — lower it when sources disagree or are old/anecdotal
+  source_quote: the sentence from the evidence that states the policy
+  notes: one short sentence (mention if this came from a forum rather than the venue)
+Rules:
+- Use ONLY the evidence; never guess a time or day count that isn't stated.
+- Prefer the venue's own/official statement; treat forum posts as corroboration
+  and lower confidence when they're the only source or conflict with each other."""
+
+
+def _finalize_release(values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # A usable policy needs both the lead days and the clock time to fire on.
+    if values.get("opens_days_in_advance") is None or not values.get("release_time"):
         return None
+    values.setdefault("release_timezone", None)
+    values.setdefault("rolling", True)
+    values.setdefault("confidence", 0.5)
+    values.setdefault("source_quote", "")
+    values.setdefault("notes", "")
+    return values
 
-    out: Dict[str, Any] = {"method": raw["method"]}
 
-    # Anti-hallucination: contact details must literally appear in the evidence.
-    url = raw.get("url")
-    out["url"] = url if isinstance(url, str) and url in evidence_json else None
-    email = raw.get("email")
-    if isinstance(email, str) and _EMAIL_RE.fullmatch(email) and email in evidence_json:
-        out["email"] = email
-    else:
-        out["email"] = None
-    if out["method"] == "email" and not out["email"]:
-        return None  # an email decision without an address is useless
+RELEASE_POLICY_TASK = LLMTask(
+    name="release_policy",
+    system_prompt=_RELEASE_SYSTEM,
+    sink=LLM_TEXT_SINK,
+    max_tokens=400,
+    fields=(
+        FieldSpec("opens_days_in_advance", int, coerce=_coerce_party,
+                  valid=lambda n: 1 <= n <= 365),
+        FieldSpec("release_time", str, grounded=True, max_len=40),
+        # Not grounded: a small closed vocabulary, and the model reliably maps
+        # "Eastern Time" -> "ET"; grounding it just drops the normalized form.
+        FieldSpec("release_timezone", str, max_len=40),
+        FieldSpec("rolling", bool, coerce=bool),
+        FieldSpec("confidence", float, coerce=_coerce_confidence),
+        FieldSpec("source_quote", str, grounded=True, max_len=400),
+        FieldSpec("notes", str, max_len=300),
+    ),
+    finalize=_finalize_release,
+)
 
-    out["requires_card"] = bool(raw.get("requires_card"))
-    try:
-        out["confidence"] = min(1.0, max(0.0, float(raw.get("confidence", 0.5))))
-    except (TypeError, ValueError):
-        out["confidence"] = 0.5
-    notes = raw.get("notes")
-    out["notes"] = notes.strip()[:300] if isinstance(notes, str) else ""
-    return out
+
+def extract_release_policy(llm: Optional[ReservationLLM],
+                           evidence: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """LLM extraction of a venue's reservation-release policy over web/Reddit
+    evidence. Returns {opens_days_in_advance, release_time, release_timezone,
+    rolling, confidence, source_quote, notes} or None when not grounded."""
+    if llm is None:
+        return None
+    guard(LLM_CLASSIFY_SINK, evidence)
+    evidence_json = json.dumps(evidence, ensure_ascii=False, default=str)
+    result = run_task(llm, RELEASE_POLICY_TASK, evidence_json, evidence=evidence_json)
+    return result.values if result.from_llm else None
 
 
 # ------------------------------------------------------------------------ email drafting
@@ -183,10 +258,21 @@ Plain text body, no markdown. Include the party size, date, time (and flexibilit
 given), the guest's name, and their callback phone if provided. Ask them to confirm
 availability or suggest the nearest alternative. Never mention payment card details."""
 
+DRAFT_TASK = LLMTask(
+    name="email_draft",
+    system_prompt=_DRAFT_SYSTEM,
+    sink=LLM_TEXT_SINK,
+    max_tokens=600,
+    fields=(
+        FieldSpec("subject", str, required=True, max_len=200),
+        FieldSpec("body", str, required=True, max_len=4000),
+    ),
+)
+
 
 def make_llm_drafter(llm: ReservationLLM, fallback) -> "callable":
-    """Wraps an LLM into the EmailChannel drafter signature, falling back to the
-    template drafter on any failure."""
+    """Wraps the draft task into the EmailChannel drafter signature, falling
+    back to the template drafter on any failure."""
 
     def drafter(slots: Dict[str, Any], decision,
                 instruction: Optional[str] = None) -> Tuple[str, str]:
@@ -201,9 +287,9 @@ def make_llm_drafter(llm: ReservationLLM, fallback) -> "callable":
         }
         if instruction:
             facts["revision_instruction_from_guest"] = instruction
-        raw = llm.complete_json(_DRAFT_SYSTEM, json.dumps(facts, default=str), max_tokens=600)
-        if raw and isinstance(raw.get("subject"), str) and isinstance(raw.get("body"), str):
-            return raw["subject"].strip(), raw["body"].strip()
+        result = run_task(llm, DRAFT_TASK, facts)
+        if result.from_llm:
+            return result.values["subject"], result.values["body"]
         return fallback(slots, decision, instruction=instruction)
 
     return drafter

@@ -35,7 +35,7 @@ class GenericWebChannel(BrowserChannel):
     def __init__(self, profile_dir: str):
         super().__init__(ReservationMethod.GENERIC_WEB, "generic_web", profile_dir)
 
-    async def _do_booking(self, plan: CommitPlan) -> BookingResult:
+    async def _do_booking(self, plan: CommitPlan, payment: Any = None) -> BookingResult:
         import re
 
         from playwright.async_api import async_playwright

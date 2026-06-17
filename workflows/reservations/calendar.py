@@ -3,40 +3,34 @@ CalendarService (M4).
 
 On a confirmed booking, creates a Google Calendar event with the reservation
 details. The event *insertion* is pluggable: the real Google inserter is wired
-only when credentials are configured; otherwise it's a safe no-op. Building the
-event dict and parsing the human date/time are deterministic and tested.
+only when credentials are configured; otherwise it's a safe no-op.
+
+Dates/times arrive already canonicalized by the harness (ISO `YYYY-MM-DD`,
+24-hour `HH:MM` — core/harness/normalize.py), so this service does no parsing
+of human phrasing; uncanonical input means "skip the event", never a guess.
 
 Creating the event never fails the booking — failures are logged and ignored.
 """
 
 from __future__ import annotations
 
-import calendar as _calendar
 import logging
 import os
-import re
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _DURATION_MIN = 90
-_WEEKDAYS = {
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-    "friday": 4, "saturday": 5, "sunday": 6,
-}
-_TIME_RE = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", re.I)
 
 
 class CalendarService:
     def __init__(self, calendar_id: str = "primary",
                  inserter: Optional[Callable[[str, Dict[str, Any]], Optional[str]]] = None,
-                 timezone: Optional[str] = None,
-                 now: Optional[Callable[[], datetime]] = None):
+                 timezone: Optional[str] = None):
         self.calendar_id = calendar_id
         self._inserter = inserter           # callable(calendar_id, event_dict) -> link/id or None
         self.timezone = timezone
-        self._now = now or datetime.now     # injectable for deterministic tests
 
     @classmethod
     def from_env(cls) -> "CalendarService":
@@ -93,66 +87,18 @@ class CalendarService:
             event["end"]["timeZone"] = self.timezone
         return event
 
-    # ------------------------------------------------------------------ parsing
-    def _parse_when(self, date_str: Optional[str],
-                    time_str: Optional[str]) -> Optional[Tuple[datetime, datetime]]:
-        day = self._parse_date(date_str)
-        tod = self._parse_time(time_str)
-        if day is None or tod is None:
-            return None
-        start = day.replace(hour=tod[0], minute=tod[1], second=0, microsecond=0)
-        return start, start + timedelta(minutes=_DURATION_MIN)
-
-    def _parse_date(self, s: Optional[str]) -> Optional[datetime]:
-        if not s:
-            return None
-        s = s.strip().lower()
-        today = self._now()
-        if s in ("today", "tonight", "this evening", "this afternoon"):
-            return today
-        if s == "tomorrow":
-            return today + timedelta(days=1)
-
-        m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", s)
-        if m:
-            month, dayn = int(m.group(1)), int(m.group(2))
-            year = int(m.group(3)) if m.group(3) else today.year
-            if year < 100:
-                year += 2000
-            try:
-                return today.replace(year=year, month=month, day=dayn)
-            except ValueError:
-                return None
-
-        for name, idx in _WEEKDAYS.items():
-            if name in s:
-                ahead = (idx - today.weekday()) % 7
-                if ahead == 0 or "next" in s:
-                    ahead = ahead or 7
-                    if "next" in s and (idx - today.weekday()) % 7 != 0:
-                        ahead = (idx - today.weekday()) % 7
-                    else:
-                        ahead = 7 if ahead == 0 else ahead
-                return today + timedelta(days=ahead)
-        return None
-
+    # ------------------------------------------------------------------ canonical
     @staticmethod
-    def _parse_time(s: Optional[str]) -> Optional[Tuple[int, int]]:
-        if not s:
+    def _parse_when(date_str: Optional[str],
+                    time_str: Optional[str]) -> Optional[Tuple[datetime, datetime]]:
+        """Canonical 'YYYY-MM-DD' + 'HH:MM' → (start, end). Anything else → None."""
+        if not date_str or not time_str:
             return None
-        m = _TIME_RE.search(s.strip().lower())
-        if not m:
+        try:
+            start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        except ValueError:
             return None
-        hour = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        ampm = m.group(3)
-        if ampm == "pm" and hour < 12:
-            hour += 12
-        elif ampm == "am" and hour == 12:
-            hour = 0
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            return None
-        return hour, minute
+        return start, start + timedelta(minutes=_DURATION_MIN)
 
 
 def _google_inserter_from_env() -> Optional[Callable[[str, Dict[str, Any]], Optional[str]]]:

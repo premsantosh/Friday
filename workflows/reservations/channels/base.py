@@ -12,6 +12,7 @@ all degrade to a safe, honest hand-off instead of a fake success.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -49,6 +50,17 @@ def persistent_context_options(profile_dir: str) -> Dict[str, Any]:
     if channel:
         opts["channel"] = channel
     return opts
+
+
+def storage_state_path(profile_dir: str) -> str:
+    """Where the login bootstrap saves cookies for the booking channel to replay.
+
+    A sibling of the profile dir (e.g. ~/.friday/browser/resy.storage.json). The
+    persistent profile keeps localStorage and *persistent* cookies on disk by
+    itself, but Chromium drops session cookies (expires=-1) on every relaunch and
+    some sites (Resy) carry auth in those — so we capture and replay them.
+    """
+    return profile_dir.rstrip(os.sep) + ".storage.json"
 
 
 class AvailabilityStatus(Enum):
@@ -159,12 +171,9 @@ class BrowserChannel(ReservationChannel):
         )
 
     async def commit(self, plan: CommitPlan, payment: Any = None) -> BookingResult:
-        if kill_switch_on():
-            return BookingResult(
-                success=False, needs_manual=True,
-                message="I'm in research-only mode (kill switch on), sir, so I haven't booked it.",
-                error="kill_switch",
-            )
+        # Policy (kill switch, approval, idempotency) lives in the ActionGate the
+        # workflow routes every commit through — channels are pure executors.
+        # The checks below are operational (missing card / missing dependency).
         if plan.requires_card and payment is None:
             # Payment (single-use Privacy card) is wired in M3.
             return BookingResult(
@@ -189,7 +198,7 @@ class BrowserChannel(ReservationChannel):
             )
 
         try:
-            return await self._do_booking(plan)
+            return await self._do_booking(plan, payment)
         except Exception as exc:
             logger.exception("Browser commit failed on %s", self.platform)
             return BookingResult(
@@ -201,8 +210,13 @@ class BrowserChannel(ReservationChannel):
                 error=str(exc),
             )
 
-    async def _do_booking(self, plan: CommitPlan) -> BookingResult:
-        """Override per site. Default: open the page, then hand off (no fake success)."""
+    async def _do_booking(self, plan: CommitPlan, payment: Any = None) -> BookingResult:
+        """Override per site. Default: open the page, then hand off (no fake success).
+
+        `payment` is the single-use card minted upstream when the booking needs
+        one; sites that complete a card-on-file flow themselves use it, others
+        ignore it (the gate already refused the commit if a card was required
+        and none was provided)."""
         return BookingResult(
             success=False, needs_manual=True,
             message=(
@@ -214,8 +228,38 @@ class BrowserChannel(ReservationChannel):
 
     # ------------------------------------------------------------------ helpers
     async def _launch(self, p):
-        """Launch a persistent Chromium context so the user's login/cookies are reused."""
+        """Launch a persistent Chromium context so the user's login/cookies are reused.
+
+        The profile dir restores localStorage and persistent cookies on its own;
+        we additionally replay the cookies captured by the login bootstrap so
+        session cookies (which Chromium otherwise drops on relaunch) survive.
+        """
         os.makedirs(self.profile_dir, exist_ok=True)
         os.chmod(self.profile_dir, 0o700)  # session cookies are account-takeover tokens (§8 L3)
-        return await p.chromium.launch_persistent_context(
+        ctx = await p.chromium.launch_persistent_context(
             **persistent_context_options(self.profile_dir))
+        await self._restore_cookies(ctx)
+        return ctx
+
+    async def _restore_cookies(self, ctx) -> None:
+        """Replay saved storage_state cookies (incl. session cookies) into the context.
+
+        No-op when the login bootstrap hasn't run yet — the channel still falls
+        back to whatever the persistent profile holds, then hands off if logged out.
+        """
+        path = storage_state_path(self.profile_dir)
+        try:
+            with open(path) as fh:
+                cookies = json.load(fh).get("cookies", [])
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.warning("Couldn't read saved session for %s (%s)", self.platform, path,
+                           exc_info=True)
+            return
+        if not cookies:
+            return
+        try:
+            await ctx.add_cookies(cookies)
+        except Exception:
+            logger.warning("Couldn't replay saved cookies for %s", self.platform, exc_info=True)

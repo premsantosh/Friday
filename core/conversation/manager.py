@@ -141,4 +141,13 @@ class SessionManager:
     def _close(self, session: Session, status: SessionStatus) -> None:
         session.status = status
         session.updated_at = time.time()
+        # Give the owning workflow its one terminal hook (e.g. PII purge)
+        # before the final save. A hook failure never blocks the close.
+        workflow = self.workflows.workflows.get(session.workflow_name) if self.workflows else None
+        if workflow is not None and hasattr(workflow, "on_terminal"):
+            try:
+                workflow.on_terminal(session)
+            except Exception:
+                logger.warning("on_terminal failed for session %s",
+                               session.session_id, exc_info=True)
         self.store.save(session)

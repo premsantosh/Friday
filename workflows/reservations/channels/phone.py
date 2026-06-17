@@ -22,10 +22,18 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from core.harness import Sink, SinkMode, guard
+
 from ..models import ChannelDecision, ReservationMethod
 from .base import Availability, AvailabilityStatus, BookingResult, CommitPlan, ReservationChannel
 
 logger = logging.getLogger(__name__)
+
+# What may leave for Bland: the destination, the call plan, minimal request
+# context, and the outcome schema. The free text is still scanned (no card
+# data is ever voiced; spec §8 L6).
+BLAND_SINK = Sink("bland", SinkMode.ALLOWLIST,
+                  frozenset({"phone_number", "task", "request_data", "analysis_schema"}))
 
 POLL_SECONDS = 60          # how often to poll Bland for a result
 RETRY_DELAY_SECONDS = 300  # wait between call attempts on no-answer
@@ -68,6 +76,23 @@ class BlandClient:
 
     def place_call(self, phone_number: str, task: str,
                    request_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        payload = {
+            "phone_number": phone_number,
+            "task": task,
+            "request_data": request_data or {},
+            # Ask Bland to return a structured outcome under "analysis".
+            "analysis_schema": {
+                "outcome": "one of: confirmed, no_availability, email_requested, "
+                           "callback_required, needs_info, failed",
+                "confirmation_number": "string or null",
+                "negotiated_time": "string or null",
+                "email_address": "string or null",
+                "question": "string or null",
+            },
+        }
+        # Outside the try: a blocked payload must fail the call loudly (the
+        # gate turns it into an honest refusal), not look like a network blip.
+        guard(BLAND_SINK, payload)
         try:
             poster = self._poster
             if poster is None:
@@ -76,20 +101,7 @@ class BlandClient:
             resp = poster(
                 f"{self.base_url}/calls",
                 headers={"authorization": self.api_key},
-                json={
-                    "phone_number": phone_number,
-                    "task": task,
-                    "request_data": request_data or {},
-                    # Ask Bland to return a structured outcome under "analysis".
-                    "analysis_schema": {
-                        "outcome": "one of: confirmed, no_availability, email_requested, "
-                                   "callback_required, needs_info, failed",
-                        "confirmation_number": "string or null",
-                        "negotiated_time": "string or null",
-                        "email_address": "string or null",
-                        "question": "string or null",
-                    },
-                },
+                json=payload,
                 timeout=15,
             )
             data = resp.json()
@@ -217,12 +229,13 @@ class PhoneChannel(ReservationChannel):
             outcome = PhoneOutcome.NO_AVAILABILITY
         elif has("confirmed", "all set", "see you", "you're booked", "reservation is set"):
             outcome = PhoneOutcome.CONFIRMED
+        elif has("voicemail", "no answer", "didn't answer", "busy"):
+            # Before the email check — "voicemail" contains "email".
+            outcome = PhoneOutcome.FAILED
         elif has("email"):
             outcome = PhoneOutcome.EMAIL_REQUESTED
         elif has("call back", "callback", "call you back"):
             outcome = PhoneOutcome.CALLBACK_REQUIRED
-        elif has("voicemail", "no answer", "didn't answer", "busy"):
-            outcome = PhoneOutcome.FAILED
         else:
             outcome = PhoneOutcome.NEEDS_INFO
 

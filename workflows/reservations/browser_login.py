@@ -8,9 +8,11 @@ One-time login bootstrap for the reservation browser channels.
 
 Opens a visible Chromium window on the platform's sign-in page using the same
 persistent profile the booking channels use (RESERVATION_BROWSER_DIR, default
-~/.friday/browser/<platform>). Log in once — including any 2FA — then close the
-window; the session cookies persist and the channel reuses them. No passwords
-are ever stored by Friday (spec §8 L3: the profile dir is chmod 0700).
+~/.friday/browser/<platform>). Log in once — including any 2FA — then press Enter
+in this terminal (leave the browser open). We snapshot the session cookies to a
+0600 storage-state file the booking channel replays, so session cookies survive
+relaunches (the persistent profile alone drops them). No passwords are ever
+stored by Friday (spec §8 L3: profile dir and state file are chmod 0700/0600).
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import os
 import stat
 import sys
 
-from .channels.base import persistent_context_options
+from .channels.base import persistent_context_options, storage_state_path
 
 LOGIN_URLS = {
     "opentable": "https://www.opentable.com/signin",
@@ -57,28 +59,38 @@ def main(argv: list[str]) -> int:
         return 1
 
     profile = _profile_dir(platform)
+    state_path = storage_state_path(profile)
     opts = persistent_context_options(profile)
     print(f"Opening {url}\nProfile: {profile}")
     if opts.get("channel"):
         print(f"Using your installed '{opts['channel']}' browser.")
-    print("Log in (and finish any 2FA / human check), then close the browser window.")
+    print("Log in (and finish any 2FA / human check) in the browser window.")
 
+    saved = False
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(**opts)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(url)
         try:
-            # Blocks until the user closes the browser window. (Don't poll with
-            # time.sleep here — that starves the sync-API event loop and hangs.)
-            ctx.wait_for_event("close", timeout=0)
-        except Exception:
-            pass  # window closed under us — that's the expected exit
+            # Snapshot must happen while the context is alive, so we wait on a
+            # terminal keypress rather than the window close — closing the window
+            # tears the context down before we can read storage_state.
+            input("\nPress Enter HERE once you're logged in — keep the browser open... ")
+            ctx.storage_state(path=state_path)
+            os.chmod(state_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — auth tokens (§8 L3)
+            saved = True
+        except Exception as exc:
+            print(f"Couldn't save the session: {exc}\n"
+                  "Re-run and press Enter only after you've finished logging in "
+                  "(don't close the browser first).")
         finally:
             try:
                 ctx.close()
             except Exception:
                 pass
-    print(f"Done — {platform} session saved. The booking channel will reuse it.")
+    if not saved:
+        return 1
+    print(f"Done — {platform} session saved to {state_path}. The booking channel will replay it.")
     return 0
 
 

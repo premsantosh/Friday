@@ -149,6 +149,17 @@ class ConversationalWorkflow(Workflow):
     session_timeout_s: int = 600
     read_only: bool = False
 
+    # Slot keys holding user PII, purged when the session reaches a terminal
+    # status (the SessionManager calls on_terminal once). Booking/task facts
+    # the user may ask about later should NOT be listed here.
+    pii_slots: tuple = ()
+
+    def on_terminal(self, session: "Session") -> None:
+        """Called once when the session becomes DONE/CANCELLED/EXPIRED."""
+        if self.pii_slots:
+            from core.harness import purge_slots
+            purge_slots(session, self.pii_slots)
+
     @abstractmethod
     async def start(self, intent: str, entities: Dict[str, Any], session: "Session") -> "TurnResult":
         """First turn: seed slots from the utterance, return the next prompt/confirmation."""

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 class ReservationMethod(Enum):
@@ -23,16 +23,41 @@ class ReservationMethod(Enum):
     UNKNOWN = "unknown"
 
 
-# Essentials collected up front. Channel-specific extras (email, card, seating
-# preference, …) are gathered lazily once a channel is chosen.
-ESSENTIAL_SLOTS: tuple = ("business_name", "date", "time", "party_size")
+# Essentials collected up front, each with its deterministic normalizer —
+# values are canonicalized (ISO date, 24h time, bounded int) the moment they
+# enter the slots, and re-asked when the normalizer rejects them.
+# Channel-specific extras (email, card, seating preference, …) are gathered
+# lazily once a channel is chosen.
+from core.harness import (  # noqa: E402  (import after docstring block by design)
+    SlotSpec,
+    normalize_date,
+    normalize_party_size,
+    normalize_text,
+    normalize_time,
+)
 
-SLOT_PROMPTS: Dict[str, str] = {
-    "business_name": "Which establishment shall I book, sir?",
-    "date": "For which date, sir?",
-    "time": "At what time, sir?",
-    "party_size": "For how many people, sir?",
-}
+ESSENTIAL_SLOT_SPECS: tuple = (
+    SlotSpec("business_name",
+             "Which establishment shall I book, sir?",
+             "I didn't catch the establishment's name, sir — which place shall I book?",
+             normalize_text),
+    SlotSpec("date",
+             "For which date, sir?",
+             "I couldn't make out the date, sir — something like \"next Friday\" or \"June 14\"?",
+             normalize_date),
+    SlotSpec("time",
+             "At what time, sir?",
+             "I couldn't make out the time, sir — something like \"7pm\"?",
+             normalize_time),
+    SlotSpec("party_size",
+             "For how many people, sir?",
+             "How many shall I say, sir — just a number?",
+             normalize_party_size),
+)
+
+SLOT_SPECS_BY_NAME: Dict[str, SlotSpec] = {s.name: s for s in ESSENTIAL_SLOT_SPECS}
+ESSENTIAL_SLOTS: tuple = tuple(s.name for s in ESSENTIAL_SLOT_SPECS)
+SLOT_PROMPTS: Dict[str, str] = {s.name: s.prompt for s in ESSENTIAL_SLOT_SPECS}
 
 _METHOD_PHRASES: Dict[ReservationMethod, str] = {
     ReservationMethod.OPENTABLE: "They take reservations through OpenTable.",
@@ -43,6 +68,30 @@ _METHOD_PHRASES: Dict[ReservationMethod, str] = {
     ReservationMethod.EMAIL: "They take reservation requests by email.",
     ReservationMethod.UNKNOWN: "I could not yet determine how they take reservations.",
 }
+
+
+@dataclass
+class ReleasePolicy:
+    """When a venue releases reservations, as discovered from the web/forums."""
+    days_in_advance: int
+    release_time: str               # verbatim clock time, e.g. "10am"
+    timezone: Optional[str] = None  # "ET" / "America/New_York" / None
+    rolling: bool = True
+    confidence: float = 0.0
+    source_quote: str = ""
+    notes: str = ""
+
+    @classmethod
+    def from_extraction(cls, d: Dict[str, Any]) -> "ReleasePolicy":
+        return cls(
+            days_in_advance=int(d["opens_days_in_advance"]),
+            release_time=d["release_time"],
+            timezone=d.get("release_timezone"),
+            rolling=bool(d.get("rolling", True)),
+            confidence=float(d.get("confidence", 0.0)),
+            source_quote=d.get("source_quote", ""),
+            notes=d.get("notes", ""),
+        )
 
 
 @dataclass
@@ -73,6 +122,7 @@ class ChannelDecision:
             "phone": self.phone,
             "email": self.email,
             "address": self.address,
+            "hours": self.hours,
             "timezone": self.timezone,
             "confidence": self.confidence,
             "requires_card_hint": self.requires_card_hint,

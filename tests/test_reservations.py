@@ -5,6 +5,7 @@ Tests for the Reservations agent — M1 (discovery + multi-turn collection, no c
 import pytest
 
 from core.conversation import InMemorySessionStore, SessionManager, TurnControl
+from core.harness import ActionGate, AuditLog
 from search.provider import SearchResult
 from workflows.base import WorkflowManager
 from workflows.reservations import (
@@ -24,7 +25,12 @@ from workflows.reservations.channels import (
 )
 from workflows.reservations.calendar import CalendarService
 from workflows.reservations.notify import SignalNotifier
-from workflows.reservations.payment import PrivacyCardService, VirtualCard
+from workflows.reservations.payment import (
+    ManualCardService,
+    PrivacyCardService,
+    VirtualCard,
+    card_service_from_env,
+)
 
 from datetime import datetime
 
@@ -35,7 +41,7 @@ class FakeSearch:
     def __init__(self, results):
         self._results = results
 
-    def search(self, query, max_results=5):
+    def search(self, query, max_results=5, include_domains=None):
         return self._results
 
 
@@ -115,9 +121,18 @@ def card_hint_result():
                          url="https://www.opentable.com/lazy-bear")]
 
 
+def make_test_gate():
+    """Real gate + policies, but an in-memory audit DB so tests leave no files."""
+    from workflows.reservations.workflow import RESERVATION_MACHINE
+    return ActionGate.with_defaults(kill_switch_env="RESERVATION_KILL_SWITCH",
+                                    audit=AuditLog(":memory:"),
+                                    gate_states=RESERVATION_MACHINE.gate_states)
+
+
 def make_reservation_manager(discovery, router=None):
     wf_manager = WorkflowManager()
-    wf_manager.register(ReservationWorkflow(discovery=discovery, router=router, llm=None))
+    wf_manager.register(ReservationWorkflow(discovery=discovery, router=router, llm=None,
+                                            gate=make_test_gate()))
     return SessionManager(InMemorySessionStore(), wf_manager, default_timeout_s=1800)
 
 
@@ -136,6 +151,30 @@ def test_discovery_classifies_opentable_from_link():
     assert "opentable.com" in decision.url
     assert decision.phone == "+14155551234"
     assert "San Francisco" in decision.address
+
+
+class RecordingSearch:
+    """A search provider that records each call (and returns fixed results)."""
+    def __init__(self, results):
+        self._results = results
+        self.queries = []
+        self.calls = []
+
+    def search(self, query, max_results=5, include_domains=None):
+        self.queries.append(query)
+        self.calls.append({"query": query, "include_domains": include_domains})
+        return self._results
+
+
+def test_discovery_search_includes_location():
+    """Regression: without the city in the query, common names resolve to the
+    wrong place (e.g. "Flores" -> a New York venue instead of San Francisco)."""
+    search = RecordingSearch(opentable_result())
+    disc = BusinessDiscovery(search_provider=search, yelp_client=FakeYelp(yelp_business()))
+    disc.discover("Flores", "San Francisco")
+    assert search.queries, "discovery should have run a web search"
+    assert "San Francisco" in search.queries[0]
+    assert "Flores" in search.queries[0]
 
 
 def test_discovery_falls_back_to_phone():
@@ -162,6 +201,111 @@ def test_discovery_detects_card_hint_and_appointment_platform():
     assert decision.requires_card_hint is True
 
 
+# ----------------------------------------------------- discovery via Google Places
+
+from workflows.reservations import GooglePlacesClient, YelpClient  # noqa: E402
+
+
+def google_place():
+    return {
+        "displayName": {"text": "Lazy Bear"},
+        "formattedAddress": "3416 19th St, San Francisco, CA 94110",
+        "internationalPhoneNumber": "+1 415-555-1234",
+        "websiteUri": "https://www.lazybearsf.com",
+        "regularOpeningHours": {
+            # Google: day 0 = Sunday. Tue 17:00–22:00 and Sun 17:00–02:00 (overnight).
+            "periods": [
+                {"open": {"day": 2, "hour": 17, "minute": 0},
+                 "close": {"day": 2, "hour": 22, "minute": 0}},
+                {"open": {"day": 0, "hour": 17, "minute": 0},
+                 "close": {"day": 1, "hour": 2, "minute": 0}},
+            ]
+        },
+    }
+
+
+def test_google_places_client_normalizes_to_resolver_shape():
+    captured = {}
+
+    class Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"places": [google_place()]}
+
+    def poster(url, headers=None, json=None, timeout=None):
+        captured.update(url=url, headers=headers, body=json)
+        return Resp()
+
+    biz = GooglePlacesClient("g-key", poster=poster).match("Lazy Bear", "San Francisco")
+
+    assert captured["url"].endswith("places:searchText")
+    assert captured["headers"]["X-Goog-Api-Key"] == "g-key"
+    assert "places.regularOpeningHours" in captured["headers"]["X-Goog-FieldMask"]
+    assert captured["body"]["textQuery"] == "Lazy Bear San Francisco"
+
+    assert biz["name"] == "Lazy Bear"
+    assert biz["phone"] == "+14155551234"                  # normalized for dialing
+    assert biz["url"] == "https://www.lazybearsf.com"
+    assert "San Francisco" in biz["location"]["display_address"][0]
+    # Day indices converted to Yelp convention (0 = Monday): Tue → 1, Sun → 6.
+    opens = biz["hours"][0]["open"]
+    assert {"day": 1, "start": "1700", "end": "2200"} in opens
+    assert {"day": 6, "start": "1700", "end": "0200"} in opens
+
+
+def test_google_places_client_returns_none_on_failure():
+    def poster(*a, **k):
+        raise RuntimeError("network down")
+
+    assert GooglePlacesClient("g-key", poster=poster).match("Lazy Bear") is None
+
+
+def test_discovery_prefers_google_over_yelp(monkeypatch):
+    for var in ("ANTHROPIC_API_KEY", "TAVILY_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GOOGLE_PLACES_API_KEY", "g")
+    monkeypatch.setenv("YELP_API_KEY", "y")
+    assert isinstance(BusinessDiscovery.from_env().business, GooglePlacesClient)
+
+    monkeypatch.delenv("GOOGLE_PLACES_API_KEY")
+    assert isinstance(BusinessDiscovery.from_env().business, YelpClient)
+
+    monkeypatch.delenv("YELP_API_KEY")
+    assert BusinessDiscovery.from_env().business is None
+
+
+def test_discovery_carries_google_hours_into_decision_and_phone_plan():
+    # No booking link found + a phone number → PHONE method, with the resolver's
+    # hours flowing through to the channel decision (off-hours deferral input).
+    normalized = GooglePlacesClient._normalize(google_place())
+
+    class FakeGoogle:
+        source_name = "google_places"
+
+        def match(self, name, location=""):
+            return normalized
+
+    disc = BusinessDiscovery(FakeSearch([]), FakeGoogle())
+    decision = disc.discover("Lazy Bear")
+    assert decision.method == ReservationMethod.PHONE
+    assert decision.phone == "+14155551234"
+    assert decision.hours == normalized["hours"]
+    assert decision.source == "google_places"
+    # And the hours survive the slots round-trip (restart safety).
+    assert decision.to_dict()["hours"] == normalized["hours"]
+
+    # The phone channel reads them: Tuesday 6pm → open; Tuesday 3pm → deferred
+    # to the 17:00 opening (Yelp-day 1 = Tuesday).
+    ch = PhoneChannel(client=None)
+    open_now, _ = ch.is_open_now({"hours": decision.hours}, datetime(2026, 6, 16, 18, 0))
+    assert open_now is True
+    closed, next_open = ch.is_open_now({"hours": decision.hours}, datetime(2026, 6, 16, 15, 0))
+    assert closed is False
+    assert datetime.fromtimestamp(next_open).hour == 17
+
+
 # ----------------------------------------------------------------- extraction
 
 def test_extract_slots_from_full_request():
@@ -169,8 +313,13 @@ def test_extract_slots_from_full_request():
     slots = wf._extract_slots("book a table for 2 at Lazy Bear next friday at 7pm")
     assert slots["party_size"] == 2
     assert slots["business_name"].lower() == "lazy bear"
-    assert "7pm" in slots["time"].lower().replace(" ", "")
-    assert "friday" in slots["date"].lower()
+    # Values are canonicalized at extraction (harness normalize): 24h time,
+    # ISO date resolved against now, with the verbatim phrasing kept in *_raw.
+    assert slots["time"] == "19:00"
+    parsed = datetime.fromisoformat(slots["date"])
+    assert parsed.weekday() == 4                      # a Friday
+    assert parsed.date() > datetime.now().date() - __import__("datetime").timedelta(days=1)
+    assert slots["date_raw"].lower() == "next friday"
 
 
 # ----------------------------------------------------------------- workflow flow
@@ -193,6 +342,231 @@ async def test_full_request_awaits_confirmation_then_books():
     assert fake.committed is True
     assert "Booked" in turn.message
     assert not mgr.has_active("default")
+
+
+def test_merge_entities_normalizes_and_passes_through():
+    wf = ReservationWorkflow(discovery=BusinessDiscovery(FakeSearch([]), FakeYelp(None)),
+                             llm=None, gate=make_test_gate())
+    merged = wf._merge_entities({"party_size": "2", "time": "7pm",
+                                 "location": "San Francisco", "junk": "ignored"})
+    assert merged["party_size"] == 2          # essentials canonicalized
+    assert merged["time"] == "19:00"
+    assert merged["location"] == "San Francisco"  # free-text passed through
+    assert "junk" not in merged
+    assert wf._merge_entities(None) == {}
+
+
+@pytest.mark.asyncio
+async def test_followup_reservation_inherits_recent_details():
+    """A quick follow-up that names only a new place reuses the date/time/party
+    from the request just before it, instead of re-asking for everything."""
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+
+    # First request supplies the WHEN and HOW MANY, then we walk away (cancel).
+    await mgr.open(wf, "book a table for 2 at Lazy Bear next friday at 7pm", {}, "default")
+    await mgr.handle("default", "no")
+    assert not mgr.has_active("default")
+
+    # Follow-up names only a new place — no date/time/party in the message.
+    turn = await mgr.open(wf, "actually make a reservation at Flores instead", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION  # didn't re-ask for the details
+    assert "7:00 pm" in turn.message.lower() or "7:00pm" in turn.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_recent_details_not_inherited_after_expiry(monkeypatch):
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    mgr = make_reservation_manager(disc, router=opentable_router(FakeChannel()))
+    wf = mgr.workflows.workflows["reservations"]
+    wf._recent_ttl_s = 0  # everything is "too old" → never inherit
+
+    await mgr.open(wf, "book a table for 2 at Lazy Bear next friday at 7pm", {}, "default")
+    await mgr.handle("default", "no")
+
+    turn = await mgr.open(wf, "make a reservation at Flores", {}, "default")
+    # With nothing inherited, it must collect the missing essentials again.
+    assert turn.control == TurnControl.CONTINUE
+
+
+# --------------------------------------------------- release-policy detection (Phase 2)
+
+def test_resolve_release_policy_searches_reddit_and_grounds():
+    quote = "Bungalow drops reservations 30 days in advance at 10am ET, set an alarm."
+    search = RecordingSearch([SearchResult(
+        title="r/FoodNYC — booking Bungalow", snippet=quote,
+        url="https://www.reddit.com/r/FoodNYC/comments/abc")])
+    llm = FakeLLM({"opens_days_in_advance": 30, "release_time": "10am",
+                   "release_timezone": "ET", "rolling": True, "confidence": 0.8,
+                   "source_quote": quote, "notes": "per a Reddit thread"})
+    disc = BusinessDiscovery(search_provider=search, yelp_client=FakeYelp(None), llm=llm)
+
+    policy = disc.resolve_release_policy("Bungalow", "New York")
+    assert policy is not None
+    assert policy.days_in_advance == 30
+    assert policy.release_time == "10am"
+    assert policy.timezone == "ET"
+    assert policy.confidence == 0.8
+    # A Reddit-scoped search was actually issued.
+    assert any(c["include_domains"] == ["reddit.com"] for c in search.calls)
+    # Queries carry only business identity, never PII.
+    assert all("Bungalow" in c["query"] for c in search.calls)
+
+
+def test_resolve_release_policy_drops_ungrounded_fields():
+    """The LLM 'remembers' a time that isn't in the evidence → that field is
+    dropped, so no usable policy (we never snipe on a hallucinated time)."""
+    search = FakeSearch([SearchResult(title="Bungalow", snippet="A great spot.",
+                                      url="https://www.reddit.com/r/x")])
+    llm = FakeLLM({"opens_days_in_advance": 30, "release_time": "10am",
+                   "release_timezone": "ET", "rolling": True, "confidence": 0.9,
+                   "source_quote": "made up", "notes": ""})
+    disc = BusinessDiscovery(search_provider=search, yelp_client=FakeYelp(None), llm=llm)
+    assert disc.resolve_release_policy("Bungalow", "New York") is None
+
+
+class StubDiscovery:
+    """Decouples the workflow test from live lookups."""
+    def __init__(self, decision, policy=None):
+        self._decision, self._policy = decision, policy
+
+    def discover(self, name, location=None):
+        return self._decision
+
+    def resolve_release_policy(self, name, location=None):
+        return self._policy
+
+
+def _bookable_decision():
+    return ChannelDecision(method=ReservationMethod.OPENTABLE, business_name="Bungalow",
+                           url="https://www.opentable.com/r/bungalow-ny")
+
+
+@pytest.mark.asyncio
+async def test_autodetected_policy_offers_snipe():
+    from workflows.reservations.models import ReleasePolicy
+    policy = ReleasePolicy(days_in_advance=30, release_time="10am", timezone="ET",
+                           confidence=0.8, source_quote="opens 30 days out at 10am ET")
+    mgr = make_reservation_manager(StubDiscovery(_bookable_decision(), policy),
+                                   router=opentable_router(FakeChannel()))
+    wf = mgr.workflows.workflows["reservations"]
+
+    # No release policy stated by the user; dining date is far enough out (8/15).
+    turn = await mgr.open(wf, "book a table for 2 at Bungalow on 8/15 at 7pm", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "open" in turn.message.lower()
+    assert "opens 30 days out" in turn.message  # cites the discovered source
+
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.BACKGROUND
+    assert mgr.store.list_waiting()[0].slots.get("snipe_state") is not None
+
+
+@pytest.mark.asyncio
+async def test_near_term_booking_skips_autodetect():
+    from workflows.reservations.models import ReleasePolicy
+    policy = ReleasePolicy(days_in_advance=30, release_time="10am", timezone="ET",
+                           confidence=0.9, source_quote="opens 30 days out at 10am ET")
+    mgr = make_reservation_manager(StubDiscovery(_bookable_decision(), policy),
+                                   router=opentable_router(FakeChannel()))
+    wf = mgr.workflows.workflows["reservations"]
+
+    # "next friday" is within the auto-detect horizon → no lookup, book normally.
+    turn = await mgr.open(wf, "book a table for 2 at Bungalow next friday at 7pm", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "book it" in turn.message.lower()   # the normal booking gate, not a snipe
+
+
+# ----------------------------------------------------------------- snipe (Phase 1)
+
+def test_snipe_datetime_math():
+    from workflows.reservations.snipe import (
+        compute_release_fire_ts, describe_fire, resolve_timezone)
+    from datetime import datetime as _dt
+
+    tz = resolve_timezone("ET")
+    assert tz.key == "America/New_York"
+    # dining 2026-08-15, opens 30 days ahead at 10:00 ET -> 2026-07-16 10:00 ET
+    ts = compute_release_fire_ts("2026-08-15", 30, "10:00", tz)
+    local = _dt.fromtimestamp(ts, tz)
+    assert (local.year, local.month, local.day, local.hour, local.minute) == (2026, 7, 16, 10, 0)
+    assert "Jul 16" in describe_fire(ts, tz)
+    # aliases, explicit IANA, and a garbage fallback
+    assert resolve_timezone("PT").key == "America/Los_Angeles"
+    assert resolve_timezone("Europe/London").key == "Europe/London"
+    assert resolve_timezone("not-a-zone", "America/Chicago").key == "America/Chicago"
+    assert compute_release_fire_ts("not-a-date", 30, "10:00", tz) is None
+
+
+@pytest.mark.asyncio
+async def test_snipe_schedules_then_books_at_fire():
+    import time as _time
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+
+    # Dining date far enough out that the window (30 days prior) is still future.
+    turn = await mgr.open(
+        wf, "book a table for 2 at Lazy Bear on 8/15 at 7pm — reservations open "
+            "30 days in advance at 10am ET", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "reservations open" in turn.message.lower()   # snipe gate, not a normal book
+    assert fake.committed is False
+
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.BACKGROUND
+    assert fake.committed is False                        # nothing booked yet
+
+    sess = mgr.store.list_waiting()[0]
+    assert sess.slots.get("snipe_state") is not None
+    assert sess.fsm_state == "scheduled"
+
+    # Pretend the window just opened, then let the scheduled tick race it.
+    sess.slots["snipe_state"]["fire_ts"] = _time.time() - 1
+    sess.slots["snipe_state"]["deadline_ts"] = _time.time() + 60
+    turn = await wf.on_tick(sess)
+    assert turn.control == TurnControl.COMPLETE
+    assert fake.committed is True
+    assert "booked" in turn.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_window_already_open_books_normally_not_sniped():
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    mgr = make_reservation_manager(disc, router=opentable_router(FakeChannel()))
+    wf = mgr.workflows.workflows["reservations"]
+
+    # "next friday" minus 30 days is in the past → window already open → book now.
+    turn = await mgr.open(
+        wf, "book a table for 2 at Lazy Bear next friday at 7pm — reservations open "
+            "30 days in advance at 10am", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "reservations open" not in turn.message.lower()   # the normal booking gate
+    assert "book it" in turn.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_snipe_miss_reports_honestly():
+    import time as _time
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    miss = FakeChannel(result=BookingResult(success=False, needs_manual=True,
+                                            error="slot_not_found", message="No slot."))
+    mgr = make_reservation_manager(disc, router=opentable_router(miss))
+    wf = mgr.workflows.workflows["reservations"]
+
+    await mgr.open(wf, "book a table for 2 at Lazy Bear on 8/15 at 7pm — reservations open "
+                       "30 days in advance at 10am ET", {}, "default")
+    await mgr.handle("default", "yes")
+    sess = mgr.store.list_waiting()[0]
+    sess.slots["snipe_state"]["fire_ts"] = _time.time() - 1
+    sess.slots["snipe_state"]["deadline_ts"] = _time.time() + 0.5  # almost no budget
+    turn = await wf.on_tick(sess)
+    assert turn.control == TurnControl.COMPLETE
+    assert "sold out" in turn.message.lower()
+    assert turn.slots_update.get("snipe_state") is None  # session clears the parked state
 
 
 @pytest.mark.asyncio
@@ -270,6 +644,44 @@ async def test_missing_slots_are_collected_then_gated():
     assert turn.control == TurnControl.AWAIT_CONFIRMATION  # gated, not auto-booked
 
 
+@pytest.mark.asyncio
+async def test_unclear_reply_reasks_then_cancels_never_books():
+    # "wait, what?" at a booking gate must neither book nor silently cancel:
+    # re-ask once, then read a second unclear as a no.
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+
+    await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
+
+    turn = await mgr.handle("default", "wait, what time was that?")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION   # re-asked, still gated
+    assert "yes or no" in turn.message.lower()
+    assert fake.committed is False
+
+    turn = await mgr.handle("default", "hmm, the weather is nice")
+    assert turn.control == TurnControl.CANCEL               # second unclear = no
+    assert fake.committed is False
+
+
+@pytest.mark.asyncio
+async def test_pii_purged_when_session_ends():
+    # Terminal sessions lose guest PII (spec §8 L2) but keep the booking facts.
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+
+    await mgr.open(wf, "book a table for 2 at Lazy Bear next friday at 7pm", {}, "default")
+    session_id = mgr.store.list_active_dialogue()[0].session_id
+    await mgr.handle("default", "yes")
+
+    done = mgr.store.get(session_id)
+    assert done.slots.get("raw_request") is None          # purged
+    assert done.slots.get("business_name") == "Lazy Bear"  # kept
+
+
 # ----------------------------------------------------------------- channels / router
 
 def test_router_selects_browser_channel_else_none():
@@ -280,14 +692,23 @@ def test_router_selects_browser_channel_else_none():
 
 
 @pytest.mark.asyncio
-async def test_browser_channel_kill_switch_blocks_commit(tmp_path, monkeypatch):
+async def test_kill_switch_flipped_mid_flight_blocks_commit(monkeypatch):
+    # The switch is OFF at gating time but flipped before the "yes" — the gate
+    # re-checks at execution time, so nothing is booked (the old per-channel
+    # check couldn't catch this).
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+
+    turn = await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+
     monkeypatch.setenv("RESERVATION_KILL_SWITCH", "1")
-    ch = OpenTableChannel(str(tmp_path))
-    plan = CommitPlan(channel="opentable", summary="x", details={"url": "http://x"})
-    result = await ch.commit(plan)
-    assert result.success is False
-    assert result.needs_manual is True
-    assert result.error == "kill_switch"
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.COMPLETE
+    assert "research-only" in turn.message.lower()
+    assert fake.committed is False
 
 
 @pytest.mark.asyncio
@@ -302,12 +723,119 @@ async def test_browser_channel_requires_card_without_payment(tmp_path):
 
 # ----------------------------------------------------------------- M3: payment
 
+def _manual_card_env(monkeypatch, number="4111 1111 1111 1111"):
+    monkeypatch.delenv("PRIVACY_API_KEY", raising=False)
+    monkeypatch.delenv("RESERVATION_CARD_PROVIDER", raising=False)
+    monkeypatch.setenv("RESERVATION_CARD_NUMBER", number)
+    monkeypatch.setenv("RESERVATION_CARD_CVV", "123")
+    monkeypatch.setenv("RESERVATION_CARD_EXP_MONTH", "9")
+    monkeypatch.setenv("RESERVATION_CARD_EXP_YEAR", "27")
+
+
+def test_manual_card_from_env(monkeypatch):
+    _manual_card_env(monkeypatch)
+    svc = ManualCardService.from_env()
+    assert svc is not None
+    card = svc.mint_single_use()
+    assert isinstance(card, VirtualCard)
+    assert card.pan == "4111111111111111"      # separators stripped
+    assert card.last_four == "1111"
+    assert card.exp_month == "09" and card.exp_year == "2027"
+    assert card.spend_limit_usd == 10.0
+    assert "4111111111111111" not in repr(svc)  # PAN never in repr/logs
+
+
+def test_manual_card_carries_billing_zip(monkeypatch):
+    _manual_card_env(monkeypatch)
+    monkeypatch.setenv("RESERVATION_CARD_ZIP", "94115")
+    card = ManualCardService.from_env().mint_single_use()
+    assert card.zip_code == "94115"   # threaded into card-on-file checkouts
+
+
+def test_opentable_card_decline_regex():
+    """A rejected card at "Complete" must be recognised so the booking hands off
+    (the user needs a valid card), while benign policy text must not trip it."""
+    from workflows.reservations.channels.opentable import _CARD_DECLINE_RE
+
+    assert _CARD_DECLINE_RE.search("Your card was declined. Please try a different card.")
+    assert _CARD_DECLINE_RE.search("There was a problem with your payment.")
+    assert _CARD_DECLINE_RE.search("We were unable to process your card.")
+    # The no-show policy and confirmation copy must NOT read as a decline.
+    assert not _CARD_DECLINE_RE.search("No-shows will be subject to a charge of $45 per person.")
+    assert not _CARD_DECLINE_RE.search("You're confirmed! We'll see you on June 30.")
+
+
+def test_manual_card_rejects_invalid_number_and_over_cap(monkeypatch):
+    _manual_card_env(monkeypatch, number="4111111111111112")   # fails Luhn
+    assert ManualCardService.from_env() is None
+
+    _manual_card_env(monkeypatch)
+    svc = ManualCardService.from_env()
+    assert svc.mint_single_use(amount_usd=25) is None          # hard cap holds
+    monkeypatch.setenv("RESERVATION_CARD_LIMIT_USD", "50")     # can't raise it
+    assert ManualCardService.from_env().limit_usd == 10.0
+
+
+def test_card_provider_selection(monkeypatch):
+    _manual_card_env(monkeypatch)
+    assert isinstance(card_service_from_env(), ManualCardService)
+
+    monkeypatch.setenv("PRIVACY_API_KEY", "pk")                # privacy wins by default
+    assert isinstance(card_service_from_env(), PrivacyCardService)
+
+    monkeypatch.setenv("RESERVATION_CARD_PROVIDER", "manual")  # explicit override
+    assert isinstance(card_service_from_env(), ManualCardService)
+
+    monkeypatch.setenv("RESERVATION_CARD_PROVIDER", "off")
+    assert card_service_from_env() is None
+
+
+@pytest.mark.asyncio
+async def test_manual_card_passed_to_commit(monkeypatch):
+    _manual_card_env(monkeypatch)
+    disc = BusinessDiscovery(FakeSearch(card_hint_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+    wf.payment = ManualCardService.from_env()
+
+    await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.COMPLETE
+    assert isinstance(fake.payment_received, VirtualCard)
+    assert fake.payment_received.last_four == "1111"
+    assert fake.payment_received.token == "manual"
+
+
 def test_card_service_enforces_hard_cap():
     # A higher configured limit is clamped to $10, and over-cap mints are refused
     # without any network call.
     svc = PrivacyCardService("api-key", limit_usd=50)
     assert svc.limit_usd == 10.0
     assert svc.mint_single_use(amount_usd=25) is None
+
+
+@pytest.mark.asyncio
+async def test_no_card_needed_books_without_minting():
+    # Discovery found no card/deposit hint → the gate message mentions no card,
+    # nothing is minted (even with a payment service configured), and commit
+    # proceeds with payment=None.
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    fake = FakeChannel()
+    pay = FakePayment()
+    mgr = make_reservation_manager(disc, router=opentable_router(fake))
+    wf = mgr.workflows.workflows["reservations"]
+    wf.payment = pay
+
+    turn = await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "card" not in turn.message.lower()
+
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.COMPLETE
+    assert fake.committed is True
+    assert pay.minted is False              # payment service never touched
+    assert fake.payment_received is None    # commit ran card-free
 
 
 @pytest.mark.asyncio
@@ -363,11 +891,8 @@ async def test_no_payment_service_hands_off_when_card_needed():
 
 # ----------------------------------------------------------------- M4: calendar + signal
 
-def _june_2026():
-    return datetime(2026, 6, 1, 9, 0, 0)  # a Monday, fixed "now" for deterministic dates
-
-
 def test_calendar_builds_event_with_details():
+    # The harness hands the calendar canonical values only (ISO date, 24h time).
     captured = {}
 
     def inserter(calendar_id, event):
@@ -375,9 +900,9 @@ def test_calendar_builds_event_with_details():
         captured["event"] = event
         return "https://calendar.google.com/event?eid=abc"
 
-    svc = CalendarService(calendar_id="primary", inserter=inserter, now=_june_2026)
+    svc = CalendarService(calendar_id="primary", inserter=inserter)
     link = svc.create_event({
-        "business_name": "Lazy Bear", "party_size": 2, "date": "tomorrow", "time": "7pm",
+        "business_name": "Lazy Bear", "party_size": 2, "date": "2026-06-02", "time": "19:00",
         "address": "3416 19th St", "method": "opentable", "confirmation": "XYZ9",
     })
     assert link.startswith("https://calendar.google.com")
@@ -389,12 +914,13 @@ def test_calendar_builds_event_with_details():
 
 
 def test_calendar_noop_without_inserter():
-    svc = CalendarService(inserter=None, now=_june_2026)
-    assert svc.create_event({"business_name": "X", "date": "tomorrow", "time": "7pm"}) is None
+    svc = CalendarService(inserter=None)
+    assert svc.create_event({"business_name": "X", "date": "2026-06-02", "time": "19:00"}) is None
 
 
 def test_calendar_skips_when_time_unparseable():
-    svc = CalendarService(inserter=lambda c, e: "link", now=_june_2026)
+    # Non-canonical input means skip, never guess.
+    svc = CalendarService(inserter=lambda c, e: "link")
     assert svc.create_event({"business_name": "X", "date": "someday", "time": "later"}) is None
 
 
@@ -566,6 +1092,44 @@ async def test_phone_call_flow_confirms_via_polling():
     assert cal.facts["confirmation"] == "PH42"
     assert sig.message is not None
     assert not mgr.store.list_waiting()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_blocks_waiting_phone_redial(monkeypatch):
+    # The approved call fails (no answer) and the session goes WAITING for a
+    # retry; the switch is flipped meanwhile. The redial fires through the
+    # gate at execution time → blocked. Pre-harness, place_call never checked
+    # the switch, so the retry would have dialed anyway.
+    class CountingPhoneClient(FakePhoneClient):
+        def __init__(self, results):
+            super().__init__(results)
+            self.calls_placed = 0
+
+        def place_call(self, phone, task, request_data=None):
+            self.calls_placed += 1
+            return super().place_call(phone, task, request_data)
+
+    disc = BusinessDiscovery(FakeSearch([]), FakeYelp(yelp_business()))  # -> PHONE
+    client = CountingPhoneClient([
+        {"completed": True, "summary": "no answer, went to voicemail"},  # attempt 1 fails
+    ])
+    phone = PhoneChannel(client=client)
+    mgr = make_reservation_manager(disc, router=ChannelRouter({ReservationMethod.PHONE: phone}))
+    wf = mgr.workflows.workflows["reservations"]
+
+    await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
+    await mgr.handle("default", "yes")                 # call placed (attempt 1)
+    assert client.calls_placed == 1
+    _force_waiting_due(mgr)
+    _s, result = (await mgr.tick_waiting())[0]
+    assert result.control == TurnControl.BACKGROUND    # no answer → retry scheduled
+
+    monkeypatch.setenv("RESERVATION_KILL_SWITCH", "1")  # flipped while WAITING
+    _force_waiting_due(mgr)
+    _s, result = (await mgr.tick_waiting())[0]
+    assert result.control == TurnControl.COMPLETE
+    assert "research-only" in result.message.lower()
+    assert client.calls_placed == 1                    # the redial never fired
 
 
 @pytest.mark.asyncio
@@ -981,13 +1545,15 @@ def test_classify_method_rejects_hallucinated_contacts():
 
 
 def test_extract_slots_llm_refines_regex():
-    # "four of us" and "half past seven" defeat the regexes; the LLM gets them.
+    # "four of us" and "half past seven" defeat the regexes; the LLM gets them,
+    # then the harness canonicalizes ("half past seven" → 19:30, evening rule).
     llm = FakeLLM({"business_name": "Lazy Bear", "date": "next Friday",
                    "time": "half past seven", "party_size": "4", "service_type": "dinner"})
     wf = ReservationWorkflow(discovery=BusinessDiscovery(FakeSearch([]), FakeYelp(None)), llm=llm)
     slots = wf._extract_slots("book dinner for four of us at Lazy Bear next Friday at half past seven")
     assert slots["party_size"] == 4
-    assert slots["time"] == "half past seven"
+    assert slots["time"] == "19:30"
+    assert slots["time_raw"] == "half past seven"
     assert slots["business_name"] == "Lazy Bear"
     assert slots["service_type"] == "dinner"
 
@@ -1031,3 +1597,75 @@ async def test_email_only_discovery_routes_to_email_gate():
     turn = await mgr.handle("default", "yes")
     assert turn.control == TurnControl.BACKGROUND
     assert sender.sent[0] == "book@lazybear.com"
+
+
+# --------------------------------------------------------------- resy success detection
+
+def test_resy_confirmed_regex_recognizes_booked_panel():
+    """Regression: Resy's success panel reads "Reservation Booked." with
+    "check your inbox for a confirmation email" / "Continue to Reservation
+    Details" — none contain the word "confirmed". The detector must still match
+    these (a live booking once mis-reported as failed because it didn't)."""
+    from workflows.reservations.channels.resy import _CONFIRMED_RE
+
+    booked = ("Reservation Booked. Please check your inbox for a confirmation "
+              "email. Continue to Reservation Details")
+    assert _CONFIRMED_RE.search(booked)
+    assert _CONFIRMED_RE.search("Your reservation is confirmed")
+    assert _CONFIRMED_RE.search("You're all set")
+
+    # Pre-booking widget states must NOT read as success.
+    assert not _CONFIRMED_RE.search("Select a time  6:00 PM  6:15 PM  Reserve Now")
+    assert not _CONFIRMED_RE.search("Log in or sign up to continue")
+    assert not _CONFIRMED_RE.search("Reservation details  Party of 2  Reserve Now")
+
+
+# ----------------------------------------------------------- opentable booking flow
+
+def test_opentable_booking_url_preselects_datetime_and_covers():
+    from workflows.reservations.channels.opentable import OpenTableChannel
+
+    url = OpenTableChannel._booking_url({
+        "url": "https://www.opentable.com/r/lazy-bear?ref=123",
+        "date": "2026-06-14", "time": "19:00", "party_size": 2,
+    })
+    assert url.startswith("https://www.opentable.com/r/lazy-bear?")
+    assert "dateTime=2026-06-14T19%3A00" in url
+    assert "covers=2" in url
+    assert "ref=123" not in url  # the venue's own query is dropped, not appended
+
+    # A non-OpenTable URL isn't ours to drive.
+    assert OpenTableChannel._booking_url(
+        {"url": "https://resy.com/cities/ny/lazy-bear"}) is None
+    assert OpenTableChannel._booking_url({"url": None}) is None
+
+
+def test_opentable_time_normalization_matches_slot_labels():
+    from workflows.reservations.channels.opentable import OpenTableChannel
+
+    assert OpenTableChannel._to_12h("19:00") == (7, "00", "PM")
+    assert OpenTableChannel._to_12h("00:30") == (12, "30", "AM")
+    assert OpenTableChannel._to_12h("12:15") == (12, "15", "PM")
+    assert OpenTableChannel._to_12h("09:45") == (9, "45", "AM")
+    assert OpenTableChannel._to_12h("bogus") is None
+    assert OpenTableChannel._display_time("19:00") == "7:00 PM"
+
+
+def test_opentable_confirmed_regex_recognizes_confirmation_page():
+    """OpenTable's confirmation page reads "You're confirmed" / "Reservation
+    confirmed" / "Your table is booked" — none of which is the bare word the
+    naive detector looks for. Pre-booking states must not read as success."""
+    from workflows.reservations.channels.opentable import _CONFIRMED_RE, _LOGIN_RE
+
+    assert _CONFIRMED_RE.search("You're confirmed! We'll see you on Sunday.")
+    assert _CONFIRMED_RE.search("Reservation confirmed")
+    assert _CONFIRMED_RE.search("Your table is booked")
+
+    # The slot grid / details page must NOT read as a confirmation.
+    assert not _CONFIRMED_RE.search("Select a time  7:00 PM  7:15 PM  Complete reservation")
+    assert not _CONFIRMED_RE.search("Reservation details  Party of 2")
+
+    # The header's "Sign in" link must NOT trip the session-expired wall; only a
+    # genuine "sign in to complete" prompt should.
+    assert not _LOGIN_RE.search("Home  Restaurants  Sign in  My reservations")
+    assert _LOGIN_RE.search("Sign in to complete your reservation")

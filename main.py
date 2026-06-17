@@ -35,6 +35,12 @@ import sys
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Load ./.env before anything reads os.getenv, so configuration works regardless
+# of shell (zsh doesn't source ~/.bash_profile). Shell vars already set win over
+# the file (override=False), and a missing .env is a harmless no-op.
+from dotenv import load_dotenv
+load_dotenv()
+
 from config import (
     AssistantConfig,
     PersonalityConfig,
@@ -120,9 +126,12 @@ def create_custom_config(args) -> AssistantConfig:
     # Determine wake word provider
     wake_provider = "keyboard" if args.keyboard else "porcupine"
 
-    # Determine TTS provider - default to piper (local, fast)
-    # Switch to "elevenlabs" or "openai" here for cloud TTS
-    tts_provider = "elevenlabs"
+    # Determine TTS provider — ElevenLabs needs both its key and a voice ID;
+    # otherwise fall back to the OS voice so text modes still run.
+    if os.getenv("ELEVENLABS_API_KEY") and os.getenv("ELEVENLABS_VOICE_ID"):
+        tts_provider = "elevenlabs"
+    else:
+        tts_provider = "system"
 
     is_ephemeral = bool(args.chat or args.test)
 
@@ -267,6 +276,7 @@ def run_text_chat(config: AssistantConfig):
                 continue
 
             response = assistant.run_single_interaction(user_input)
+            print(f"\n🤖 {name}: {response}\n")
             assistant.speak(response)
 
         except KeyboardInterrupt:
@@ -317,7 +327,11 @@ def main():
     )
     
     args = parser.parse_args()
-    
+
+    # PII/card redaction over everything the logging module emits (harness §5.2).
+    from core.harness import install_log_redaction
+    install_log_redaction()
+
     # List audio devices
     if args.list_devices:
         from utils import list_audio_devices

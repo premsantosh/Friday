@@ -30,7 +30,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from core.harness import Sink, SinkMode, guard
+
 logger = logging.getLogger(__name__)
+
+# Untrusted code gets booking facts only — no guest PII, no credentials.
+SANDBOX_SINK = Sink("sandbox", SinkMode.ALLOWLIST,
+                    frozenset({"business_name", "url", "date", "time", "party_size"}))
 
 ALLOWED_LANGUAGES = {"Python", "JavaScript", "TypeScript", "Go", "Ruby"}
 MIN_STARS = 5
@@ -174,9 +180,11 @@ class SandboxBotChannel:
         return self.finder.find(f"{platform} reservation bot")
 
     def run_bot(self, candidate: BotCandidate, details: Dict[str, Any]) -> SandboxResult:
-        # Pass only the minimum booking facts — never credentials or host env.
+        # Pass only the minimum booking facts — never guest PII, credentials,
+        # or host env. The sink check makes the minimization structural.
         payload = {k: details.get(k) for k in
-                   ("business_name", "url", "date", "time", "party_size", "guest_name")}
+                   ("business_name", "url", "date", "time", "party_size")}
+        guard(SANDBOX_SINK, payload)
         return self.sandbox.run(candidate.url, payload)
 
 
