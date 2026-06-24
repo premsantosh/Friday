@@ -6,6 +6,7 @@ when keyword matching fails. Returns structured routing + a natural response.
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -79,7 +80,7 @@ class IntentRouter:
 
         response = self._anthropic_client.messages.create(
             model=self.config.anthropic_model,
-            max_tokens=200,
+            max_tokens=600,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -93,7 +94,7 @@ class IntentRouter:
 
         response = self._openai_client.chat.completions.create(
             model=self.config.openai_model,
-            max_tokens=200,
+            max_tokens=600,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -113,18 +114,23 @@ class IntentRouter:
                     {"role": "user", "content": user_message},
                 ],
                 "stream": False,
-                "options": {"temperature": 0.0, "num_predict": 200},
+                "options": {"temperature": 0.0, "num_predict": 600},
             },
         )
         response.raise_for_status()
         return response.json()["message"]["content"]
 
     def _parse(self, raw: str) -> RouteResult:
-        # Strip markdown code fences Claude sometimes adds (```json ... ```)
-        text = raw.strip()
+        text = (raw or "").strip()
+        # Strip the markdown code fences Claude sometimes adds (```json ... ```).
         if text.startswith("```"):
-            text = text.split("```", 2)[-1] if text.count("```") >= 2 else text
-            text = text.lstrip("json").strip().rstrip("```").strip()
+            text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
+            text = re.sub(r"\s*```\s*$", "", text).strip()
+        # Be liberal about surrounding prose: keep the outermost {...} object.
+        if not text.startswith("{"):
+            start, end = text.find("{"), text.rfind("}")
+            if 0 <= start < end:
+                text = text[start:end + 1]
 
         try:
             data = json.loads(text)

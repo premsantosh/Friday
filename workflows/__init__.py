@@ -4,6 +4,8 @@ from .base import (
     WorkflowResult,
     WorkflowTrigger,
     WorkflowManager,
+    ConversationalWorkflow,
+    InterruptPolicy,
     DoorbellWorkflow,
     ThermostatWorkflow,
     WeatherWorkflow,
@@ -53,7 +55,9 @@ __all__ = [
     "WorkflowResult",
     "WorkflowTrigger",
     "WorkflowManager",
-    
+    "ConversationalWorkflow",
+    "InterruptPolicy",
+
     # Example workflows
     "DoorbellWorkflow",
     "ThermostatWorkflow",

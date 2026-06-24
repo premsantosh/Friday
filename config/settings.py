@@ -207,6 +207,21 @@ class IntentCacheConfig:
 
 
 @dataclass
+class ConversationConfig:
+    """Multi-turn agent framework (see docs/multi-turn-agent-spec.md)."""
+    # Layer A — short-term context register (turnstile-ctx)
+    context_enabled: bool = True
+    context_persist_path: str = "~/.friday/context_register.json"
+    context_max_turns: int = 3
+    # Layer B — durable multi-turn task sessions
+    sessions_enabled: bool = True
+    session_store_path: str = "~/.friday/sessions.db"
+    default_session_timeout_s: int = 600
+    # Background runner (drives WAITING sessions + expiry sweep)
+    background_tick_seconds: int = 30
+
+
+@dataclass
 class AssistantConfig:
     """Master configuration combining all settings."""
     personality: PersonalityConfig = field(default_factory=PersonalityConfig)
@@ -216,6 +231,7 @@ class AssistantConfig:
     wake_word: WakeWordConfig = field(default_factory=WakeWordConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     intent_cache: IntentCacheConfig = field(default_factory=IntentCacheConfig)
+    conversation: ConversationConfig = field(default_factory=ConversationConfig)
 
     # General settings
     debug_mode: bool = False
