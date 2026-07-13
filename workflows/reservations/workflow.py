@@ -61,7 +61,7 @@ from .models import (
     ChannelDecision,
     ReservationMethod,
 )
-from .notify import SignalNotifier
+from .notify import TelegramNotifier
 from .payment import HARD_CAP_USD, PrivacyCardService, card_service_from_env
 from .router import ChannelRouter
 from .snipe import (
@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 # Outbound boundaries owned by the workflow itself. The email body is free
 # text the user approved; the scan stops card/secret-shaped content only.
 SMTP_SINK = Sink("smtp", SinkMode.SCAN)
-# Calendar + Signal go to the user's own destinations; scan-only.
+# Calendar + Telegram go to the user's own destinations; scan-only.
 USER_DEST_SINK = Sink("user_destination", SinkMode.SCAN)
 
 # The reservation dialogue as a closed state machine (spec §6 / harness §6).
@@ -167,7 +167,7 @@ class ReservationWorkflow(ConversationalWorkflow):
                  router: Optional[ChannelRouter] = None,
                  payment: Optional[PrivacyCardService] = None,
                  calendar: Optional[CalendarService] = None,
-                 notifier: Optional[SignalNotifier] = None,
+                 notifier: Optional[TelegramNotifier] = None,
                  sandbox: Optional[SandboxBotChannel] = None,
                  gate: Optional[ActionGate] = None,
                  llm: Any = _UNSET):
@@ -179,7 +179,7 @@ class ReservationWorkflow(ConversationalWorkflow):
         self.sandbox = sandbox if sandbox is not None else SandboxBotChannel.from_env()
         self.payment = payment if payment is not None else card_service_from_env()
         self.calendar = calendar if calendar is not None else CalendarService.from_env()
-        self.notifier = notifier if notifier is not None else SignalNotifier.from_env()
+        self.notifier = notifier if notifier is not None else TelegramNotifier.from_env()
         # Every irreversible action (book / call / email / mint / sandbox) goes
         # through the gate; the (channel, plan) under approval lives in
         # session.slots, never in process memory. Approvals are only valid if
@@ -596,7 +596,7 @@ class ReservationWorkflow(ConversationalWorkflow):
                        "attempts": 0}
         return TurnResult.background(
             f"Right, sir — I'll stand ready and book {biz} the moment reservations open "
-            f"({snipe['display']}). I'll message you on Signal either way.",
+            f"({snipe['display']}). I'll message you on Telegram either way.",
             wake_at=max(now, fire_ts - self._snipe_lead_s),
             slots_update={"snipe_state": snipe_state},
             next_state=self._fire(session, "schedule"))
@@ -667,14 +667,14 @@ class ReservationWorkflow(ConversationalWorkflow):
                                    "booking_result": {"success": False, "needs_manual": True}})
 
     async def _snipe_notify(self, session: Session, message: str) -> None:
-        """Best-effort Signal note on a snipe outcome (success already notifies
+        """Best-effort Telegram note on a snipe outcome (success already notifies
         via _on_confirmed). The unattended user learns the result either way."""
         if self.notifier is None:
             return
         try:
             await asyncio.to_thread(self.notifier.send, guard(USER_DEST_SINK, message))
         except Exception:
-            logger.warning("Snipe Signal notification failed", exc_info=True)
+            logger.warning("Snipe Telegram notification failed", exc_info=True)
 
     # ------------------------------------------------------------ gate helpers
     def _action(self, kind: ActionKind, session: Session, plan: CommitPlan,
@@ -778,7 +778,7 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     async def _on_confirmed(self, session: Session, plan: CommitPlan,
                             confirmation: Optional[str]) -> str:
-        """Calendar event + Signal record on a confirmed booking. Never fails the booking."""
+        """Calendar event + Telegram record on a confirmed booking. Never fails the booking."""
         decision = session.slots.get("channel_decision") or {}
         facts = {
             **plan.details,
@@ -798,15 +798,15 @@ class ReservationWorkflow(ConversationalWorkflow):
 
         if self.notifier is not None:
             try:
-                message = guard(USER_DEST_SINK, self._signal_text(facts))
+                message = guard(USER_DEST_SINK, self._notify_text(facts))
                 await asyncio.to_thread(self.notifier.send, message)
             except Exception:
-                logger.warning("Signal notification failed", exc_info=True)
+                logger.warning("Telegram notification failed", exc_info=True)
 
         return note
 
     @staticmethod
-    def _signal_text(facts: Dict[str, Any]) -> str:
+    def _notify_text(facts: Dict[str, Any]) -> str:
         conf = f" Confirmation: {facts['confirmation']}." if facts.get("confirmation") else ""
         return (
             f"✅ Reservation confirmed: {facts.get('business_name')} for "

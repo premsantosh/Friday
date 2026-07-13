@@ -1,57 +1,58 @@
 """
-SignalNotifier (M4).
+TelegramNotifier (M4).
 
-Sends a written record of a reservation outcome over Signal via a
-signal-cli-rest-api endpoint. Used for async outcomes (and confirmations) so the
-user has a record even when not at the mic. Never raises; degrades to a no-op
-when unconfigured. The HTTP poster is injectable for testing.
+Sends a written record of a reservation outcome over Telegram via the Bot API.
+Used for async outcomes (and confirmations) so the user has a record even when
+not at the mic. Never raises; degrades to a no-op when unconfigured. The HTTP
+poster is injectable for testing.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 
-class SignalNotifier:
-    def __init__(self, base_url: str, from_number: str, to_number: str,
-                 poster: Optional[Callable] = None):
-        self.base_url = base_url.rstrip("/")
-        self.from_number = from_number
-        self.to_number = to_number
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id, poster: Optional[Callable] = None):
+        self.api = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
         self._poster = poster  # callable(url, json=...) -> response; defaults to requests.post
 
     @classmethod
-    def from_env(cls) -> Optional["SignalNotifier"]:
-        base = os.getenv("SIGNAL_CLI_URL")
-        frm = os.getenv("SIGNAL_FROM_NUMBER")
-        to = os.getenv("SIGNAL_TO_NUMBER")
-        if not (base and frm and to):
+    def from_env(cls) -> Optional["TelegramNotifier"]:
+        """Build from env, or None when unconfigured.
+
+        Reuses TELEGRAM_BOT_TOKEN (from @BotFather). The recipient is
+        TELEGRAM_NOTIFY_CHAT_ID, falling back to the first id in
+        TELEGRAM_ALLOWED_CHAT_IDS so a single-user setup needs no extra config.
+        """
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_NOTIFY_CHAT_ID")
+        if not chat_id:
+            allowed = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")
+            chat_id = next((c.strip() for c in allowed.split(",") if c.strip()), None)
+        if not (token and chat_id):
             return None
-        return cls(base, frm, to)
+        return cls(token, chat_id)
 
     def send(self, message: str) -> bool:
-        """Send `message` to the configured recipient. Returns success; never raises."""
+        """Send `message` to the configured chat. Returns success; never raises."""
         try:
             poster = self._poster
             if poster is None:
                 import requests
                 poster = requests.post
             resp = poster(
-                f"{self.base_url}/v2/send",
-                json={
-                    "message": message,
-                    "number": self.from_number,
-                    "recipients": [self.to_number],
-                },
+                f"{self.api}/sendMessage",
+                json={"chat_id": self.chat_id, "text": message},
                 timeout=10,
             )
-            # signal-cli-rest-api returns 2xx on success.
             ok = getattr(resp, "status_code", 200)
             return 200 <= int(ok) < 300
         except Exception:
-            logger.warning("Signal notification failed.", exc_info=True)
+            logger.warning("Telegram notification failed.", exc_info=True)
             return False
