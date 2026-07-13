@@ -23,6 +23,10 @@ class TTLCache:
         with self._lock:
             self.store.pop(key, None)
 
+    def clear(self):
+        with self._lock:
+            self.store.clear()
+
 
     def fetch(self, key: str) -> Optional[Any]:
         with self._lock:
@@ -59,6 +63,11 @@ class FridayCache:
     def get_cached_response(self, query_fingerprint: str) -> Optional[str]:
         """Check if we can skip Claude entirely."""
         return self.response_cache.fetch(query_fingerprint)
+
+    def invalidate_responses(self):
+        """Drop all cached responses — called when memory facts or personality
+        change so stale answers aren't replayed."""
+        self.response_cache.clear()
 
     def cache_search(self, fingerprint: str, results: str):
         """Cache a search context block."""

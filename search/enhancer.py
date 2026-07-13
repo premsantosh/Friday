@@ -22,6 +22,11 @@ class SearchEnhancer:
             if not needs_search:
                 return None
 
+            # The query is the one payload that leaves the device on the
+            # default local-first setup — scrub PII before it goes out.
+            from core.harness import redact_text
+            query = redact_text(query)
+
             results = self.provider.search(query, max_results=self.max_results)
             if not results:
                 return None

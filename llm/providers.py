@@ -12,13 +12,17 @@ import threading
 from config import LLMConfig, PersonalityConfig, SarcasmLevel, FormalityLevel, WarmthLevel
 from memory.store import FridayStore
 
-_SARCASM_UP = {"more sarcastic", "dial up", "increase sarcasm", "more sarcasm", "turn up the sarcasm"}
-_SARCASM_DOWN = {"less sarcastic", "dial down", "decrease sarcasm", "less sarcasm", "turn down the sarcasm", "tone it down"}
-_SARCASM_NONE = {"no sarcasm", "stop being sarcastic", "be serious", "be professional"}
+# Only phrases that unambiguously reference the assistant's sarcasm. Generic
+# phrases ("tone it down", "be serious") used to silently flip the personality
+# when the user was talking about something else entirely.
+_SARCASM_UP = {"more sarcastic", "increase sarcasm", "more sarcasm", "turn up the sarcasm"}
+_SARCASM_DOWN = {"less sarcastic", "decrease sarcasm", "less sarcasm", "turn down the sarcasm"}
+_SARCASM_NONE = {"no sarcasm", "stop being sarcastic", "drop the sarcasm"}
 _SARCASM_MAX = {"maximum sarcasm", "full sarcasm", "glados", "max sarcasm"}
 from memory.cache import FridayCache
 from memory.context_builder import ContextBuilder
 from memory.extractor import FactExtractor
+from memory.summarizer import ConversationSummarizer
 
 
 def generate_personality_prompt(config: PersonalityConfig) -> str:
@@ -141,7 +145,11 @@ Helpful first, entertaining second. Brevity is the soul of wit."""
 
 class LLMProvider(ABC):
     """Base class for all LLM providers."""
-    
+
+    # Whether inference runs on this machine. Cloud providers get private
+    # memory stripped from their prompts (see _prepare_request).
+    IS_LOCAL = False
+
     def __init__(self, config: LLMConfig, personality: PersonalityConfig):
         self.config = config
         self.personality = personality
@@ -152,6 +160,7 @@ class LLMProvider(ABC):
             self.store = None
             self.context_builder = None
             self.extractor = None
+            self.summarizer = None
         else:
             self.store = FridayStore()
             self.context_builder = ContextBuilder(self.cache, self.store)
@@ -159,8 +168,15 @@ class LLMProvider(ABC):
                 base_url=config.ollama_base_url,
                 model=config.extractor_model,
             )
+            self.summarizer = ConversationSummarizer(
+                self.store,
+                base_url=config.ollama_base_url,
+                model=config.ollama_model,
+            )
+            self._hydrate_history()
         self._last_retrieved_fact_keys: List[str] = []
         self._pending_fact_keys: List[str] = []
+        self._exchanges_since_summary_check = 0
         self.search_enhancer = None
         self.stats = {
             "total_requests": 0,
@@ -170,6 +186,27 @@ class LLMProvider(ABC):
             "facts_stored": 0,
             "search_queries": 0,
         }
+
+    def _hydrate_history(self):
+        """Seed in-memory chat history from the local store so conversational
+        continuity survives a restart. Keeps strict user/assistant alternation
+        starting with a user turn (required by the Anthropic API)."""
+        turns = self.store.get_recent_turns(n=max(self.config.max_history, 0) or 10)
+        history: List[Dict[str, str]] = []
+        for turn in turns:
+            role = turn.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            if not history and role != "user":
+                continue  # must start with a user turn
+            if history and history[-1]["role"] == role:
+                history[-1] = {"role": role, "content": turn["content"]}
+                continue
+            history.append({"role": role, "content": turn["content"]})
+        # end on an assistant turn so the next append (a user turn) alternates
+        if history and history[-1]["role"] == "user":
+            history.pop()
+        self.conversation_history = history
     
     @abstractmethod
     def generate_response(self, user_input: str) -> str:
@@ -194,10 +231,17 @@ class LLMProvider(ABC):
         self.system_prompt = generate_personality_prompt(self.personality)
 
     def _trim_history(self):
-        """Trim conversation history to max_history limit."""
+        """Trim conversation history to max_history limit.
+
+        After slicing, drop any leading assistant turns — the Anthropic API
+        rejects a messages array that doesn't start with a user turn, which
+        used to make every ~6th conversational turn error out.
+        """
         max_history = self.config.max_history
         if max_history > 0 and len(self.conversation_history) > max_history:
             self.conversation_history = self.conversation_history[-max_history:]
+        while self.conversation_history and self.conversation_history[0]["role"] != "user":
+            self.conversation_history.pop(0)
 
     def _check_sarcasm_command(self, user_input: str) -> bool:
         """Detect sarcasm level adjustments and apply them immediately.
@@ -219,6 +263,8 @@ class LLMProvider(ABC):
             return False
 
         self._refresh_system_prompt()
+        # Cached responses were generated with the old personality.
+        self.cache.invalidate_responses()
         return True
 
     def _prepare_request(self, user_input: str) -> tuple[Optional[str], str]:
@@ -240,7 +286,10 @@ class LLMProvider(ABC):
                     self.stats["search_queries"] += 1
             return None, augmented_prompt
 
-        context = self.context_builder.build_context(user_input)
+        # Privacy guard: private memory only rides along when inference is
+        # local (or the owner explicitly opted in to sending it to the cloud).
+        include_private = self.IS_LOCAL or self.config.allow_private_context_to_cloud
+        context = self.context_builder.build_context(user_input, include_private=include_private)
         self._pending_fact_keys = context.get("retrieved_fact_keys", [])
         if context.get("cached_response"):
             self.stats["cache_hits"] += 1
@@ -273,14 +322,17 @@ class LLMProvider(ABC):
             if self.extractor.is_correction(user_input):
                 for key in self._last_retrieved_fact_keys:
                     self.store.drop_confidence(key)
+                # Answers built on the corrected facts must not be replayed.
+                self.cache.invalidate_responses()
             else:
                 for key in self._last_retrieved_fact_keys:
                     self.store.bump_confidence(key)
 
         self.store.log_turn("user", user_input)
         self.store.log_turn("assistant", response)
-        fp = self.context_builder.query_fingerprint(user_input)
-        self.cache.cache_response(fp, response)
+        if self.context_builder.is_cacheable(user_input):
+            fp = self.context_builder.query_fingerprint(user_input)
+            self.cache.cache_response(fp, response)
 
         # Advance pending keys → last, ready for next turn's feedback
         self._last_retrieved_fact_keys = self._pending_fact_keys
@@ -305,6 +357,15 @@ class LLMProvider(ABC):
                 category=fact["category"],
                 confidence=fact["confidence"],
             )
+        if facts:
+            # New facts can change answers — don't replay pre-fact responses.
+            self.cache.invalidate_responses()
+
+        # Periodically condense old turns into a summary (local model only).
+        self._exchanges_since_summary_check += 1
+        if self._exchanges_since_summary_check >= 20:
+            self._exchanges_since_summary_check = 0
+            self.summarizer.summarize_and_prune()
 
     def get_stats(self) -> str:
         s = self.stats
@@ -327,6 +388,8 @@ class LLMProvider(ABC):
         """Update personality configuration and regenerate system prompt."""
         self.personality = personality
         self.system_prompt = generate_personality_prompt(personality)
+        # Cached responses carry the old personality.
+        self.cache.invalidate_responses()
 
 
 class AnthropicLLM(LLMProvider):
@@ -355,6 +418,7 @@ class AnthropicLLM(LLMProvider):
         response = self._client.messages.create(
             model=self.config.anthropic_model,
             max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
             system=augmented_prompt,
             messages=self.conversation_history,
         )
@@ -416,7 +480,9 @@ class OpenAILLM(LLMProvider):
 
 class OllamaLLM(LLMProvider):
     """Ollama local LLM provider - runs models locally."""
-    
+
+    IS_LOCAL = True
+
     def __init__(self, config: LLMConfig, personality: PersonalityConfig):
         super().__init__(config, personality)
         self.base_url = config.ollama_base_url

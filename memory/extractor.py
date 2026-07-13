@@ -17,9 +17,14 @@ Example: [{{"key": "coffee_order", "value": "oat milk flat white", "category": "
 User: {user_msg}
 Assistant: {assistant_msg}"""
 
-_CORRECTION_KEYWORDS = {
-    "no", "wrong", "incorrect", "actually", "not right",
-    "that's not", "thats not", "you're wrong", "youre wrong", "mistaken",
+# A correction must LEAD with the correction ("No, I take oat milk") or use an
+# explicit phrase. A bare "no"/"actually" mid-sentence is too weak a signal to
+# penalize stored facts — it deleted memories spuriously.
+_CORRECTION_STARTS = {"no", "nope", "wrong", "incorrect", "actually"}
+_CORRECTION_PHRASES = {
+    "that's wrong", "thats wrong", "that's not right", "thats not right",
+    "that's incorrect", "thats incorrect", "you're wrong", "youre wrong",
+    "you're mistaken", "youre mistaken", "not what i said",
 }
 
 _EXPLICIT_MARKERS = {
@@ -69,7 +74,8 @@ class FactExtractor:
     def is_correction(self, user_msg: str) -> bool:
         """Heuristic: did the user correct the assistant?"""
         lower = user_msg.lower()
-        return any(kw in lower for kw in _CORRECTION_KEYWORDS)
+        first = lower.split()[0].strip(",.!?") if lower.split() else ""
+        return first in _CORRECTION_STARTS or any(p in lower for p in _CORRECTION_PHRASES)
 
     def _is_explicit(self, user_msg: str) -> bool:
         lower = user_msg.lower()

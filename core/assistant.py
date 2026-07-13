@@ -181,16 +181,37 @@ class VoiceAssistant:
         )
         return self.llm.generate_response(failure_context)
 
+    async def _dispatch_workflow(self, workflow, text: str, entities: dict,
+                                 user_id: str) -> tuple:
+        """Open a session on (or execute) `workflow` and return
+        (message, outcome) where outcome is 'session' | 'success' | 'failure' | 'other'."""
+        started = await self._maybe_start_session(workflow, text, entities, user_id)
+        if started is not None:
+            return started, "session"
+        result = await workflow.execute(text, entities)
+        if result.status == WorkflowStatus.SUCCESS:
+            self.context.update(workflow.name, entities, text)
+            return result.message, "success"
+        if result.status == WorkflowStatus.FAILURE:
+            return self._handle_workflow_failure(text, workflow.name, result), "failure"
+        return result.message, "other"
+
     async def process_input(self, text: str, user_id: str = "default") -> str:
         """
         Process user input and generate a response.
 
         Pipeline:
         0. Active multi-turn session   → route the turn into it (global "cancel" aborts)
-        1. Fast keyword/pattern match  → conversational? open session, else execute
-        2. Semantic intent cache       → conversational? open session, else execute
-        3. Claude routing prompt       → classify (context-enriched), open/execute workflow
-           └ no workflow found         → Claude generates a conversational response
+        1. Fast keyword/pattern match  → verify + extract entities, then execute.
+           A keyword hit is only a shortlist: the router must confirm the
+           utterance really is that command (a mention of "morning" is not a
+           lights command) and supply real entities (never execute with {}).
+        2. Semantic intent cache       → reuse the cached workflow *choice* only;
+           entities are re-extracted from the new utterance so "turn off ..."
+           can never replay a cached {"action": "on"}.
+        3. LLM routing                 → classify (context-enriched), open/execute workflow
+           └ no workflow found         → the personality LLM answers, with full
+             memory/search context — never the router's flat classifier voice.
         """
         self._log(f"Processing: {text}")
 
@@ -209,68 +230,57 @@ class VoiceAssistant:
         if enriched != text:
             self._log(f"Context-enriched: {enriched}")
 
-        # Step 1: fast keyword/pattern matching
+        # Step 1: fast keyword/pattern matching (verified, with real entities)
         matching_workflow = self.workflows.find_matching_workflow(text)
         if matching_workflow:
             self._log(f"Keyword match: {matching_workflow.name}")
-            started = await self._maybe_start_session(matching_workflow, text, {}, user_id)
-            if started is not None:
-                return started
-            result = await matching_workflow.execute(text, {})
-            if result.status == WorkflowStatus.SUCCESS:
-                self.context.update(matching_workflow.name, {}, text)
-                return result.message
-            elif result.status == WorkflowStatus.FAILURE:
-                return self._handle_workflow_failure(text, matching_workflow.name, result)
-            return result.message
+            extraction = self.intent_router.extract_entities(text, matching_workflow)
+            if extraction is not None and extraction["matches"]:
+                message, _ = await self._dispatch_workflow(
+                    matching_workflow, text, extraction["entities"], user_id)
+                return message
+            # Keyword fired but the utterance isn't really this command (or
+            # extraction failed) — fall through to the cache / full routing.
+            self._log(f"Keyword match not confirmed for {matching_workflow.name}")
 
-        # Step 2: semantic intent cache
+        # Step 2: semantic intent cache — reuses the routing decision, never the
+        # stored entities (similar phrasings can carry opposite actions).
         if self.intent_cache:
             cached = self.intent_cache.query(text)
             if cached:
-                workflow_name, entities = cached
+                workflow_name, _stale_entities = cached
                 workflow = self.workflows.workflows.get(workflow_name)
                 if workflow:
                     self._log(f"Cache hit: {workflow_name}")
-                    started = await self._maybe_start_session(workflow, text, entities, user_id)
-                    if started is not None:
-                        return started
-                    result = await workflow.execute(text, entities)
-                    if result.status == WorkflowStatus.SUCCESS:
-                        self.context.update(workflow_name, entities, text)
-                        return result.message
-                    elif result.status == WorkflowStatus.FAILURE:
-                        return self._handle_workflow_failure(text, workflow_name, result)
-                    return result.message
+                    extraction = self.intent_router.extract_entities(text, workflow)
+                    if extraction is not None and extraction["matches"]:
+                        message, _ = await self._dispatch_workflow(
+                            workflow, text, extraction["entities"], user_id)
+                        return message
+                    self._log(f"Cache hit not confirmed for {workflow_name}")
 
-        # Step 3: Claude routing (enhanced fallback, uses context-enriched text)
-        self._log("Routing via Claude")
+        # Step 3: LLM routing (enhanced fallback, uses context-enriched text)
+        self._log("Routing via LLM")
         route = self.intent_router.route(enriched, self.workflows)
 
         if route.workflow_name:
             workflow = self.workflows.workflows.get(route.workflow_name)
             if workflow:
-                started = await self._maybe_start_session(workflow, text, route.entities, user_id)
-                if started is not None:
-                    return started
-                result = await workflow.execute(text, route.entities)
-                if result.status == WorkflowStatus.SUCCESS:
+                message, outcome = await self._dispatch_workflow(
+                    workflow, text, route.entities, user_id)
+                if outcome == "success" and self.intent_cache and enriched == text:
                     # Only cache routes decided from the raw utterance. When the
                     # router saw context-enriched text (enriched != text), the
                     # decision may reflect transient prior-turn context — caching
                     # it against the raw text permanently poisons the cache (e.g.
                     # "hey" → time after a time query). Follow-ups are context-
                     # dependent by nature and shouldn't be cached anyway.
-                    if self.intent_cache and enriched == text:
-                        self.intent_cache.store(text, route.workflow_name, route.entities)
-                    self.context.update(route.workflow_name, route.entities, text)
-                    return result.message
-                elif result.status == WorkflowStatus.FAILURE:
-                    return self._handle_workflow_failure(text, route.workflow_name, result)
-                return result.message
+                    self.intent_cache.store(text, route.workflow_name, route.entities)
+                return message
 
-        # No workflow matched — use Claude's conversational response or fall back
-        return route.response or self.llm.generate_response(text)
+        # No workflow matched — the personality LLM answers so every
+        # conversational reply carries the persona, memory, and search context.
+        return self.llm.generate_response(text)
     
     def speak(self, text: str):
         """
@@ -487,7 +497,7 @@ def create_assistant(
     name: str = "Jarvis",
     sarcasm: str = "moderate",
     tts_provider: str = "elevenlabs",
-    llm_provider: str = "anthropic",
+    llm_provider: str = "ollama",
     **kwargs,
 ) -> VoiceAssistant:
     """
@@ -524,14 +534,20 @@ def create_assistant(
         "maximum": SarcasmLevel.MAXIMUM,
     }
     
+    # Keep these in sync with main.create_custom_config — two construction
+    # paths with different persona defaults made the personality drift.
     config = AssistantConfig(
         personality=PersonalityConfig(
             name=name,
+            user_title="sir",
             sarcasm_level=sarcasm_map.get(sarcasm, SarcasmLevel.MODERATE),
             formality_level=FormalityLevel.BUTLER,
             warmth_level=WarmthLevel.WARM,
             wit_enabled=True,
+            self_aware_ai_jokes=True,
+            observational_humor=True,
             use_british_vocabulary=True,
+            use_contractions=False,
         ),
         tts=TTSConfig(provider=tts_provider),
         stt=STTConfig(provider="whisper"),

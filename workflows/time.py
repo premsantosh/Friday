@@ -212,9 +212,13 @@ def _find_timezone(location: str) -> Optional[ZoneInfo]:
     except ZoneInfoNotFoundError:
         pass
 
-    # Partial match — pick first key that contains the query
+    # Partial match on whole words only — substring matching mapped "Atlanta"
+    # to "la" (Los Angeles) and "Austin" to "us". A key matches when the query
+    # words contain all of the key's words (or vice versa for multi-word keys).
+    loc_words = set(loc.split())
     for key, tz_id in TIMEZONE_MAP.items():
-        if loc in key or key in loc:
+        key_words = key.split()
+        if set(key_words) <= loc_words or loc_words <= set(key_words):
             return ZoneInfo(tz_id)
 
     return None

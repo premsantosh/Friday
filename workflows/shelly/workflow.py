@@ -208,14 +208,20 @@ class ShellyWorkflow(Workflow):
           2. Device whose name is fully contained in the hint
           3. Device whose name words are a subset of the intent words
         """
-        # 1. Exact
-        if name_hint in self._by_name:
-            return self._by_name[name_hint]
+        # No hint: only unambiguous when a single device is configured —
+        # an empty hint used to substring-match the first device in the list.
+        if not name_hint:
+            if len(self._devices) == 1:
+                return self._devices[0]
+        else:
+            # 1. Exact
+            if name_hint in self._by_name:
+                return self._by_name[name_hint]
 
-        # 2. Contained substring
-        for dev_name, device in self._by_name.items():
-            if dev_name in name_hint or name_hint in dev_name:
-                return device
+            # 2. Contained substring
+            for dev_name, device in self._by_name.items():
+                if dev_name in name_hint or name_hint in dev_name:
+                    return device
 
         # 3. Word overlap against the full intent
         intent_words = set(re.findall(r"\w+", full_intent.lower()))

@@ -264,15 +264,13 @@ class PhilipsHueLightsWorkflow(Workflow):
     @property
     def trigger(self) -> WorkflowTrigger:
         return WorkflowTrigger(
+            # Keywords are light-specific only. Broad mood/time-of-day words
+            # ("morning", "sleep", "focus", "study", "party") hijacked ordinary
+            # sentences — "help me study French" is not a lights command. Mood
+            # scenes are still reachable via the patterns below and LLM routing.
             keywords=[
-                "light", "lights", "lamp", "illuminate", "bright", "dim",
-                "romantic", "romance", "relax", "chill", "calm",
-                "energize", "energetic", "party", "celebrate",
-                "bedtime", "sleep", "going to bed", "good night",
-                "focus", "concentrate", "study",
-                "movie", "cinema", "movie night",
-                "morning", "wake up", "good morning",
-                "mood",
+                "light", "lights", "lamp", "illuminate", "dim",
+                "brightness", "bedtime", "movie night", "mood lighting",
             ],
             patterns=[
                 r"turn (on|off) .*(light|lamp)",
@@ -280,10 +278,9 @@ class PhilipsHueLightsWorkflow(Workflow):
                 r"dim .*(light|lamp)",
                 r"set .*(light|lamp).* to",
                 r"(bright|dark)en",
-                r"(romantic|relax|party|bedtime|focus|movie|morning|energize)\s*(mood|mode|setting|vibe)?",
-                r"(i am |i'm |feeling |in a ).*(romantic|relaxed|sleepy|party|focused)",
+                r"(romantic|relax|party|bedtime|focus|movie|morning|energize)\s+(mood|mode|setting|vibe|lighting)",
                 r"(going to |time for ).*(bed|sleep)",
-                r"(good\s*(night|morning))",
+                r"^(good\s*(night|morning))[.!]?$",
             ],
             examples=[
                 "Turn on the living room lights",

@@ -14,8 +14,15 @@ By default Friday listens on every channel that's available: voice (wake word),
 text (type in the terminal), and Telegram (when TELEGRAM_BOT_TOKEN is
 configured). No flags are needed to enable them.
 
+Privacy: conversations are processed on-device by default (Ollama). Set
+FRIDAY_LLM_PROVIDER=anthropic (or openai) to explicitly opt in to a cloud
+LLM — even then, private memory (preferences, personal facts, summaries,
+device state) is never included in prompts that leave the device.
+
 Environment Variables:
-    ANTHROPIC_API_KEY     - Required for Claude LLM
+    FRIDAY_LLM_PROVIDER   - LLM provider: ollama (default, local), anthropic, openai
+    FRIDAY_OLLAMA_MODEL   - Local conversation model (default: llama3.1)
+    ANTHROPIC_API_KEY     - Required only if FRIDAY_LLM_PROVIDER=anthropic
     ELEVENLABS_API_KEY    - Required for ElevenLabs TTS
     PORCUPINE_ACCESS_KEY  - Required for Porcupine wake word (free at picovoice.ai)
     OPENAI_API_KEY        - Optional, for OpenAI TTS/LLM/Whisper API
@@ -74,13 +81,32 @@ from workflows import (
 from search import OllamaSearchClassifier, TavilySearchProvider, SearchEnhancer
 
 
-def check_api_keys():
-    """Check for required API keys and warn if missing."""
+def _ollama_reachable(base_url: str = "http://localhost:11434") -> bool:
+    import requests
+    try:
+        requests.get(f"{base_url}/api/tags", timeout=2).raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def check_api_keys(llm_provider: str = "ollama"):
+    """Check for required API keys / local services and warn if missing."""
     warnings = []
-    
-    if not os.getenv("ANTHROPIC_API_KEY"):
+
+    if llm_provider == "ollama":
+        if not _ollama_reachable():
+            warnings.append(
+                "Ollama is not reachable at localhost:11434 - the local LLM won't work.\n"
+                "     Start it with 'ollama serve' and pull a model ('ollama pull llama3.1').\n"
+                "     To use a cloud LLM instead (conversations leave the device; private\n"
+                "     memory is still withheld), set FRIDAY_LLM_PROVIDER=anthropic."
+            )
+    elif llm_provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY"):
         warnings.append("ANTHROPIC_API_KEY not set - Claude LLM won't work")
-    
+    elif llm_provider == "openai" and not os.getenv("OPENAI_API_KEY"):
+        warnings.append("OPENAI_API_KEY not set - OpenAI LLM won't work")
+
     if not os.getenv("ELEVENLABS_API_KEY"):
         warnings.append("ELEVENLABS_API_KEY not set - ElevenLabs TTS unavailable (using Piper by default)")
     
@@ -164,7 +190,10 @@ def create_custom_config(args) -> AssistantConfig:
             whisper_model="base",  # Use "small" or "medium" for better accuracy
         ),
         llm=LLMConfig(
-            provider="anthropic",
+            # Local-first: conversations stay on-device unless the owner
+            # explicitly opts in to a cloud provider via FRIDAY_LLM_PROVIDER.
+            provider=os.getenv("FRIDAY_LLM_PROVIDER", "ollama"),
+            ollama_model=os.getenv("FRIDAY_OLLAMA_MODEL", "llama3.1"),
             anthropic_model="claude-haiku-4-5-20251001",
             ephemeral=is_ephemeral,
         ),
@@ -513,9 +542,9 @@ def main():
         list_audio_devices()
         return
     
-    # Check API keys
-    check_api_keys()
-    
+    # Check API keys / local LLM availability
+    check_api_keys(os.getenv("FRIDAY_LLM_PROVIDER", "ollama"))
+
     # Create configuration
     config = create_custom_config(args)
     

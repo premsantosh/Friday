@@ -6,28 +6,33 @@ keyword sets into YES / NO / EDIT / UNCLEAR. Editable gates (an email draft)
 treat unrecognized input as an edit instruction; strict gates (booking, call,
 untrusted code) treat it as UNCLEAR — the workflow re-asks instead of
 cancelling, and an UNCLEAR can never approve anything.
+
+Safety rule: a negation ANYWHERE in the reply beats an embedded yes-phrase.
+"No, don't book it" and "please don't book it" must both parse as NO even
+though they contain "book it". Mixed or odd phrasings fall to UNCLEAR/EDIT —
+never to YES.
 """
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 AFFIRMATIVE = {
     "yes", "y", "yeah", "yep", "yup", "correct", "confirm", "confirmed", "go ahead",
     "do it", "book it", "please do", "sounds good", "ok", "okay", "sure", "send it",
-    "yes please", "absolutely", "of course",
+    "yes please", "absolutely", "of course", "why not", "sure why not",
 }
 AFFIRMATIVE_STARTS = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
                       "absolutely"}
 AFFIRMATIVE_PHRASES = ("go ahead", "book it", "do it", "please do", "sounds good",
                        "send it")
 
-NEGATIVE = {
-    "no", "n", "nope", "nah", "don't", "do not", "cancel", "stop", "no thanks",
-    "no thank you", "never mind", "nevermind", "forget it", "scrap it", "hold off",
-    "not now", "leave it",
-}
-NEGATIVE_STARTS = {"no", "nope", "nah", "don't", "dont", "never", "cancel", "stop", "not"}
+# Single tokens that signal refusal wherever they appear.
+NEGATIVE_TOKENS = {"no", "n", "nope", "nah", "don't", "dont", "never", "cancel",
+                   "stop", "not"}
+NEGATIVE_PHRASES = ("do not", "no thanks", "no thank you", "never mind",
+                    "nevermind", "forget it", "scrap it", "hold off", "leave it")
 
 
 class ConfirmDecision(Enum):
@@ -38,14 +43,22 @@ class ConfirmDecision(Enum):
 
 
 def parse_confirmation(text: str, *, editable: bool = False) -> ConfirmDecision:
-    t = text.strip().lower().rstrip("!.,")
-    first = t.split()[0] if t else ""
+    # Normalize: lowercase, strip all punctuation so "No," can't dodge the
+    # negation check the way a trailing-comma token used to.
+    t = re.sub(r"[^a-z'\s]+", " ", text.strip().lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    tokens = t.split()
+    if not tokens:
+        return ConfirmDecision.EDIT if editable else ConfirmDecision.UNCLEAR
 
     if t in AFFIRMATIVE:
         return ConfirmDecision.YES
-    # Negations win over embedded yes-phrases ("don't book it").
-    if t in NEGATIVE or first in NEGATIVE_STARTS:
+
+    # Negations win over embedded yes-phrases ("no, don't book it",
+    # "please don't book it") no matter where they appear.
+    if any(tok in NEGATIVE_TOKENS for tok in tokens) or any(p in t for p in NEGATIVE_PHRASES):
         return ConfirmDecision.NO
-    if first in AFFIRMATIVE_STARTS or any(p in t for p in AFFIRMATIVE_PHRASES):
+
+    if tokens[0] in AFFIRMATIVE_STARTS or any(p in t for p in AFFIRMATIVE_PHRASES):
         return ConfirmDecision.YES
     return ConfirmDecision.EDIT if editable else ConfirmDecision.UNCLEAR

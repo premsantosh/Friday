@@ -411,6 +411,20 @@ def test_parse_confirmation_matrix():
                               editable=True) == ConfirmDecision.EDIT
 
 
+def test_parse_confirmation_negation_wins_anywhere():
+    """Regression: declined bookings used to parse as YES when the negation
+    wasn't the first token — the embedded "book it" phrase matched first."""
+    no = ConfirmDecision.NO
+    assert parse_confirmation("No, don't book it.") == no      # comma-attached "No,"
+    assert parse_confirmation("please don't book it") == no    # negation mid-sentence
+    assert parse_confirmation("actually no, go ahead and cancel") == no
+    assert parse_confirmation("do not send it") == no
+    assert parse_confirmation("stop, don't do it") == no
+    # Affirmative idioms containing "not" still approve.
+    assert parse_confirmation("sure, why not") == ConfirmDecision.YES
+    assert parse_confirmation("why not") == ConfirmDecision.YES
+
+
 # ------------------------------------------------------------------- extract
 
 from core.harness import FieldSpec, LLMTask, run_task  # noqa: E402

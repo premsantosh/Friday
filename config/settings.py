@@ -143,9 +143,16 @@ class STTConfig:
 
 @dataclass
 class LLMConfig:
-    """Language Model configuration."""
+    """Language Model configuration.
+
+    Privacy: conversations are processed on-device by default (provider
+    "ollama"). Cloud providers (anthropic, openai) are an explicit opt-in —
+    and even then, private memory (preferences, personal facts, conversation
+    summaries, device state) is never included in prompts that leave the
+    device unless allow_private_context_to_cloud is also set.
+    """
     # Provider selection
-    provider: str = "anthropic"  # Options: anthropic, openai, ollama
+    provider: str = "ollama"  # Options: ollama (local, default), anthropic, openai
     
     # Anthropic settings
     anthropic_api_key: Optional[str] = None
@@ -168,6 +175,11 @@ class LLMConfig:
     # When True, no data is read from or written to any persistent store.
     # Used by --chat and --test modes so test sessions don't pollute long-term memory.
     ephemeral: bool = False
+
+    # Privacy guard: when the conversation provider is a cloud service, private
+    # memory sections are stripped from outbound prompts unless this is True.
+    # Local providers (ollama) always receive full context.
+    allow_private_context_to_cloud: bool = False
 
 
 @dataclass
@@ -260,7 +272,6 @@ DEFAULT_CONFIG = AssistantConfig(
         whisper_model="base",
     ),
     llm=LLMConfig(
-        provider="anthropic",
-        anthropic_model="claude-haiku-4-5-20251001",
+        provider="ollama",
     ),
 )
