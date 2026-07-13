@@ -242,7 +242,7 @@ Reservation sink declarations (defined in the workflow, enforced by the harness)
 | `bland` (call payload) | ALLOWLIST | `phone_number`, `task`, `business`, plus scan of the task text |
 | `sandbox` (bot input) | ALLOWLIST | `business_name`, `date`, `time`, `party_size`, `url` — never credentials |
 | `smtp` (email body) | SCAN | card/secret scan |
-| `signal`, `calendar` | SCAN | user-owned destinations; scan only |
+| `telegram`, `calendar` | SCAN | user-owned destinations; scan only |
 
 `EgressViolation` propagates to the workflow, which fails the step honestly
 ("I stopped that lookup, sir — it was about to include something it shouldn't").
@@ -445,7 +445,7 @@ def parse_confirmation(text: str, *, editable: bool = False) -> ConfirmDecision
 | `main.py` | `install_log_redaction()` at startup |
 
 Not gated (deliberately): availability checks and discovery reads (no side effects),
-calendar/Signal writes (user-owned destinations, never fail the booking — scan-sink
+calendar/Telegram writes (user-owned destinations, never fail the booking — scan-sink
 only).
 
 ---

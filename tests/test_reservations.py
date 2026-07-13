@@ -24,7 +24,7 @@ from workflows.reservations.channels import (
     ReservationChannel,
 )
 from workflows.reservations.calendar import CalendarService
-from workflows.reservations.notify import SignalNotifier
+from workflows.reservations.notify import TelegramNotifier
 from workflows.reservations.payment import (
     ManualCardService,
     PrivacyCardService,
@@ -924,34 +924,42 @@ def test_calendar_skips_when_time_unparseable():
     assert svc.create_event({"business_name": "X", "date": "someday", "time": "later"}) is None
 
 
-def test_signal_from_env_none_when_unconfigured(monkeypatch):
-    for var in ("SIGNAL_CLI_URL", "SIGNAL_FROM_NUMBER", "SIGNAL_TO_NUMBER"):
+def test_telegram_from_env_none_when_unconfigured(monkeypatch):
+    for var in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_NOTIFY_CHAT_ID", "TELEGRAM_ALLOWED_CHAT_IDS"):
         monkeypatch.delenv(var, raising=False)
-    assert SignalNotifier.from_env() is None
+    assert TelegramNotifier.from_env() is None
 
 
-def test_signal_send_builds_payload():
+def test_telegram_from_env_falls_back_to_first_allowed_chat(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+    monkeypatch.delenv("TELEGRAM_NOTIFY_CHAT_ID", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "555, 777")
+    n = TelegramNotifier.from_env()
+    assert n is not None and n.chat_id == "555"
+
+
+def test_telegram_send_builds_payload():
     captured = {}
 
     class Resp:
-        status_code = 201
+        status_code = 200
 
     def poster(url, json=None, timeout=None):
         captured["url"] = url
         captured["json"] = json
         return Resp()
 
-    n = SignalNotifier("http://localhost:8080", "+1111", "+2222", poster=poster)
+    n = TelegramNotifier("123:ABC", "555", poster=poster)
     assert n.send("hello") is True
-    assert captured["url"].endswith("/v2/send")
-    assert captured["json"] == {"message": "hello", "number": "+1111", "recipients": ["+2222"]}
+    assert captured["url"] == "https://api.telegram.org/bot123:ABC/sendMessage"
+    assert captured["json"] == {"chat_id": "555", "text": "hello"}
 
 
-def test_signal_send_never_raises():
+def test_telegram_send_never_raises():
     def poster(*a, **k):
         raise RuntimeError("network down")
 
-    n = SignalNotifier("http://x", "+1", "+2", poster=poster)
+    n = TelegramNotifier("123:ABC", "555", poster=poster)
     assert n.send("hi") is False
 
 
@@ -964,7 +972,7 @@ class _RecordingCalendar:
         return "https://cal/evt"
 
 
-class _RecordingSignal:
+class _RecordingNotifier:
     def __init__(self):
         self.message = None
 
@@ -974,12 +982,12 @@ class _RecordingSignal:
 
 
 @pytest.mark.asyncio
-async def test_confirmed_booking_creates_calendar_and_signal():
+async def test_confirmed_booking_creates_calendar_and_telegram():
     disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
     fake = FakeChannel()
     mgr = make_reservation_manager(disc, router=opentable_router(fake))
     wf = mgr.workflows.workflows["reservations"]
-    cal, sig = _RecordingCalendar(), _RecordingSignal()
+    cal, sig = _RecordingCalendar(), _RecordingNotifier()
     wf.calendar, wf.notifier = cal, sig
 
     await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
@@ -1066,7 +1074,7 @@ async def test_phone_call_flow_confirms_via_polling():
     router = ChannelRouter({ReservationMethod.PHONE: phone})
     mgr = make_reservation_manager(disc, router=router)
     wf = mgr.workflows.workflows["reservations"]
-    cal, sig = _RecordingCalendar(), _RecordingSignal()
+    cal, sig = _RecordingCalendar(), _RecordingNotifier()
     wf.calendar, wf.notifier = cal, sig
 
     turn = await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
@@ -1231,7 +1239,7 @@ async def test_phone_email_requested_hands_off_to_email():
     router = ChannelRouter({ReservationMethod.PHONE: phone, ReservationMethod.EMAIL: email})
     mgr = make_reservation_manager(disc, router=router)
     wf = mgr.workflows.workflows["reservations"]
-    cal, sig = _RecordingCalendar(), _RecordingSignal()
+    cal, sig = _RecordingCalendar(), _RecordingNotifier()
     wf.calendar, wf.notifier = cal, sig
 
     # Approve the call → it's placed → poll returns "email us" → hand off to an email draft.
@@ -1327,7 +1335,7 @@ async def test_wait_and_book_opens_then_books():
     ])
     mgr = make_reservation_manager(disc, router=opentable_router(chan))
     wf = mgr.workflows.workflows["reservations"]
-    wf.calendar, wf.notifier = _RecordingCalendar(), _RecordingSignal()
+    wf.calendar, wf.notifier = _RecordingCalendar(), _RecordingNotifier()
 
     turn = await mgr.open(wf, "book a table for 2 at Lazy Bear friday at 7pm", {}, "default")
     assert turn.control == TurnControl.AWAIT_CONFIRMATION       # offered to wait
@@ -1416,7 +1424,7 @@ async def test_sandbox_fallback_offered_and_runs_on_consent():
                                             message="I couldn't complete it automatically."))
     mgr = make_reservation_manager(disc, router=opentable_router(fake))
     wf = mgr.workflows.workflows["reservations"]
-    wf.calendar, wf.notifier = _RecordingCalendar(), _RecordingSignal()
+    wf.calendar, wf.notifier = _RecordingCalendar(), _RecordingNotifier()
     wf.sandbox = _sandbox_with([_repo("acme/ot-bot", 120, "Python")],
                                SandboxResult(True, output="Reservation confirmed",
                                              confirmation="BOT9"))

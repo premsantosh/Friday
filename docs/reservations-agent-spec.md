@@ -33,7 +33,7 @@ pauses for the user's explicit approval before any irreversible, outward-facing 
 | OpenTable / Resy / Yelp | **Browser automation (Playwright)** against the real sites with the user's logged-in session — these platforms have no public consumer booking API. **Yelp** additionally used for discovery via its Fusion API. |
 | No-API sites | **Prefer our own Playwright engine; fall back to a sandboxed (Docker) third-party GitHub bot.** Docker is available locally, so the sandbox fallback is enabled. |
 | Calendar | On a confirmed booking, **create a Google Calendar event** with all details (Friday already has Google Calendar tools). |
-| Async notifications | When Friday isn't actively listening, send a **Signal** message; speak it when it is. |
+| Async notifications | When Friday isn't actively listening, send a **Telegram** message; speak it when it is. |
 | Accounts | User holds a **Privacy.com API key** and **OpenTable / Resy / Yelp** logins. |
 | Multi-user / concurrency | Single user, **one active dialogue** at a time (many backgrounded). |
 
@@ -144,7 +144,7 @@ infrastructure of its own.
         │      session)                     form engine)      call plan)          GitHub bot)
         │
    ┌────▼─────────────────┐   ┌──────────────────────┐   ┌────────────────────────┐
-   │ PrivacyCardService    │   │ CalendarService       │   │ SignalNotifier         │
+   │ PrivacyCardService    │   │ CalendarService       │   │ TelegramNotifier       │
    │ (single-use, $10 def.)│   │ (Google Cal event on  │   │ (async updates when    │
    │ ← any requires_card   │   │  CONFIRMED)           │   │  Friday isn't listening)│
    └───────────────────────┘   └──────────────────────┘   └────────────────────────┘
@@ -218,10 +218,10 @@ creates a Google Calendar event with all booking details (business, address, dat
 size, confirmation number, special requests) using Friday's existing Google Calendar tools.
 Failure to create the event never fails the booking — it's logged and surfaced.
 
-**`SignalNotifier`** (`workflows/reservations/notify.py`) — delivers async outcomes
-(confirmation, "slot opened — confirm?", call result, failure) over **Signal** when Friday
+**`TelegramNotifier`** (`workflows/reservations/notify.py`) — delivers async outcomes
+(confirmation, "slot opened — confirm?", call result, failure) over **Telegram** when Friday
 isn't actively listening; when it is, the `BackgroundTaskRunner` speaks instead. Backed by
-`signal-cli` / signal-cli-rest-api; target number from config.
+the Telegram Bot API; target number from config.
 
 **Durable persistence + async driver** — provided by the multi-turn framework's
 `SqliteSessionStore` and `BackgroundTaskRunner`; the reservation workflow implements `on_tick`
@@ -283,12 +283,12 @@ small read model over the session DB can list "your pending reservations" if nee
   - **`callback_required`** — they'll call back, or said to call a specific later time. →
     `WAITING` with `wake_at` set accordingly (or note the business will call the user's number).
   - **`needs_info`** — they asked something not in the call plan. → surface the question to the
-    user (speak/Signal), collect the answer, re-call.
-  The outcome is announced (spoken or Signal).
+    user (speak/Telegram), collect the answer, re-call.
+  The outcome is announced (spoken or Telegram).
 - **No-availability handling.** Treated like `UNAVAILABLE`: the agent reports back and offers
   options — try another date/time, call back another day (wait-and-retry via `WAITING`/`on_tick`,
   bounded by `RESERVATION_CALL_DEADLINE_DAYS`), try a different business, or stop. If Friday
-  isn't listening, the options go out over Signal and the session waits for the user's choice.
+  isn't listening, the options go out over Telegram and the session waits for the user's choice.
   Nothing is re-attempted without the user picking an option.
 - **Off-hours deferral.** Before dialing, the channel checks the business hours/timezone
   captured during discovery against `now`:
@@ -364,9 +364,9 @@ NEW
      │                         reply: confirmed→CONFIRMED · declined→UNAVAILABLE ·
      │                                needs_info→ask user · asks_to_call→Phone
      ├▶ callback_required ─▶ WAITING (wake_at = stated time / business will call)
-     ├▶ needs_info ────────▶ ask user (speak/Signal) ─▶ re-COMMIT
+     ├▶ needs_info ────────▶ ask user (speak/Telegram) ─▶ re-COMMIT
      └▶ failed (no answer)─▶ retry within window / defer to next open window / give up
- CONFIRMED ─▶ store confirmation #  ─▶ create Google Calendar event  ─▶ notify (speak / Signal)
+ CONFIRMED ─▶ store confirmation #  ─▶ create Google Calendar event  ─▶ notify (speak / Telegram)
 ```
 
 Email-only businesses enter the `EMAIL_SENT ▶ WAITING (reply)` path directly from
@@ -401,7 +401,7 @@ integrations.
 | `RESERVATION_EMAIL_FROM` / SMTP host/port/user/pass (or Gmail OAuth) | Sending identity/credentials. |
 | `RESERVATION_EMAIL_DEADLINE_DAYS` | Stop awaiting an email reply after this many days (default `5`); one follow-up nudge before giving up. |
 | `YELP_API_KEY` | Yelp Fusion API key (business discovery). |
-| `SIGNAL_CLI_URL` / `SIGNAL_FROM_NUMBER` / `SIGNAL_TO_NUMBER` | Signal notifications when not listening. |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_CHAT_IDS` / `TELEGRAM_NOTIFY_CHAT_ID` | Telegram notifications when not listening. |
 | `RESERVATION_CALENDAR_ID` | Google Calendar to write confirmed events to (default `primary`). |
 | `RESERVATION_USER_PHONE` / `RESERVATION_USER_EMAIL` / `RESERVATION_GUEST_NAME` | Defaults for slot-filling. |
 | `RESERVATION_ALLOW_SANDBOX_BOTS` | Default `false`; enables the Docker GitHub-bot fallback (Docker is available). |
@@ -449,7 +449,7 @@ sessions). Those need their own controls.
 | L5 | **Discovery queries** (Yelp Fusion, Tavily) | a naive query could include user PII | Hard rule: discovery queries contain **only** business name + location, never the user's name/phone/email/card. |
 | L6 | **Bland.ai** — receives destination number + call plan (name, callback #, details); processes/records call audio | user's name + callback number to a 3rd party; possibly card read aloud if a phone booking needs payment | Minimize: first name + callback number + reservation specifics only. **If a phone booking would require reading a card aloud, abort** (don't voice card data over the line). Review Bland's retention; disclose in setup. |
 | L7 | **Google Calendar event** | full booking details, confirmation code | Write to the user's own (private) calendar (`primary` default); default visibility private; don't embed card data. |
-| L8 | **Signal notifications** | booking details | Send only to the user's own configured `SIGNAL_TO_NUMBER`; transport is E2E-encrypted. |
+| L8 | **Telegram notifications** | booking details | Send only to the user's own configured `TELEGRAM_NOTIFY_CHAT_ID` chat. |
 | L9 | **`PRIVACY_API_KEY` / other API keys** | mint many cards / impersonate services | Env only, never logged, never in prompts, gitignored (`.env` is); recommend account-level spend limits at Privacy so a key leak is also bounded, not just per-card. |
 | L10 | **Sandbox exfiltration** (L4-class but worse) | card + PII handed to untrusted code | Pass the minimum PII; rely on egress allowlist + single-use $10 card; **require explicit user consent before using a third-party bot** for a given booking (new trust surface, off by default). |
 | L11 | **Email channel** — sends from the user's mailbox; reads replies | reservation email (name/contact/details) to the business; inbox access | Send only after user approves the draft; **read only the reservation thread** (match by recipient/thread-id), never scan the broader inbox; OAuth/SMTP creds via env, never logged; never include card data in the email. |
@@ -478,7 +478,7 @@ workflows/reservations/
 ├── router.py              # ChannelRouter (strategy selection + preference order)
 ├── payment.py             # PrivacyCardService
 ├── calendar.py            # CalendarService (Google Calendar event on CONFIRMED)
-├── notify.py              # SignalNotifier
+├── notify.py              # TelegramNotifier
 └── channels/
     ├── base.py            # ReservationChannel ABC + shared Playwright base
     ├── opentable.py       # Playwright + persistent session
@@ -492,7 +492,7 @@ workflows/reservations/
 Session state, persistence, and the background runner come from `core/conversation/` (multi-turn
 framework) — **not** duplicated here. Plus: `ReservationConfig` dataclass in
 `config/settings.py`, conditional registration in `main.py:create_workflow_manager`, and new
-deps in `requirements.txt` (`playwright`, `docker`; HTTP for Bland.ai/Yelp/Signal). The
+deps in `requirements.txt` (`playwright`, `docker`; HTTP for Bland.ai/Yelp/Telegram). The
 `core/assistant.py` change and `turnstile-ctx` dependency are owned by the multi-turn spec.
 
 ---
@@ -536,14 +536,14 @@ deps in `requirements.txt` (`playwright`, `docker`; HTTP for Bland.ai/Yelp/Signa
    the booking. `VirtualCard.__repr__` redacts PAN/CVV; card data is never logged, persisted, or
    put in slots. Tested (hard-cap refusal, mint→passed-to-commit, mint-failure abort, no-service
    hand-off). Entering the card into the booking page is part of per-site live work (M2 caveat).
-4. **M4 — Calendar + Signal.** ✅ **Done.** `CalendarService` (`calendar.py`) builds a Google
+4. **M4 — Calendar + Telegram.** ✅ **Done.** `CalendarService` (`calendar.py`) builds a Google
    Calendar event (summary/location/description + parsed date/time) on a confirmed booking;
    insertion is pluggable (real Google inserter only when `GOOGLE_APPLICATION_CREDENTIALS` is
-   set, else a safe no-op). `SignalNotifier` (`notify.py`) sends a written confirmation via
-   signal-cli-rest-api. Both are wired into the confirmed-commit path and **never fail the
+   set, else a safe no-op). `TelegramNotifier` (`notify.py`) sends a written confirmation via
+   the Telegram Bot API. Both are wired into the confirmed-commit path and **never fail the
    booking** on error. Tested: event-dict build + date/time parse, no-op-without-inserter,
-   unparseable-time skip, Signal payload + never-raises, and end-to-end (confirm → calendar +
-   Signal fired). Real Google OAuth/credentials setup remains environment config (Friday has no
+   unparseable-time skip, Telegram payload + never-raises, and end-to-end (confirm → calendar +
+   Telegram fired). Real Google OAuth/credentials setup remains environment config (Friday has no
    Google auth wired in yet).
 5. **M5 — Phone channel (Bland.ai).** ✅ **Done.** `PhoneChannel` + `BlandClient`
    (`channels/phone.py`): builds a call plan, places the call after the user approves it (the
@@ -551,7 +551,7 @@ deps in `requirements.txt` (`playwright`, `docker`; HTTP for Bland.ai/Yelp/Signa
    and maps a **structured outcome** (confirmed / no-availability / email-requested / callback /
    needs-info / failed). Off-hours calls **defer to the next opening** (`is_open_now` over Yelp
    hours); no-answer **retries** up to `RESERVATION_CALL_RETRIES` then gives up. Confirmed →
-   calendar + Signal (M4). `DialAndBridgeChannel` is the non-autonomous fallback; Google Voice
+   calendar + Telegram (M4). `DialAndBridgeChannel` is the non-autonomous fallback; Google Voice
    unsupported. Router wires `PHONE` from `RESERVATION_PHONE_PROVIDER` (`bland`/`dial_and_bridge`/
    `off`). Bland client injectable; tested (outcome classification, hours/deferral, router wiring,
    full confirm→call→poll→confirmed flow, no-availability). Live calling needs a `BLAND_API_KEY`.
@@ -560,7 +560,7 @@ deps in `requirements.txt` (`playwright`, `docker`; HTTP for Bland.ai/Yelp/Signa
    anything else re-drafts) → send (SMTP via stdlib; reader/sender injectable) → session `WAITING`
    → `on_tick` polls **only the reservation thread** (subject-scoped) → classifies the reply
    (confirmed / declined / needs-info / asks-to-call), with a deadline. Confirmed → calendar +
-   Signal (M4). Wired both ways: a phone `email_requested` outcome **hands off** to an email draft
+   Telegram (M4). Wired both ways: a phone `email_requested` outcome **hands off** to an email draft
    (promotes the WAITING session back to an active confirmation), and email-only businesses route
    here. Router wires `EMAIL` from `RESERVATION_EMAIL_PROVIDER`. Tested: reply classification,
    drafter content, send+poll, router wiring, full phone→email→send→reply→confirmed, and the
@@ -608,5 +608,5 @@ All v1 scoping questions are settled:
    integrated** (Fusion API for discovery, browser for booking).
 4. **Docker** — available locally; the sandboxed GitHub-bot fallback (M7) is enabled.
 5. **Calendar** — confirmed bookings create a Google Calendar event with all details.
-6. **Async notifications** — **Signal** message when Friday isn't listening; spoken when it is.
+6. **Async notifications** — **Telegram** message when Friday isn't listening; spoken when it is.
 7. **Multi-user / concurrency** — single user, one active dialogue (per multi-turn spec).

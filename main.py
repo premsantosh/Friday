@@ -3,11 +3,16 @@
 Jarvis Voice Assistant - Main Entry Point
 
 Usage:
-    python main.py                    # Run with default settings
+    python main.py                    # Listen on voice + text + Telegram together
     python main.py --debug            # Run with debug output
-    python main.py --keyboard         # Use keyboard activation (no wake word)
-    python main.py --chat             # Interactive text mode (no microphone)
+    python main.py --keyboard         # Keyboard activation for voice (+ Telegram)
+    python main.py --chat             # Text only (no microphone, no Telegram)
+    python main.py --telegram         # Headless Telegram bot (no mic/terminal)
     python main.py --test "Hello"     # Test with single text input (no voice)
+
+By default Friday listens on every channel that's available: voice (wake word),
+text (type in the terminal), and Telegram (when TELEGRAM_BOT_TOKEN is
+configured). No flags are needed to enable them.
 
 Environment Variables:
     ANTHROPIC_API_KEY     - Required for Claude LLM
@@ -31,6 +36,8 @@ Environment Variables:
 import argparse
 import os
 import sys
+import time
+from typing import Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,7 +60,7 @@ from config import (
     FormalityLevel,
     WarmthLevel,
 )
-from core import VoiceAssistant, create_assistant
+from core import VoiceAssistant, create_assistant, TelegramChannel
 from workflows import (
     WorkflowManager,
     create_default_workflow_manager,
@@ -241,8 +248,46 @@ def run_text_test(text: str, config: AssistantConfig):
     print()
 
 
+def _text_chat_loop(assistant: VoiceAssistant, config: AssistantConfig) -> str:
+    """Foreground "type a message" loop, shared by chat mode and the default
+    all-channels mode.
+
+    Returns why it ended: 'quit' (user typed quit/exit), 'interrupt' (Ctrl+C),
+    or 'eof' (Ctrl+D / no stdin). Callers running other channels concurrently
+    use that to decide whether to keep those channels alive.
+    """
+    name = config.personality.name
+    title = config.personality.user_title
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except KeyboardInterrupt:
+            print()
+            assistant.speak(f"Very good, {title}. Until next time.")
+            return "interrupt"
+        except EOFError:
+            print()
+            return "eof"
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ("quit", "exit"):
+            assistant.speak(f"Very good, {title}. Until next time.")
+            return "quit"
+
+        if user_input.lower() == "clear":
+            assistant.clear_history()
+            print("[Conversation history cleared]\n")
+            continue
+
+        response = assistant.run_single_interaction(user_input)
+        print(f"\n🤖 {name}: {response}\n")
+        assistant.speak(response)
+
+
 def run_text_chat(config: AssistantConfig):
-    """Run interactive chat mode - type input, voice output."""
+    """Run interactive chat mode - type input, voice output (text only, no mic)."""
     workflow_manager = create_workflow_manager()
     assistant = VoiceAssistant(config, workflow_manager)
     assistant.llm.search_enhancer = create_search_enhancer(config)
@@ -259,33 +304,157 @@ def run_text_chat(config: AssistantConfig):
     print(f"  'clear'          - Clear conversation history")
     print(f"{'='*50}\n")
 
-    while True:
-        try:
-            user_input = input("You: ").strip()
+    _text_chat_loop(assistant, config)
 
-            if not user_input:
-                continue
 
-            if user_input.lower() in ("quit", "exit"):
-                assistant.speak(f"Very good, {config.personality.user_title}. Until next time.")
-                break
+def _attach_listener(assistant: VoiceAssistant, channel) -> None:
+    """Wire a messaging channel's inbound messages to the assistant brain.
 
-            if user_input.lower() == "clear":
-                assistant.clear_history()
-                print("[Conversation history cleared]\n")
-                continue
+    Works for any channel exposing start(handler) where handler is
+    `async (text, sender) -> reply`. Each sender gets their own multi-turn
+    session via user_id, so a chat tracks reservations/dialogues independently
+    of the voice path. (Telegram keys by chat ID.)
+    """
+    async def handle(text: str, sender: str) -> Optional[str]:
+        return await assistant.process_input(text, user_id=sender)
 
-            response = assistant.run_single_interaction(user_input)
-            print(f"\n🤖 {name}: {response}\n")
-            assistant.speak(response)
+    channel.start(handle)
 
-        except KeyboardInterrupt:
-            print()
-            assistant.speak(f"Very good, {config.personality.user_title}. Until next time.")
-            break
-        except EOFError:
-            print()
-            break
+
+def _run_headless_channel(config: AssistantConfig, channel, label: str,
+                          owner, summary: str):
+    """Run Friday headless against a single messaging channel — no mic/speaker.
+
+    You text Friday; it routes the message through the same brain the voice
+    assistant uses and texts the reply back. Long-running outcomes (reservation
+    results, coffee alerts) are pushed to `owner` instead of being spoken aloud.
+    """
+    workflow_manager = create_workflow_manager()
+    assistant = VoiceAssistant(config, workflow_manager)
+    assistant.llm.search_enhancer = create_search_enhancer(config)
+
+    notify_owner = (lambda msg: channel.send(msg, owner)) if owner else (lambda msg: None)
+
+    # Re-point session notifications at the channel, since there's no speaker
+    # in this mode (the assistant built its runner wired to speak()).
+    if assistant.sessions is not None:
+        from core.conversation import BackgroundTaskRunner
+        assistant.background_runner = BackgroundTaskRunner(
+            assistant.sessions,
+            notify_owner,
+            tick_seconds=config.conversation.background_tick_seconds,
+        )
+        assistant.background_runner.start()
+
+    # Coffee-machine alerts also have nowhere to speak — route them to the channel.
+    coffee_workflow = workflow_manager.get_workflow("coffee_machine")
+    if coffee_workflow is not None and owner:
+        coffee_workflow.start_monitor(notify_owner)
+
+    _attach_listener(assistant, channel)
+
+    name = config.personality.name
+    print(f"\n{'='*50}")
+    print(f"  {name} - {label} Mode")
+    print(f"{'='*50}")
+    print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  {summary}")
+    print(f"{'='*50}")
+    print("  Text Friday from your phone. (Press Ctrl+C to quit)\n")
+
+    try:
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        channel.stop()
+        if assistant.background_runner is not None:
+            assistant.background_runner.stop()
+        if coffee_workflow is not None:
+            coffee_workflow.stop_monitor()
+
+
+def run_telegram_mode(config: AssistantConfig):
+    """Run Friday headless as a Telegram bot — no mic, no speaker."""
+    channel = TelegramChannel.from_env()
+    if channel is None:
+        print("\n❌ Telegram channel not configured.")
+        print("   Set TELEGRAM_BOT_TOKEN (from @BotFather). Optionally set")
+        print("   TELEGRAM_ALLOWED_CHAT_IDS to authorise chats.\n")
+        return
+    owner = next(iter(channel.allowed_chat_ids), None)
+    summary = (f"Authorised chats: {', '.join(sorted(channel.allowed_chat_ids))}"
+               if channel.allowed_chat_ids
+               else "No allowlist yet — message the bot and it will reply with your chat ID.")
+    _run_headless_channel(config, channel, "Telegram", owner, summary)
+
+
+def run_all(config: AssistantConfig, debug: bool = False):
+    """Default mode: listen on voice, text, and Telegram at once.
+
+    Voice (wake word, mic) and Telegram (inbound poll) run on background threads;
+    the type-a-message loop owns the foreground. Any channel that isn't available
+    is skipped silently — no flags required to opt in/out:
+      * Voice needs a working wake-word detector (mic).
+      * Telegram needs TELEGRAM_BOT_TOKEN configured.
+      * Text is always available when there's a terminal.
+    """
+    workflow_manager = create_workflow_manager()
+    assistant = VoiceAssistant(config, workflow_manager)
+    assistant.llm.search_enhancer = create_search_enhancer(config)
+
+    if debug:
+        assistant.on_transcript = lambda t: print(f"📢 You: {t}")
+        assistant.on_response = lambda r: print(f"🤖 {config.personality.name}: {r}")
+        assistant.on_error = lambda e: print(f"❌ Error: {e}")
+
+    name = config.personality.name
+    print(f"\n{'='*50}")
+    print(f"  {name}")
+    print(f"{'='*50}")
+    print(f"  TTS: {assistant.tts.get_name()}")
+    print(f"  LLM: {assistant.llm.get_name()}")
+
+    # Coffee-machine alerts speak aloud (mic/speaker present in this mode).
+    coffee_workflow = workflow_manager.get_workflow("coffee_machine")
+    if coffee_workflow is not None:
+        coffee_workflow.start_monitor(assistant.speak)
+
+    # Telegram — automatically on whenever it's configured.
+    telegram_channel = TelegramChannel.from_env()
+    if telegram_channel is not None:
+        _attach_listener(assistant, telegram_channel)
+
+    # Voice — start in the background; don't grab stdin (the text loop owns it),
+    # so a mic-less machine just runs text + Telegram instead of hijacking input.
+    voice_active = assistant.start_listening(allow_keyboard_fallback=False)
+
+    channels = []
+    if voice_active:
+        channels.append(f"voice (say '{config.wake_word.porcupine_keyword}')")
+    channels.append("text (type below)")
+    if telegram_channel is not None:
+        channels.append("Telegram")
+    print(f"  Channels: {' · '.join(channels)}")
+    print(f"{'='*50}")
+    print("  Talk, type, or text Friday. (Ctrl+C to quit)\n")
+
+    try:
+        reason = _text_chat_loop(assistant, config)
+        # Ctrl+D / closed stdin shouldn't kill voice + Telegram — keep them alive.
+        if reason == "eof" and (voice_active or telegram_channel is not None):
+            print("[text input closed — voice/Telegram still listening; Ctrl+C to quit]")
+            while assistant._running:
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        assistant.stop()
+        if coffee_workflow is not None:
+            coffee_workflow.stop_monitor()
+        if telegram_channel is not None:
+            telegram_channel.stop()
 
 
 def main():
@@ -310,7 +479,7 @@ def main():
     parser.add_argument(
         "--chat",
         action="store_true",
-        help="Interactive text chat mode (no microphone required)",
+        help="Text-only chat mode (no microphone, no Telegram)",
     )
 
     parser.add_argument(
@@ -319,7 +488,13 @@ def main():
         metavar="TEXT",
         help="Test with single text input (no voice)",
     )
-    
+
+    parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Run headless as a Telegram bot (chat with Friday from your phone)",
+    )
+
     parser.add_argument(
         "--list-devices",
         action="store_true",
@@ -354,30 +529,42 @@ def main():
         run_text_chat(config)
         return
 
-    # Create workflow manager
-    workflow_manager = create_workflow_manager()
+    # Headless Telegram bot mode (no microphone)
+    if args.telegram:
+        run_telegram_mode(config)
+        return
 
-    # Create and run assistant
-    assistant = VoiceAssistant(config, workflow_manager)
-    assistant.llm.search_enhancer = create_search_enhancer(config)
+    # Keyboard-activation mode owns stdin for the wake trigger, so it can't share
+    # the foreground with a text loop — run voice (keyboard) + Telegram only.
+    if args.keyboard:
+        workflow_manager = create_workflow_manager()
+        assistant = VoiceAssistant(config, workflow_manager)
+        assistant.llm.search_enhancer = create_search_enhancer(config)
 
-    # Optional: Add callbacks for UI integration
-    if args.debug:
-        assistant.on_transcript = lambda t: print(f"📢 You: {t}")
-        assistant.on_response = lambda r: print(f"🤖 Jarvis: {r}")
-        assistant.on_error = lambda e: print(f"❌ Error: {e}")
+        if args.debug:
+            assistant.on_transcript = lambda t: print(f"📢 You: {t}")
+            assistant.on_response = lambda r: print(f"🤖 {config.personality.name}: {r}")
+            assistant.on_error = lambda e: print(f"❌ Error: {e}")
 
-    # Start background monitors that need a speak callback
-    coffee_workflow = workflow_manager.get_workflow("coffee_machine")
-    if coffee_workflow is not None:
-        coffee_workflow.start_monitor(assistant.speak)
+        coffee_workflow = workflow_manager.get_workflow("coffee_machine")
+        if coffee_workflow is not None:
+            coffee_workflow.start_monitor(assistant.speak)
 
-    # Run!
-    assistant.run()
+        telegram_channel = TelegramChannel.from_env()
+        if telegram_channel is not None:
+            _attach_listener(assistant, telegram_channel)
+            print("ℹ️  Telegram two-way channel enabled")
 
-    # Clean up background monitors on exit
-    if coffee_workflow is not None:
-        coffee_workflow.stop_monitor()
+        assistant.run()
+
+        if coffee_workflow is not None:
+            coffee_workflow.stop_monitor()
+        if telegram_channel is not None:
+            telegram_channel.stop()
+        return
+
+    # Default: listen on voice + text + Telegram together.
+    run_all(config, debug=args.debug)
 
 
 if __name__ == "__main__":

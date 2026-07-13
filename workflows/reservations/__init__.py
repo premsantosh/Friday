@@ -7,7 +7,7 @@ M1: discovery + multi-turn detail collection + plan description (no commits).
 from .models import ChannelDecision, ReservationMethod, ESSENTIAL_SLOTS
 from .discovery import BusinessDiscovery, GooglePlacesClient, YelpClient
 from .calendar import CalendarService
-from .notify import SignalNotifier
+from .notify import TelegramNotifier
 from .payment import ManualCardService, PrivacyCardService, VirtualCard, card_service_from_env
 from .router import ChannelRouter
 from .workflow import ReservationWorkflow
@@ -19,7 +19,7 @@ __all__ = [
     "YelpClient",
     "ChannelRouter",
     "CalendarService",
-    "SignalNotifier",
+    "TelegramNotifier",
     "PrivacyCardService",
     "ManualCardService",
     "card_service_from_env",

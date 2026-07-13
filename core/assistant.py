@@ -255,7 +255,13 @@ class VoiceAssistant:
                     return started
                 result = await workflow.execute(text, route.entities)
                 if result.status == WorkflowStatus.SUCCESS:
-                    if self.intent_cache:
+                    # Only cache routes decided from the raw utterance. When the
+                    # router saw context-enriched text (enriched != text), the
+                    # decision may reflect transient prior-turn context — caching
+                    # it against the raw text permanently poisons the cache (e.g.
+                    # "hey" → time after a time query). Follow-ups are context-
+                    # dependent by nature and shouldn't be cached anyway.
+                    if self.intent_cache and enriched == text:
                         self.intent_cache.store(text, route.workflow_name, route.entities)
                     self.context.update(route.workflow_name, route.entities, text)
                     return result.message
@@ -368,6 +374,39 @@ class VoiceAssistant:
         # Run activation in async context
         asyncio.run(self.handle_activation())
     
+    def start_listening(self, allow_keyboard_fallback: bool = True) -> bool:
+        """
+        Start the session runner and wake-word detector without blocking.
+
+        Returns True if a voice trigger (wake word or, when allowed, keyboard)
+        is active. Callers that want to own stdin themselves (e.g. a concurrent
+        text-chat loop) should pass allow_keyboard_fallback=False so the mic-less
+        case quietly disables voice instead of grabbing stdin.
+        """
+        self._running = True
+
+        # Start the multi-turn background runner (WAITING sessions + expiry sweep)
+        if self.background_runner is not None:
+            self.background_runner.start()
+
+        # Initialize wake word detector
+        try:
+            self._wake_detector = get_wake_word_detector(self.config.wake_word)
+            self._wake_detector.start(self._on_wake_word_detected)
+            print(f"Listening for wake word '{self.config.wake_word.porcupine_keyword}'...")
+            return True
+        except Exception as e:
+            if allow_keyboard_fallback:
+                print(f"Wake word detection failed: {e}")
+                print("Falling back to keyboard activation (press Enter)...")
+                from utils import KeyboardWakeDetector
+                self._wake_detector = KeyboardWakeDetector()
+                self._wake_detector.start(self._on_wake_word_detected)
+                return True
+            print(f"⚠️  Voice disabled (wake word unavailable): {e}")
+            self._wake_detector = None
+            return False
+
     def run(self):
         """
         Run the assistant (blocking).
@@ -381,26 +420,10 @@ class VoiceAssistant:
         print(f"  LLM: {self.llm.get_name()}")
         print(f"  Wake word: {self.config.wake_word.porcupine_keyword}")
         print(f"{'='*50}\n")
-        
-        self._running = True
 
-        # Start the multi-turn background runner (WAITING sessions + expiry sweep)
-        if self.background_runner is not None:
-            self.background_runner.start()
+        self.start_listening(allow_keyboard_fallback=True)
+        print("(Press Ctrl+C to quit)\n")
 
-        # Initialize wake word detector
-        try:
-            self._wake_detector = get_wake_word_detector(self.config.wake_word)
-            self._wake_detector.start(self._on_wake_word_detected)
-            print(f"Listening for wake word '{self.config.wake_word.porcupine_keyword}'...")
-            print("(Press Ctrl+C to quit)\n")
-        except Exception as e:
-            print(f"Wake word detection failed: {e}")
-            print("Falling back to keyboard activation (press Enter)...")
-            from utils import KeyboardWakeDetector
-            self._wake_detector = KeyboardWakeDetector()
-            self._wake_detector.start(self._on_wake_word_detected)
-        
         # Keep running until interrupted
         try:
             while self._running:
