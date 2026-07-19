@@ -91,9 +91,21 @@ def stage_evolve(ctx: NightlyContext) -> str:
 
 
 def stage_train(ctx: NightlyContext) -> str:
+    from research.approaches.train_lora import train_nightly
+
     if ctx.dry_run:
         return "skipped (dry-run)"
-    return "skipped (arm B lands in M5)"
+
+    def sonnet(prompt: str) -> str:
+        import anthropic
+        resp = anthropic.Anthropic().messages.create(
+            model="claude-sonnet-5", max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
+
+    return train_nightly(ctx.store, ctx.date_str, artifacts_dir=ctx.artifacts_dir,
+                         correction_llm_fn=sonnet)
 
 
 def stage_replay(ctx: NightlyContext) -> str:
@@ -132,6 +144,13 @@ def stage_replay(ctx: NightlyContext) -> str:
             name="memory",
             block_for=lambda text: agent.system_block_for(text, max_id=max_id),
             artifact_version=memory_version,
+        ))
+    adapter = artifacts.current_path("lora", ctx.artifacts_dir)
+    if adapter is not None:
+        specs.append(ArmSpec(
+            name="lora",
+            adapter_path=str(adapter),
+            artifact_version=artifacts.current_version("lora", ctx.artifacts_dir),
         ))
 
     generated = 0
