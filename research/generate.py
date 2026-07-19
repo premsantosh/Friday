@@ -29,18 +29,21 @@ class ArmSpec:
     name: str                                             # base | memory | lora | prompt
     adapter_path: Optional[str] = None                    # arm B
     system_block: str = ""                                # arm C: learned-preferences block
-    block_for: Optional[Callable[[EvalPrompt], str]] = None  # arm A: per-prompt retrieval
+    block_for: Optional[Callable[[str], str]] = None      # arm A: per-query retrieval
     artifact_version: Optional[str] = None
 
-    def system_prompt_for(self, prompt: EvalPrompt) -> str:
-        parts = [PERSONA_PROMPT]
+    def _blocks(self, user_text: str) -> list[str]:
+        parts = []
         if self.system_block:
             parts.append(self.system_block)
         if self.block_for is not None:
-            block = self.block_for(prompt)
+            block = self.block_for(user_text)
             if block:
                 parts.append(block)
-        return "\n\n".join(parts)
+        return parts
+
+    def system_prompt_for(self, user_text: str) -> str:
+        return "\n\n".join([PERSONA_PROMPT, *self._blocks(user_text)])
 
 
 def generate_replay(
@@ -66,9 +69,8 @@ def generate_replay(
         if not snapshot:
             continue
         try:
-            system = snapshot.get("system_prompt", PERSONA_PROMPT)
-            if arm.system_block:
-                system = f"{system}\n\n{arm.system_block}"
+            system = "\n\n".join([snapshot.get("system_prompt", PERSONA_PROMPT),
+                                  *arm._blocks(e.get("user_text", ""))])
             chat = [{"role": "system", "content": system}, *snapshot.get("messages", [])]
             templated = tokenizer.apply_chat_template(
                 chat, add_generation_prompt=True, tokenize=False
@@ -103,7 +105,7 @@ def generate_candidates(
     for p in prompts:
         try:
             chat = [
-                {"role": "system", "content": arm.system_prompt_for(p)},
+                {"role": "system", "content": arm.system_prompt_for(p.prompt)},
                 {"role": "user", "content": p.prompt},
             ]
             templated = tokenizer.apply_chat_template(

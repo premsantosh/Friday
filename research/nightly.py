@@ -67,7 +67,17 @@ def stage_harvest(ctx: NightlyContext) -> str:
 
 
 def stage_reflect(ctx: NightlyContext) -> str:
-    return "skipped (arm A lands in M4)"
+    from research.approaches.memory_agent import ChromaIndex, MemoryAgent
+
+    if ctx.dry_run:
+        return "skipped (dry-run: no local LLM calls)"
+    index = ChromaIndex(Path(ctx.artifacts_dir).expanduser() / "memory_index")
+    agent = MemoryAgent(ctx.store, artifacts_dir=ctx.artifacts_dir, index=index)
+    observed = agent.observe(ctx.since_ts)
+    reflected = agent.maybe_reflect()
+    version = agent.snapshot(ctx.date_str) if (observed or reflected) else None
+    return (f"{observed} observations, {reflected} reflections"
+            + (f", snapshot {version}" if version else ", no snapshot"))
 
 
 def stage_evolve(ctx: NightlyContext) -> str:
@@ -103,6 +113,25 @@ def stage_replay(ctx: NightlyContext) -> str:
             name="prompt",
             system_block=block,
             artifact_version=artifacts.current_version("prompt", ctx.artifacts_dir),
+        ))
+    # 'facts' is arm A's baseline comparator: production's existing facts
+    # store retrieved per query, so the study can report reflection-memory vs
+    # facts-store rather than only vs vanilla.
+    from research.approaches import facts_baseline
+
+    specs.append(ArmSpec(name="facts", block_for=facts_baseline.system_block_for))
+
+    memory_version = artifacts.current_version("memory", ctx.artifacts_dir)
+    if memory_version is not None:
+        from research.approaches.memory_agent import ChromaIndex, MemoryAgent
+
+        index = ChromaIndex(Path(ctx.artifacts_dir).expanduser() / "memory_index")
+        agent = MemoryAgent(ctx.store, artifacts_dir=ctx.artifacts_dir, index=index)
+        max_id = agent.current_max_id()
+        specs.append(ArmSpec(
+            name="memory",
+            block_for=lambda text: agent.system_block_for(text, max_id=max_id),
+            artifact_version=memory_version,
         ))
 
     generated = 0
