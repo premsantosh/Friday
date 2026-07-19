@@ -43,6 +43,44 @@ class ArmSpec:
         return "\n\n".join(parts)
 
 
+def generate_replay(
+    exchanges: list[dict],
+    arm: ArmSpec,
+    *,
+    model: str = BASE_MODEL,
+    max_tokens: int = MAX_TOKENS,
+) -> dict[int, str]:
+    """exchange_id -> response, regenerating from each exchange's context
+    snapshot (the exact system prompt + history production saw). All arms see
+    the identical snapshot; the arm's artifact is appended/loaded on top.
+    """
+    from mlx_lm import generate, load
+
+    logger.info("Replay: loading %s (adapter=%s) for arm %s", model, arm.adapter_path,
+                arm.name)
+    lm, tokenizer = load(model, adapter_path=arm.adapter_path)
+
+    out: dict[int, str] = {}
+    for e in exchanges:
+        snapshot = e.get("context_snapshot")
+        if not snapshot:
+            continue
+        try:
+            system = snapshot.get("system_prompt", PERSONA_PROMPT)
+            if arm.system_block:
+                system = f"{system}\n\n{arm.system_block}"
+            chat = [{"role": "system", "content": system}, *snapshot.get("messages", [])]
+            templated = tokenizer.apply_chat_template(
+                chat, add_generation_prompt=True, tokenize=False
+            )
+            out[e["id"]] = generate(lm, tokenizer, prompt=templated,
+                                    max_tokens=max_tokens).strip()
+        except Exception:
+            logger.warning("Replay generation failed for exchange %s (arm %s)",
+                           e.get("id"), arm.name, exc_info=True)
+    return out
+
+
 def generate_candidates(
     prompts: list[EvalPrompt],
     arm: ArmSpec,

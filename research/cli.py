@@ -157,6 +157,24 @@ def cmd_rate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_nightly(args: argparse.Namespace) -> int:
+    import logging
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    from research.nightly import run_nightly
+
+    store = ResearchStore(args.db)
+    stages = [s.strip() for s in args.stages.split(",")] if args.stages else None
+    status = run_nightly(store, dry_run=args.dry_run, stages=stages)
+    print("\nnightly run:")
+    failed = False
+    for stage, note in status.items():
+        print(f"  {stage:8} {note}")
+        failed = failed or note.startswith("FAILED")
+    return 1 if failed else 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m research")
     parser.add_argument("--db", default="~/.friday/research.db")
@@ -178,6 +196,12 @@ def main(argv=None) -> int:
     p_rate = sub.add_parser("rate", help="human-rate production vs shadow pairs")
     p_rate.add_argument("--pairs", type=int, default=20)
 
+    p_nightly = sub.add_parser("nightly", help="run the nightly learning loop")
+    p_nightly.add_argument("--dry-run", action="store_true",
+                           help="FakeJudge, no training, no paid API calls")
+    p_nightly.add_argument("--stages", default=None,
+                           help="comma-separated subset of stages to run")
+
     args = parser.parse_args(argv)
     return {"status": cmd_status, "harvest": cmd_harvest, "eval": cmd_eval,
-            "rate": cmd_rate}[args.command](args)
+            "rate": cmd_rate, "nightly": cmd_nightly}[args.command](args)
