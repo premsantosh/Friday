@@ -14,6 +14,10 @@ from research.db import ResearchStore
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    import json
+
+    from research import artifacts
+
     store = ResearchStore(args.db)
     counts = store.counts()
     print("research.db counts:")
@@ -26,6 +30,21 @@ def cmd_status(args: argparse.Namespace) -> int:
         routes[e["route"] or "unknown"] = routes.get(e["route"] or "unknown", 0) + 1
     print(f"last 24h: {len(recent)} exchanges "
           f"({', '.join(f'{k}={v}' for k, v in sorted(routes.items())) or 'none'})")
+
+    print("artifacts:")
+    for arm in ("memory", "lora", "prompt"):
+        current = artifacts.current_version(arm)
+        n_versions = len(artifacts.list_versions(arm))
+        print(f"  {arm:8} current={current or '-'} ({n_versions} version(s))")
+
+    row = store.conn.execute(
+        "SELECT started_ts, finished_ts, stage_status FROM runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(row["started_ts"]))
+        print(f"last nightly run ({when}):")
+        for stage, note in json.loads(row["stage_status"] or "{}").items():
+            print(f"  {stage:8} {note}")
     return 0
 
 
@@ -158,11 +177,24 @@ def cmd_rate(args: argparse.Namespace) -> int:
 
 
 def cmd_nightly(args: argparse.Namespace) -> int:
+    import fcntl
     import logging
+    from pathlib import Path
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     from research.nightly import run_nightly
+
+    # One nightly at a time: an overrun (slow training) must not double up
+    # with the next launchd firing. flock releases automatically on exit.
+    lock_path = Path("~/.friday/research/nightly.lock").expanduser()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another nightly run is still in progress — exiting")
+        return 0
 
     store = ResearchStore(args.db)
     stages = [s.strip() for s in args.stages.split(",")] if args.stages else None
@@ -173,6 +205,19 @@ def cmd_nightly(args: argparse.Namespace) -> int:
         print(f"  {stage:8} {note}")
         failed = failed or note.startswith("FAILED")
     return 1 if failed else 0
+
+
+def cmd_revert(args: argparse.Namespace) -> int:
+    from research import artifacts
+
+    versions = artifacts.list_versions(args.arm)
+    if args.to not in versions:
+        print(f"unknown version {args.to!r} for arm {args.arm!r}; "
+              f"available: {', '.join(versions) or 'none'}")
+        return 1
+    artifacts.advance_current(args.arm, args.to)
+    print(f"{args.arm}: current -> {args.to}")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -202,6 +247,10 @@ def main(argv=None) -> int:
     p_nightly.add_argument("--stages", default=None,
                            help="comma-separated subset of stages to run")
 
+    p_revert = sub.add_parser("revert", help="repoint an arm's current artifact")
+    p_revert.add_argument("--arm", required=True, choices=("memory", "lora", "prompt"))
+    p_revert.add_argument("--to", required=True, help="version name, e.g. v20260718")
+
     args = parser.parse_args(argv)
     return {"status": cmd_status, "harvest": cmd_harvest, "eval": cmd_eval,
-            "rate": cmd_rate, "nightly": cmd_nightly}[args.command](args)
+            "rate": cmd_rate, "nightly": cmd_nightly, "revert": cmd_revert}[args.command](args)

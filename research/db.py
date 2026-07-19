@@ -149,9 +149,13 @@ class ResearchStore:
             self.conn.commit()
 
     def get_exchange(self, exchange_id: int) -> Optional[dict]:
-        row = self.conn.execute(
-            "SELECT * FROM exchanges WHERE id = ?", (exchange_id,)
-        ).fetchone()
+        # Reads take the lock too: one sqlite3 connection shared between the
+        # shadow worker thread and the caller's thread segfaults without full
+        # serialization (observed, not theoretical).
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM exchanges WHERE id = ?", (exchange_id,)
+            ).fetchone()
         if row is None:
             return None
         d = dict(row)
@@ -160,11 +164,12 @@ class ResearchStore:
         return d
 
     def exchanges_since(self, ts: float) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT id, ts, channel, user_id, user_text, reply_text, route, latency_ms"
-            " FROM exchanges WHERE ts >= ? ORDER BY ts",
-            (ts,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, ts, channel, user_id, user_text, reply_text, route, latency_ms"
+                " FROM exchanges WHERE ts >= ? ORDER BY ts",
+                (ts,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     # -------------------------------------------------------------- feedback
@@ -186,16 +191,18 @@ class ResearchStore:
             return int(cur.lastrowid)
 
     def feedback_for(self, exchange_id: int) -> list[dict]:
-        rows = self.conn.execute(
-            "SELECT * FROM feedback WHERE exchange_id = ? ORDER BY ts", (exchange_id,)
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM feedback WHERE exchange_id = ? ORDER BY ts", (exchange_id,)
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def has_feedback(self, exchange_id: int, source: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM feedback WHERE exchange_id = ? AND source = ? LIMIT 1",
-            (exchange_id, source),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM feedback WHERE exchange_id = ? AND source = ? LIMIT 1",
+                (exchange_id, source),
+            ).fetchone()
         return row is not None
 
     # ---------------------------------------------------------------- shadow
@@ -224,10 +231,13 @@ class ResearchStore:
     # ---------------------------------------------------------------- status
     def counts(self) -> dict[str, int]:
         out = {}
-        for table in ("exchanges", "feedback", "shadow_responses", "runs",
-                      "eval_results", "memories"):
-            out[table] = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        with self._lock:
+            for table in ("exchanges", "feedback", "shadow_responses", "runs",
+                          "eval_results", "memories"):
+                out[table] = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return out
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
