@@ -57,6 +57,15 @@ class TelegramChannel:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
+        # Optional research-substrate hooks (set by main.py; default off keeps
+        # behavior identical to before they existed):
+        #   feedback_provider(chat_id, reply) -> reply_markup dict or None,
+        #     consulted per reply to attach an inline keyboard (👍/👎).
+        #   on_callback(chat_id, callback_data) -> None, invoked for button taps
+        #     from allowlisted chats.
+        self.feedback_provider: Optional[Callable[[str, str], Optional[dict]]] = None
+        self.on_callback: Optional[Callable[[str, str], None]] = None
+
     # ------------------------------------------------------------------ config
     @classmethod
     def from_env(cls) -> Optional["TelegramChannel"]:
@@ -80,16 +89,19 @@ class TelegramChannel:
         return cls(token, allowed_chat_ids=allowed, long_poll_seconds=long_poll)
 
     # ------------------------------------------------------------------ outbound
-    def send(self, message: str, chat_id) -> bool:
+    def send(self, message: str, chat_id, reply_markup: Optional[dict] = None) -> bool:
         """Send `message` to `chat_id`. Returns success; never raises."""
         try:
             poster = self._poster
             if poster is None:
                 import requests
                 poster = requests.post
+            payload = {"chat_id": chat_id, "text": message}
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
             resp = poster(
                 f"{self.api}/sendMessage",
-                json={"chat_id": chat_id, "text": message},
+                json=payload,
                 timeout=15,
             )
             status = int(getattr(resp, "status_code", 200))
@@ -213,6 +225,20 @@ class TelegramChannel:
             logger.info("Telegram inbound from %s: %r", chat_id, text)
             await self._dispatch(chat_id, text)
 
+        for callback_id, chat_id, data in self._extract_callbacks(result):
+            # Always answer the callback so the client stops its spinner, even
+            # for unauthorised chats (answering leaks nothing).
+            self._answer_callback(callback_id)
+            if chat_id not in self.allowed_chat_ids:
+                logger.info("Ignoring Telegram callback from unauthorised chat %s", chat_id)
+                continue
+            if self.on_callback is None:
+                continue
+            try:
+                self.on_callback(chat_id, data)
+            except Exception:
+                logger.warning("Telegram callback handler raised.", exc_info=True)
+
     @staticmethod
     def _extract_messages(result) -> List[Tuple[str, str]]:
         """Pull (chat_id, text) pairs out of a getUpdates result list.
@@ -238,6 +264,47 @@ class TelegramChannel:
             out.append((str(chat_id), text.strip()))
         return out
 
+    @staticmethod
+    def _extract_callbacks(result) -> List[Tuple[str, str, str]]:
+        """Pull (callback_query_id, chat_id, data) out of a getUpdates result list.
+
+        Callback queries arrive when a user taps an inline keyboard button
+        (e.g. the 👍/👎 feedback buttons). The offset cursor already
+        acknowledges them; this makes them actionable.
+        """
+        out: List[Tuple[str, str, str]] = []
+        if not isinstance(result, list):
+            return out
+        for u in result:
+            if not isinstance(u, dict):
+                continue
+            cq = u.get("callback_query")
+            if not isinstance(cq, dict):
+                continue
+            data = cq.get("data")
+            callback_id = cq.get("id")
+            chat = (cq.get("message") or {}).get("chat") or {}
+            chat_id = chat.get("id")
+            if not data or callback_id is None or chat_id is None:
+                continue
+            out.append((str(callback_id), str(chat_id), str(data)))
+        return out
+
+    def _answer_callback(self, callback_id: str) -> None:
+        """Acknowledge a callback query (stops the client spinner). Never raises."""
+        try:
+            poster = self._poster
+            if poster is None:
+                import requests
+                poster = requests.post
+            poster(
+                f"{self.api}/answerCallbackQuery",
+                json={"callback_query_id": callback_id},
+                timeout=15,
+            )
+        except Exception:
+            logger.warning("Telegram answerCallbackQuery failed.", exc_info=True)
+
     async def _dispatch(self, chat_id: str, text: str) -> None:
         assert self._handler is not None
         try:
@@ -248,4 +315,10 @@ class TelegramChannel:
             return
         if reply and reply.strip():
             logger.info("Telegram reply to %s: %r", chat_id, reply[:80])
-            self.send(reply, chat_id)
+            reply_markup = None
+            if self.feedback_provider is not None:
+                try:
+                    reply_markup = self.feedback_provider(chat_id, reply)
+                except Exception:
+                    logger.warning("Telegram feedback provider raised.", exc_info=True)
+            self.send(reply, chat_id, reply_markup=reply_markup)

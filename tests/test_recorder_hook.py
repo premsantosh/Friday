@@ -1,0 +1,193 @@
+"""Tests for ConversationRecorder and its provider/assistant hooks.
+
+Hermetic: research store on tmp_path; the LLM provider is a minimal fake with
+in-memory stand-ins for FridayStore/ContextBuilder, so nothing touches
+~/.friday or the network.
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from config import LLMConfig, PersonalityConfig
+from llm.providers import LLMProvider
+from research.db import ResearchStore
+from research.recorder import ConversationRecorder
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = ResearchStore(str(tmp_path / "research.db"))
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def recorder(store):
+    return ConversationRecorder(store)
+
+
+# ----------------------------------------------------------------- recorder
+
+def test_record_chat_then_record_turn_backfills_not_duplicates(store, recorder):
+    eid = recorder.record_chat("hello", "Good evening, sir.",
+                               model="fake", context_snapshot={"system_prompt": "sp", "messages": []})
+    turn_id = recorder.record_turn("hello", "Good evening, sir.", route="chat",
+                                   latency_ms=1500, user_id="555", channel="telegram")
+    assert turn_id == eid
+    assert store.counts()["exchanges"] == 1
+    row = store.get_exchange(eid)
+    assert (row["channel"], row["user_id"], row["latency_ms"]) == ("telegram", "555", 1500)
+    assert row["route"] == "chat"
+
+
+def test_record_turn_alone_inserts_workflow_exchange(store, recorder):
+    recorder.record_turn("turn on the lights", "Done, sir.", route="keyword:philips_hue",
+                         latency_ms=50, user_id="555", channel="telegram")
+    assert store.counts()["exchanges"] == 1
+
+
+def test_shadow_enqueued_on_chat_record(store):
+    enqueued = []
+
+    class FakeShadow:
+        def enqueue(self, eid):
+            enqueued.append(eid)
+
+    recorder = ConversationRecorder(store, shadow=FakeShadow())
+    eid = recorder.record_chat("hi", "Hello.", context_snapshot={"system_prompt": "s", "messages": []})
+    assert enqueued == [eid]
+
+
+# ----------------------------------------------------------------- feedback
+
+def test_feedback_markup_only_for_fresh_chat_exchange(store, recorder):
+    recorder.record_chat("hi", "Hello.")
+    recorder.record_turn("hi", "Hello.", route="chat", user_id="555")
+    markup = recorder.feedback_markup("555", "Hello.")
+    eid = store.counts()["exchanges"]
+    assert markup == {"inline_keyboard": [[
+        {"text": "👍", "callback_data": f"fb:{eid}:1"},
+        {"text": "👎", "callback_data": f"fb:{eid}:0"},
+    ]]}
+
+
+def test_feedback_markup_absent_for_workflow_reply(store, recorder):
+    recorder.record_turn("lights on", "Done.", route="keyword:philips_hue", user_id="555")
+    assert recorder.feedback_markup("555", "Done.") is None
+
+
+def test_feedback_markup_absent_when_stale(store, recorder, monkeypatch):
+    recorder.record_chat("hi", "Hello.")
+    recorder.record_turn("hi", "Hello.", route="chat", user_id="555")
+    real = time.monotonic()
+    monkeypatch.setattr("research.recorder.time.monotonic", lambda: real + 120)
+    assert recorder.feedback_markup("555", "Hello.") is None
+
+
+def test_feedback_markup_absent_when_disabled(store):
+    recorder = ConversationRecorder(store, feedback_buttons=False)
+    recorder.record_chat("hi", "Hello.")
+    recorder.record_turn("hi", "Hello.", route="chat", user_id="555")
+    assert recorder.feedback_markup("555", "Hello.") is None
+
+
+def test_handle_callback_records_explicit_feedback(store, recorder):
+    eid = recorder.record_chat("hi", "Hello.")
+    recorder.handle_callback("555", f"fb:{eid}:1")
+    recorder.handle_callback("555", f"fb:{eid}:0")
+    fb = store.feedback_for(eid)
+    assert [(f["kind"], f["signal"], f["source"]) for f in fb] == [
+        ("explicit", 1, "telegram_button"),
+        ("explicit", -1, "telegram_button"),
+    ]
+
+
+def test_handle_callback_ignores_malformed_data(store, recorder):
+    for junk in ("", "fb:", "fb:notanint:1", "other:1:1", None):
+        recorder.handle_callback("555", junk)
+    assert store.counts()["feedback"] == 0
+
+
+# ------------------------------------------------------------- provider hook
+
+class _FakeFridayStore:
+    def __init__(self):
+        self.turns = []
+
+    def log_turn(self, role, content):
+        self.turns.append((role, content))
+        return len(self.turns)
+
+
+class _FakeContextBuilder:
+    def query_fingerprint(self, text):
+        return f"fp:{text}"
+
+
+class _FakeExtractor:
+    def is_correction(self, text):
+        return False
+
+    def extract(self, user_input, response):
+        return []
+
+
+class _FakeProvider(LLMProvider):
+    def generate_response(self, user_input: str) -> str:  # pragma: no cover
+        return "unused"
+
+    def get_name(self) -> str:
+        return "Fake (test)"
+
+
+def _make_provider(recorder=None, ephemeral=False):
+    provider = _FakeProvider(LLMConfig(ephemeral=True), PersonalityConfig())
+    if not ephemeral:
+        provider.store = _FakeFridayStore()
+        provider.context_builder = _FakeContextBuilder()
+        provider.extractor = _FakeExtractor()
+    provider.research_recorder = recorder
+    return provider
+
+
+def test_provider_records_exchange_with_snapshot(store, recorder):
+    provider = _make_provider(recorder)
+    provider._last_augmented_prompt = "AUGMENTED PROMPT"
+    provider.conversation_history = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "Good evening, sir."},
+    ]
+    provider._record_exchange("hello", "Good evening, sir.")
+
+    assert store.counts()["exchanges"] == 1
+    row = store.get_exchange(1)
+    assert row["route"] == "chat"
+    assert row["model"] == "Fake (test)"
+    assert row["memory_turn_id"] == 1  # id of the user turn in the fake store
+    snap = row["context_snapshot"]
+    assert snap["system_prompt"] == "AUGMENTED PROMPT"
+    # Snapshot ends with the user message; the reply is excluded.
+    assert snap["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_provider_recorder_failure_does_not_raise(store):
+    class ExplodingRecorder:
+        def record_chat(self, *a, **k):
+            raise RuntimeError("boom")
+
+    provider = _make_provider(ExplodingRecorder())
+    provider.conversation_history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello."},
+    ]
+    provider._record_exchange("hi", "Hello.")  # must not raise
+    assert provider.store.turns  # normal persistence still happened
+
+
+def test_ephemeral_provider_records_nothing(store, recorder):
+    provider = _make_provider(recorder, ephemeral=True)
+    provider._record_exchange("hi", "Hello.")
+    assert store.counts()["exchanges"] == 0

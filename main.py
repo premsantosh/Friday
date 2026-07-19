@@ -56,6 +56,7 @@ from config import (
     LLMConfig,
     WakeWordConfig,
     IntentCacheConfig,
+    ResearchConfig,
     SarcasmLevel,
     FormalityLevel,
     WarmthLevel,
@@ -142,6 +143,13 @@ def create_custom_config(args) -> AssistantConfig:
 
     is_ephemeral = bool(args.chat or args.test)
 
+    # Research substrate (see research/): explicit opt-in, never in ephemeral
+    # modes — those must stay free of any persistence.
+    research_enabled = (
+        os.getenv("FRIDAY_RESEARCH", "").lower() in ("1", "true")
+        and not is_ephemeral
+    )
+
     return AssistantConfig(
         personality=PersonalityConfig(
             name="Jarvis",
@@ -174,6 +182,7 @@ def create_custom_config(args) -> AssistantConfig:
             porcupine_sensitivity=0.5,
         ),
         intent_cache=IntentCacheConfig(enabled=not is_ephemeral),
+        research=ResearchConfig(enabled=research_enabled),
         debug_mode=args.debug,
     )
 
@@ -316,9 +325,46 @@ def _attach_listener(assistant: VoiceAssistant, channel) -> None:
     of the voice path. (Telegram keys by chat ID.)
     """
     async def handle(text: str, sender: str) -> Optional[str]:
-        return await assistant.process_input(text, user_id=sender)
+        return await assistant.process_input(text, user_id=sender, channel="telegram")
 
     channel.start(handle)
+
+
+def _setup_research(assistant: VoiceAssistant, config: AssistantConfig,
+                    channel=None):
+    """Wire the learn-from-every-conversation substrate (see research/).
+
+    Off unless FRIDAY_RESEARCH=1 (never in ephemeral modes). Attaches the
+    conversation recorder to the assistant and LLM provider, starts the shadow
+    runner, and hooks Telegram feedback buttons when a channel is given.
+    Returns the recorder (or None when disabled).
+    """
+    rc = config.research
+    if not rc.enabled:
+        return None
+    from research.db import ResearchStore
+    from research.recorder import ConversationRecorder
+    from research.shadow import ShadowRunner
+
+    store = ResearchStore(rc.db_path)
+    shadow = None
+    if rc.shadow_enabled:
+        shadow = ShadowRunner(
+            store,
+            model_tag=rc.shadow_model,
+            base_url=config.llm.ollama_base_url,
+        )
+        shadow.start()
+    recorder = ConversationRecorder(store, shadow=shadow,
+                                    feedback_buttons=rc.feedback_buttons)
+    assistant.research_recorder = recorder
+    assistant.llm.research_recorder = recorder
+    if channel is not None:
+        channel.on_callback = recorder.handle_callback
+        channel.feedback_provider = recorder.feedback_markup
+    print("  Research substrate: ON (recording to "
+          f"{rc.db_path}, shadow={'on' if shadow else 'off'})")
+    return recorder
 
 
 def _run_headless_channel(config: AssistantConfig, channel, label: str,
@@ -352,6 +398,7 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
         coffee_workflow.start_monitor(notify_owner)
 
     _attach_listener(assistant, channel)
+    _setup_research(assistant, config, channel=channel)
 
     name = config.personality.name
     print(f"\n{'='*50}")
@@ -425,6 +472,7 @@ def run_all(config: AssistantConfig, debug: bool = False):
     telegram_channel = TelegramChannel.from_env()
     if telegram_channel is not None:
         _attach_listener(assistant, telegram_channel)
+    _setup_research(assistant, config, channel=telegram_channel)
 
     # Voice — start in the background; don't grab stdin (the text loop owns it),
     # so a mic-less machine just runs text + Telegram instead of hijacking input.
@@ -554,6 +602,7 @@ def main():
         if telegram_channel is not None:
             _attach_listener(assistant, telegram_channel)
             print("ℹ️  Telegram two-way channel enabled")
+        _setup_research(assistant, config, channel=telegram_channel)
 
         assistant.run()
 

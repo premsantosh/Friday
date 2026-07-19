@@ -28,6 +28,9 @@ _EXTERNAL_SERVICE_ENV = (
     # Outbound email (SMTP) + reply polling (IMAP)
     "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "RESERVATION_EMAIL_FROM",
     "IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD",
+    # Research substrate (research/): writes ~/.friday/research.db and calls
+    # local Ollama when enabled — must never turn on implicitly in tests.
+    "FRIDAY_RESEARCH",
 )
 
 

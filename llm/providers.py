@@ -6,8 +6,11 @@ The personality of your assistant is defined here.
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+import logging
 import os
 import threading
+
+logger = logging.getLogger(__name__)
 
 from config import LLMConfig, PersonalityConfig, SarcasmLevel, FormalityLevel, WarmthLevel
 from memory.store import FridayStore
@@ -162,6 +165,10 @@ class LLMProvider(ABC):
         self._last_retrieved_fact_keys: List[str] = []
         self._pending_fact_keys: List[str] = []
         self.search_enhancer = None
+        # Research substrate (see research/): set externally from main.py when
+        # FRIDAY_RESEARCH=1. Providers never import the research package.
+        self.research_recorder = None
+        self._last_augmented_prompt: Optional[str] = None
         self.stats = {
             "total_requests": 0,
             "cache_hits": 0,
@@ -238,7 +245,8 @@ class LLMProvider(ABC):
                 if search_context:
                     augmented_prompt += search_context
                     self.stats["search_queries"] += 1
-            return None, augmented_prompt
+            self._last_augmented_prompt = augmented_prompt
+        return None, augmented_prompt
 
         context = self.context_builder.build_context(user_input)
         self._pending_fact_keys = context.get("retrieved_fact_keys", [])
@@ -258,6 +266,7 @@ class LLMProvider(ABC):
             if search_context:
                 augmented_prompt += search_context
 
+        self._last_augmented_prompt = augmented_prompt
         return None, augmented_prompt
 
     def _record_exchange(self, user_input: str, response: str):
@@ -277,10 +286,31 @@ class LLMProvider(ABC):
                 for key in self._last_retrieved_fact_keys:
                     self.store.bump_confidence(key)
 
-        self.store.log_turn("user", user_input)
+        user_turn_id = self.store.log_turn("user", user_input)
         self.store.log_turn("assistant", response)
         fp = self.context_builder.query_fingerprint(user_input)
         self.cache.cache_response(fp, response)
+
+        # Research substrate: record the exchange with the exact context the LLM
+        # saw, so the nightly replay can regenerate it fairly. Must never break
+        # the user-facing reply.
+        if self.research_recorder is not None:
+            try:
+                snapshot = {
+                    "system_prompt": self._last_augmented_prompt or self.system_prompt,
+                    # history[-1] is the assistant reply; replay input is
+                    # everything up to and including the current user message.
+                    "messages": [dict(m) for m in self.conversation_history[:-1]],
+                }
+                self.research_recorder.record_chat(
+                    user_input,
+                    response,
+                    model=self.get_name(),
+                    context_snapshot=snapshot,
+                    memory_turn_id=user_turn_id,
+                )
+            except Exception:
+                logger.debug("Research recorder failed for exchange.", exc_info=True)
 
         # Advance pending keys → last, ready for next turn's feedback
         self._last_retrieved_fact_keys = self._pending_fact_keys

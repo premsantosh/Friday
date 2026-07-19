@@ -147,6 +147,11 @@ class VoiceAssistant:
         self.on_transcript: Optional[Callable[[str], None]] = None
         self.on_response: Optional[Callable[[str], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+
+        # Research substrate (see research/): set externally from main.py when
+        # FRIDAY_RESEARCH=1. last_route records which pipeline step answered.
+        self.research_recorder = None
+        self.last_route: Optional[str] = None
     
     def _set_state(self, state: AssistantState):
         """Update state and notify callback."""
@@ -181,7 +186,32 @@ class VoiceAssistant:
         )
         return self.llm.generate_response(failure_context)
 
-    async def process_input(self, text: str, user_id: str = "default") -> str:
+    async def process_input(self, text: str, user_id: str = "default",
+                            channel: Optional[str] = None) -> str:
+        """Process user input and generate a response (see _process_input_inner).
+
+        Thin wrapper that times the turn and, when the research substrate is
+        enabled, records every exchange with the route that answered it. The
+        recorder call must never affect the reply.
+        """
+        self.last_route = None
+        start = time.monotonic()
+        reply = await self._process_input_inner(text, user_id)
+        if self.research_recorder is not None:
+            try:
+                self.research_recorder.record_turn(
+                    text,
+                    reply,
+                    route=self.last_route or "unknown",
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    user_id=user_id,
+                    channel=channel,
+                )
+            except Exception:
+                self._log("Research recorder failed for turn.")
+        return reply
+
+    async def _process_input_inner(self, text: str, user_id: str = "default") -> str:
         """
         Process user input and generate a response.
 
@@ -196,6 +226,7 @@ class VoiceAssistant:
 
         # Step 0: an active dialogue session takes the turn.
         if self.sessions is not None and self.sessions.has_active(user_id):
+            self.last_route = "session"
             if self.sessions.is_global_escape(text):
                 self.sessions.cancel(user_id, "user aborted")
                 return "Very well, sir. I've set that aside."
@@ -213,6 +244,7 @@ class VoiceAssistant:
         matching_workflow = self.workflows.find_matching_workflow(text)
         if matching_workflow:
             self._log(f"Keyword match: {matching_workflow.name}")
+            self.last_route = f"keyword:{matching_workflow.name}"
             started = await self._maybe_start_session(matching_workflow, text, {}, user_id)
             if started is not None:
                 return started
@@ -232,6 +264,7 @@ class VoiceAssistant:
                 workflow = self.workflows.workflows.get(workflow_name)
                 if workflow:
                     self._log(f"Cache hit: {workflow_name}")
+                    self.last_route = f"cache:{workflow_name}"
                     started = await self._maybe_start_session(workflow, text, entities, user_id)
                     if started is not None:
                         return started
@@ -250,6 +283,7 @@ class VoiceAssistant:
         if route.workflow_name:
             workflow = self.workflows.workflows.get(route.workflow_name)
             if workflow:
+                self.last_route = f"router:{route.workflow_name}"
                 started = await self._maybe_start_session(workflow, text, route.entities, user_id)
                 if started is not None:
                     return started
@@ -270,6 +304,7 @@ class VoiceAssistant:
                 return result.message
 
         # No workflow matched — use Claude's conversational response or fall back
+        self.last_route = "chat"
         return route.response or self.llm.generate_response(text)
     
     def speak(self, text: str):

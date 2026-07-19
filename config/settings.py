@@ -222,6 +222,25 @@ class ConversationConfig:
 
 
 @dataclass
+class ResearchConfig:
+    """Learn-from-every-conversation research substrate (see research/).
+
+    Everything is off unless `enabled` is True (set via FRIDAY_RESEARCH=1 in
+    main.py, never in ephemeral --chat/--test modes). Production behavior is
+    bit-identical when disabled.
+    """
+    enabled: bool = False
+    db_path: str = "~/.friday/research.db"
+    artifacts_dir: str = "~/.friday/research"
+    feedback_buttons: bool = True   # 👍/👎 inline buttons on Telegram chat replies
+    shadow_enabled: bool = True     # local model answers silently in parallel
+    shadow_model: str = "llama3.1"
+    # Which retrieval the memory arm uses during eval: existing 'facts' store
+    # (baseline) or the new 'reflection' memory.
+    memory_arm_retrieval: str = "facts"
+
+
+@dataclass
 class AssistantConfig:
     """Master configuration combining all settings."""
     personality: PersonalityConfig = field(default_factory=PersonalityConfig)
@@ -232,6 +251,7 @@ class AssistantConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     intent_cache: IntentCacheConfig = field(default_factory=IntentCacheConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
 
     # General settings
     debug_mode: bool = False
