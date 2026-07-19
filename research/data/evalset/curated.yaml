@@ -1,0 +1,106 @@
+# Curated eval probes. PII rule: annotations describe preferences and habits
+# in general terms — never addresses, numbers, credentials, or names of others.
+#
+# TODO(user): the preference_recall / routine / correction_persistence probes
+# marked FILL-IN need annotations only you can write (what a correct answer
+# must know about you). Add more of your own; target ~40 total. Categories:
+#   preference_recall | style | routine | correction_persistence | generic_control
+
+prompts:
+  # ------------------------------------------------------------ style (fixed persona)
+  - id: style-01
+    category: style
+    prompt: "What time is it in Tokyo right now, roughly, if it's 9am here?"
+    annotations: "Simple request: at most ~3 sentences, no exclamation marks, addresses the user as sir."
+  - id: style-02
+    category: style
+    prompt: "I just got promoted!"
+    annotations: "Warm but composed congratulations; deadpan wit welcome; no exclamation marks even for good news."
+  - id: style-03
+    category: style
+    prompt: "Give me a quick pep talk before my presentation."
+    annotations: "Butler-formal, dry, brief. Not a motivational-poster wall of text."
+  - id: style-04
+    category: style
+    prompt: "Smoke is coming from my oven, what do I do?"
+    annotations: "Urgent/safety: direct, wit dropped entirely, concrete steps first."
+  - id: style-05
+    category: style
+    prompt: "Tell me a joke about my cooking."
+    annotations: "Observational humor is in persona; should tease gently without cruelty, staying brief."
+
+  # ------------------------------------------------- preference_recall (FILL-IN)
+  - id: pref-01
+    category: preference_recall
+    prompt: "Make me a coffee order for the cafe run."
+    annotations: "FILL-IN: your actual coffee order (e.g. milk type, drink)."
+  - id: pref-02
+    category: preference_recall
+    prompt: "Book somewhere nice for dinner Friday."
+    annotations: "FILL-IN: cuisine preferences, party size default, booking style you expect."
+  - id: pref-03
+    category: preference_recall
+    prompt: "What should I watch tonight?"
+    annotations: "FILL-IN: genres/shows you like and hate."
+  - id: pref-04
+    category: preference_recall
+    prompt: "Plan my breakfast for tomorrow."
+    annotations: "FILL-IN: dietary preferences/restrictions."
+
+  # ---------------------------------------------------------- routine (FILL-IN)
+  - id: routine-01
+    category: routine
+    prompt: "When should I leave for work tomorrow?"
+    annotations: "FILL-IN: your commute pattern / typical schedule."
+  - id: routine-02
+    category: routine
+    prompt: "Set things up for my usual morning."
+    annotations: "FILL-IN: wake time, coffee timing, first meetings."
+
+  # ------------------------------------------- correction_persistence (FILL-IN)
+  - id: correct-01
+    category: correction_persistence
+    prompt: "Remind me what milk to buy."
+    annotations: "FILL-IN: a preference you have explicitly corrected Friday about; the corrected value must win."
+
+  # -------------------------------------------------- generic_control (regression canary)
+  - id: control-01
+    category: generic_control
+    prompt: "Explain the difference between a virus and a bacterium."
+    annotations: "Factually correct, concise. No personalization needed."
+  - id: control-02
+    category: generic_control
+    prompt: "What's 15% of 240?"
+    annotations: "36. Must be correct and brief."
+  - id: control-03
+    category: generic_control
+    prompt: "Summarise how photosynthesis works in two sentences."
+    annotations: "Accurate two-sentence summary."
+  - id: control-04
+    category: generic_control
+    prompt: "Convert 350 fahrenheit to celsius."
+    annotations: "~177C. Correct and brief."
+  - id: control-05
+    category: generic_control
+    prompt: "Name three novels by Charles Dickens."
+    annotations: "Any three genuine Dickens novels."
+  - id: control-06
+    category: generic_control
+    prompt: "What's a good way to remove a red wine stain from a shirt?"
+    annotations: "Practical, safe household advice."
+  - id: control-07
+    category: generic_control
+    prompt: "How long should I boil an egg for a runny yolk?"
+    annotations: "Roughly 6-7 minutes; concise."
+  - id: control-08
+    category: generic_control
+    prompt: "What does HTTP stand for?"
+    annotations: "HyperText Transfer Protocol."
+  - id: control-09
+    category: generic_control
+    prompt: "Give me a one-line definition of compound interest."
+    annotations: "Interest earned on both principal and accumulated interest."
+  - id: control-10
+    category: generic_control
+    prompt: "Which planet is closest to the sun?"
+    annotations: "Mercury."
