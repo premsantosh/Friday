@@ -246,7 +246,7 @@ class LLMProvider(ABC):
                     augmented_prompt += search_context
                     self.stats["search_queries"] += 1
             self._last_augmented_prompt = augmented_prompt
-        return None, augmented_prompt
+            return None, augmented_prompt
 
         context = self.context_builder.build_context(user_input)
         self._pending_fact_keys = context.get("retrieved_fact_keys", [])

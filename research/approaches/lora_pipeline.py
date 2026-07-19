@@ -112,12 +112,14 @@ def synthesize_corrections(
         if eid in cache:
             continue
         exchange = store.get_exchange(eid)
+        if exchange is None:
+            continue
         follow_up = store.conn.execute(
             "SELECT user_text FROM exchanges WHERE id > ? AND user_id IS ?"
             " ORDER BY id LIMIT 1",
             (eid, exchange["user_id"]),
         ).fetchone()
-        if exchange is None or follow_up is None:
+        if follow_up is None:
             continue
         try:
             corrected = llm_fn(_CORRECTION_SYNTH_PROMPT.format(

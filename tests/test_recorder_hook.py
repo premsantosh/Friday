@@ -126,6 +126,12 @@ class _FakeContextBuilder:
     def query_fingerprint(self, text):
         return f"fp:{text}"
 
+    def build_context(self, text):
+        return {"retrieved_fact_keys": []}
+
+    def format_system_prompt(self, system_prompt, context):
+        return system_prompt + "\n<context/>"
+
 
 class _FakeExtractor:
     def is_correction(self, text):
@@ -151,6 +157,39 @@ def _make_provider(recorder=None, ephemeral=False):
         provider.extractor = _FakeExtractor()
     provider.research_recorder = recorder
     return provider
+
+
+def test_prepare_request_returns_augmented_prompt_non_ephemeral(store, recorder):
+    """Regression: a bad edit once dedented the ephemeral-branch return in
+    _prepare_request so it ran unconditionally, crashing every production
+    (non-ephemeral) reply with UnboundLocalError and dead-coding the context
+    build. Drive the real method on both paths."""
+    provider = _make_provider(recorder)  # non-ephemeral: fake context builder attached
+    cached, augmented = provider._prepare_request("hello there")
+    assert cached is None
+    assert augmented.endswith("<context/>")  # context build path actually ran
+    assert provider._last_augmented_prompt == augmented
+
+    ephemeral = _make_provider(recorder, ephemeral=True)
+    cached, augmented = ephemeral._prepare_request("hello there")
+    assert cached is None
+    assert augmented == ephemeral.system_prompt  # ephemeral branch: plain persona
+    assert ephemeral._last_augmented_prompt == augmented
+
+
+def test_generate_response_end_to_end_non_ephemeral(store, recorder):
+    """The full provider path: _prepare_request -> API call -> _record_exchange
+    records once with the augmented snapshot."""
+    provider = _make_provider(recorder)
+    cached, augmented = provider._prepare_request("what's for dinner")
+    provider.conversation_history = [
+        {"role": "user", "content": "what's for dinner"},
+        {"role": "assistant", "content": "Pasta, sir."},
+    ]
+    provider._record_exchange("what's for dinner", "Pasta, sir.")
+    row = store.get_exchange(1)
+    assert row["context_snapshot"]["system_prompt"] == augmented
+    assert row["context_snapshot"]["system_prompt"].endswith("<context/>")
 
 
 def test_provider_records_exchange_with_snapshot(store, recorder):
