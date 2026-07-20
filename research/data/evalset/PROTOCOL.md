@@ -12,7 +12,7 @@ responses better *for this specific user* than the vanilla local base model?
 ## Comparisons
 
 - Every arm is compared pairwise against `base` (vanilla
-  `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`, pinned persona prompt,
+  `mlx-community/Qwen3-8B-4bit`, thinking disabled, pinned persona prompt,
   greedy decoding). All arms generate through the same runtime (mlx_lm) with
   identical decode parameters; the arm's artifact is the only delta.
 - Production Haiku is reported as a reference ceiling, never as a competitor.
@@ -22,8 +22,9 @@ responses better *for this specific user* than the vanilla local base model?
 - Primary judge: Claude Sonnet (`claude-sonnet-5`), pairwise with both
   presentation orders; the two verdicts average into one prompt score
   (win 1, tie 0.5, loss 0). Judge errors score as ties.
-- Agreement audit: qwen3:8b re-judges a 20% sample; direction-agreement on
-  decisive prompts is reported alongside every result.
+- Agreement audit: llama3.1 (a different family from the judged Qwen3 base,
+  keeping the audit independent) re-judges a 20% sample; direction-agreement
+  on decisive prompts is reported alongside every result.
 - Human anchor: ~20 pairs rated by the user monthly (`python -m research rate`);
   judge-human agreement is reported in the paper.
 
@@ -60,3 +61,6 @@ An arm beats base when ALL of:
 ## Changelog
 
 - 2026-07-18: initial version.
+- 2026-07-19: base model switched Llama-3.1-8B-4bit → Qwen3-8B-4bit (thinking
+  disabled) before any eval or training run; local judge auditor swapped
+  qwen3:8b → llama3.1 to keep it a different family from the judged base.

@@ -15,17 +15,24 @@ import time
 from typing import Callable, Optional
 
 from research.db import ResearchStore
+from research.generate import strip_think
 
 logger = logging.getLogger(__name__)
 
 _STOP = object()
 
 
+def supports_thinking(model_tag: str) -> bool:
+    """Whether the Ollama model accepts the `think` option (passing it to a
+    non-thinking model is an API error, so it must be conditional)."""
+    return any(family in model_tag.lower() for family in ("qwen3", "deepseek-r1"))
+
+
 class ShadowRunner:
     def __init__(
         self,
         store: ResearchStore,
-        model_tag: str = "llama3.1",
+        model_tag: str = "qwen3:8b",
         base_url: str = "http://localhost:11434",
         poster: Optional[Callable] = None,
         timeout_s: float = 60.0,
@@ -90,17 +97,21 @@ class ShadowRunner:
             import requests
             poster = requests.post
 
+        payload = {"model": self.model_tag, "messages": messages, "stream": False}
+        if supports_thinking(self.model_tag):
+            payload["think"] = False  # answer directly; reasoning isn't the response
+
         t0 = time.monotonic()
         resp = poster(
             f"{self.base_url}/api/chat",
-            json={"model": self.model_tag, "messages": messages, "stream": False},
+            json=payload,
             timeout=self.timeout_s,
         )
         status = int(getattr(resp, "status_code", 200))
         if not (200 <= status < 300):
             logger.debug("Shadow Ollama call returned HTTP %s", status)
             return
-        text = (resp.json().get("message") or {}).get("content", "")
+        text = strip_think((resp.json().get("message") or {}).get("content", ""))
         if not text:
             return
         self.store.add_shadow_response(

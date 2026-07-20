@@ -26,7 +26,7 @@ from research.db import ResearchStore
 logger = logging.getLogger(__name__)
 
 ARM = "lora"
-BASE_MODEL = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+BASE_MODEL = "mlx-community/Qwen3-8B-4bit"  # must match research/generate.py BASE_MODEL
 SEED = 42
 LEARNING_RATE = "1e-5"
 NUM_LAYERS = 16

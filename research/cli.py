@@ -73,7 +73,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
     from research.eval_runner import run_pairwise
     from research.evalset import load_curated, load_harvested
     from research.generate import ArmSpec, generate_candidates
-    from research.judge import FakeJudge, QwenJudge, SonnetJudge
+    from research.judge import FakeJudge, LocalJudge, SonnetJudge
     from research.report import append_csv_row, write_run_markdown
 
     store = ResearchStore(args.db)
@@ -88,8 +88,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
     if args.judge == "sonnet":
         judge = SonnetJudge()
         print(f"judge: {judge.name} (PAID API — ~{2 * len(prompts)} calls per arm)")
-    elif args.judge == "qwen":
-        judge = QwenJudge()
+    elif args.judge == "local":
+        judge = LocalJudge()
     else:
         judge = FakeJudge()
 
@@ -234,7 +234,7 @@ def main(argv=None) -> int:
     p_eval = sub.add_parser("eval", help="pairwise-judge arms vs base")
     p_eval.add_argument("--arms", default="base", help="comma-separated arm names")
     p_eval.add_argument("--split", choices=("curated", "harvested"), default="curated")
-    p_eval.add_argument("--judge", choices=("fake", "qwen", "sonnet"), default="fake")
+    p_eval.add_argument("--judge", choices=("fake", "local", "sonnet"), default="fake")
     p_eval.add_argument("--after-ts", type=float, default=0.0,
                         help="harvested split: only prompts newer than this epoch ts")
 

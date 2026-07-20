@@ -32,7 +32,7 @@ from research.db import ResearchStore
 logger = logging.getLogger(__name__)
 
 ARM = "memory"
-OBSERVE_MODEL = "llama3.1"
+OBSERVE_MODEL = "qwen3:8b"
 REFLECT_EVERY = 20  # new observations between reflection passes
 
 # Pinned retrieval weights (recorded in every snapshot's config.json).
@@ -81,13 +81,16 @@ class ChromaIndex:
 
 def _default_llm(prompt: str, *, base_url: str = "http://localhost:11434") -> str:
     import requests
-    resp = requests.post(
-        f"{base_url}/api/chat",
-        json={"model": OBSERVE_MODEL, "stream": False,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=180,
-    )
-    return (resp.json().get("message") or {}).get("content", "")
+
+    from research.generate import strip_think
+    from research.shadow import supports_thinking
+
+    payload = {"model": OBSERVE_MODEL, "stream": False,
+               "messages": [{"role": "user", "content": prompt}]}
+    if supports_thinking(OBSERVE_MODEL):
+        payload["think"] = False
+    resp = requests.post(f"{base_url}/api/chat", json=payload, timeout=180)
+    return strip_think((resp.json().get("message") or {}).get("content", ""))
 
 
 def _parse_items(raw: str) -> list[dict]:

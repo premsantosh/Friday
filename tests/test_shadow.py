@@ -50,9 +50,35 @@ def test_process_posts_snapshot_and_stores_response(store):
     assert posted["json"]["model"] == "llama3.1"
     assert posted["json"]["messages"][0] == {"role": "system", "content": "You are Jarvis"}
     assert posted["json"]["messages"][-1]["content"] == "what's for dinner"
+    assert "think" not in posted["json"]  # llama doesn't accept the think option
 
     rows = store.conn.execute("SELECT arm, mode, response_text FROM shadow_responses").fetchall()
     assert [tuple(r) for r in rows] == [("base", "live", "shadow says hi")]
+
+
+def test_thinking_model_gets_think_false_and_output_stripped(store):
+    posted = {}
+
+    def poster(url, json=None, timeout=None):
+        posted["json"] = json
+        return FakeResp({"message": {"content":
+            "<think>the user wants dinner ideas</think>Pasta would suit, sir."}})
+
+    runner = ShadowRunner(store, model_tag="qwen3:8b", poster=poster)
+    runner._process(_chat_exchange(store))
+
+    assert posted["json"]["think"] is False
+    rows = store.conn.execute("SELECT response_text FROM shadow_responses").fetchall()
+    assert [r["response_text"] for r in rows] == ["Pasta would suit, sir."]
+
+
+def test_strip_think_variants():
+    from research.generate import strip_think
+
+    assert strip_think("<think>hmm</think>Answer.") == "Answer."
+    assert strip_think("Answer.<think>trailing unclosed") == "Answer."
+    assert strip_think("Plain answer.") == "Plain answer."
+    assert strip_think("<think>a</think>Mid<think>b</think> end") == "Mid end"
 
 
 def test_exchange_without_snapshot_is_skipped(store):

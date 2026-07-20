@@ -5,8 +5,9 @@ constraints), and two candidate responses labeled A/B, and picks a winner.
 Position bias is handled by the eval runner (each pair is judged in both
 orders); judges themselves are stateless single-shot calls.
 
-SonnetJudge is the primary (paid API); QwenJudge re-judges a sample locally to
-report agreement; FakeJudge keeps tests hermetic.
+SonnetJudge is the primary (paid API); LocalJudge re-judges a sample locally to
+report agreement — deliberately a DIFFERENT family (llama3.1) from the judged
+Qwen3 base, so the audit stays independent; FakeJudge keeps tests hermetic.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from typing import Optional, Protocol
 logger = logging.getLogger(__name__)
 
 JUDGE_MODEL_SONNET = "claude-sonnet-5"
-JUDGE_MODEL_QWEN = "qwen3:8b"
+JUDGE_MODEL_LOCAL = "llama3.1"
 
 _RUBRIC = """You are judging which of two assistant responses better serves this specific user.
 
@@ -93,33 +94,36 @@ class SonnetJudge:
             return Verdict("error", str(e)[:120], self.name)
 
 
-class QwenJudge:
-    """Local agreement auditor via Ollama (free, weaker)."""
+class LocalJudge:
+    """Local agreement auditor via Ollama (free, weaker). Keep its model a
+    different family from the generation base being judged."""
 
-    def __init__(self, model: str = JUDGE_MODEL_QWEN,
+    def __init__(self, model: str = JUDGE_MODEL_LOCAL,
                  base_url: str = "http://localhost:11434", poster=None):
-        self.name = f"qwen:{model}"
+        self.name = f"local:{model}"
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._poster = poster
 
     def judge(self, prompt: str, annotations: str, a: str, b: str) -> Verdict:
+        from research.generate import strip_think
+        from research.shadow import supports_thinking
+
         content = _RUBRIC.format(annotations=annotations or "(none)", prompt=prompt, a=a, b=b)
         poster = self._poster
         if poster is None:
             import requests
             poster = requests.post
+        payload = {"model": self.model, "stream": False,
+                   "messages": [{"role": "user", "content": content}]}
+        if supports_thinking(self.model):
+            payload["think"] = False
         try:
-            resp = poster(
-                f"{self.base_url}/api/chat",
-                json={"model": self.model, "stream": False, "think": False,
-                      "messages": [{"role": "user", "content": content}]},
-                timeout=120,
-            )
-            text = (resp.json().get("message") or {}).get("content", "")
+            resp = poster(f"{self.base_url}/api/chat", json=payload, timeout=120)
+            text = strip_think((resp.json().get("message") or {}).get("content", ""))
             return _parse_verdict(text, self.name)
         except Exception as e:
-            logger.warning("Qwen judge failed: %s", e)
+            logger.warning("Local judge failed: %s", e)
             return Verdict("error", str(e)[:120], self.name)
 
 

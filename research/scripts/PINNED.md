@@ -3,7 +3,8 @@
 Recorded 2026-07-18 on the study machine (M4 MacBook, 16 GB unified memory, macOS Darwin 25.3.0).
 
 ## Toolchain
-- Python (project venv `.venv`): 3.10.10
+- Python (research worktree `.venv`, where the study runs): 3.14.3
+  (main checkout's venv is 3.10.10; mlx versions identical in both)
 - mlx: 0.32.0
 - mlx-lm: 0.31.3
   - Training objectives available: SFT only (`--fine-tune-type lora|dora|full`).
@@ -12,13 +13,37 @@ Recorded 2026-07-18 on the study machine (M4 MacBook, 16 GB unified memory, macO
 - Ollama models present: llama3.1:latest (8B, 4.9 GB), qwen3:8b, qwen3:4b,
   qwen3:1.7b, llama3.2:3b, gemma3:4b, phi3:mini (extractor, pulled during M0)
 
+## Base model (fixed unless a logged decision changes it)
+- **2026-07-19: switched to Qwen3-8B before any eval/training run** (user
+  decision; stronger local base). Local stack is now:
+  - Shadow + memory-observer (Ollama): `qwen3:8b`, `think: false`
+  - Training + replay/eval base (MLX): `mlx-community/Qwen3-8B-4bit`,
+    `enable_thinking=False`, `<think>` blocks stripped defensively
+  - Local judge auditor: `llama3.1` (different family from the judged base)
+
 ## Arm B training (fixed unless a logged decision changes them)
-- Base model: `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` (QLoRA via 4-bit base)
+- Base model: `mlx-community/Qwen3-8B-4bit` (QLoRA via 4-bit base)
 - LoRA: rank 8 (mlx-lm default), 16 layers, batch size 1, lr 1e-5,
   max seq 1024, seed 42, `--mask-prompt`, iters = min(400, 4 x n_examples)
 - Serving: `mlx_lm.load(base, adapter_path=...)` — Ollama is never involved
 
-## Smoke test results (M0) — measured 2026-07-18
+## Smoke test results on Qwen3-8B-4bit — measured 2026-07-19
+
+### smoke_qlora.py — PASS (worst case: Ollama qwen3:8b held resident)
+- 100 iters, batch 1, rank 8, 16 layers, lr 1e-5, seed 42: 1.80 it/s,
+  ~42 tok/s trained, MLX peak 5.21 GB; wall 283 s including model download
+- Free memory dipped to 8% (qwen3:8b resident is 5.2 GB vs llama's 4.9);
+  272k pages swapped, no thrash, full speed throughout. Real nightly runs
+  have more headroom: train_nightly always unloads Ollama first.
+- Loss 1.30@30 → 0.001@100 — same fast-overfit shape as the Llama run.
+
+### smoke_adapter_gen.py — PASS
+- `mlx_lm.load(base, adapter_path=...)` with `enable_thinking=False`:
+  3.1 s load, 14.4 tok/s, MLX peak 4.80 GB, RSS 2.73 GB
+- Adapter effect visible (trained-register prompts short; the one
+  out-of-distribution prompt answers long), no <think> leakage observed.
+
+## Historical: smoke results on Meta-Llama-3.1-8B-Instruct-4bit — measured 2026-07-18
 
 ### smoke_qlora.py — PASS (worst case: Ollama llama3.1 held resident)
 - 100 iters, batch 1, rank 8 (mlx-lm default), 16 layers, lr 1e-5, seed 42

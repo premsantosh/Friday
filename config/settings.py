@@ -234,7 +234,9 @@ class ResearchConfig:
     artifacts_dir: str = "~/.friday/research"
     feedback_buttons: bool = True   # 👍/👎 inline buttons on Telegram chat replies
     shadow_enabled: bool = True     # local model answers silently in parallel
-    shadow_model: str = "llama3.1"
+    # Must stay the same family as research/generate.py BASE_MODEL (the study's
+    # trained/evaluated base) or the comparison is confounded.
+    shadow_model: str = "qwen3:8b"
     # Which retrieval the memory arm uses during eval: existing 'facts' store
     # (baseline) or the new 'reflection' memory.
     memory_arm_retrieval: str = "facts"

@@ -110,7 +110,7 @@ def stage_train(ctx: NightlyContext) -> str:
 
 def stage_replay(ctx: NightlyContext) -> str:
     from research.approaches import prompt_evolver
-    from research.generate import ArmSpec, generate_replay
+    from research.generate import BASE_MODEL_TAG, ArmSpec, generate_replay
 
     chat = [e for e in map(lambda r: ctx.store.get_exchange(r["id"]),
                            ctx.store.exchanges_since(ctx.since_ts))
@@ -159,7 +159,7 @@ def stage_replay(ctx: NightlyContext) -> str:
         for eid, text in responses.items():
             ctx.store.add_shadow_response(
                 eid, arm=spec.name, mode="replay", response_text=text,
-                model_tag="mlx:Meta-Llama-3.1-8B-Instruct-4bit",
+                model_tag=BASE_MODEL_TAG,
                 artifact_version=spec.artifact_version,
             )
             generated += 1

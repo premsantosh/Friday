@@ -18,7 +18,7 @@ from pathlib import Path
 import mlx.core as mx
 from mlx_lm import generate, load
 
-MODEL = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+MODEL = "mlx-community/Qwen3-8B-4bit"
 
 PROMPTS = [
     "What's a good way to brew coffee at home?",
@@ -56,6 +56,7 @@ def main() -> int:
             [{"role": "user", "content": user_msg}],
             add_generation_prompt=True,
             tokenize=False,
+            enable_thinking=False,  # match study conditions (Qwen3 answers directly)
         )
         text = generate(model, tokenizer, prompt=prompt, max_tokens=args.max_tokens)
         total_tokens += len(tokenizer.encode(text))

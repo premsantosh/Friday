@@ -11,6 +11,7 @@ mlx_lm is imported lazily so the test suite never needs model weights.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -19,8 +20,20 @@ from research.persona import PERSONA_PROMPT
 
 logger = logging.getLogger(__name__)
 
-BASE_MODEL = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+BASE_MODEL = "mlx-community/Qwen3-8B-4bit"
+BASE_MODEL_TAG = "mlx:Qwen3-8B-4bit"  # recorded on shadow_responses replay rows
 MAX_TOKENS = 200  # persona targets <=3 sentences; hard cap for runaway generations
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_think(text: str) -> str:
+    """Drop Qwen3-style <think> blocks (closed or unclosed) — reasoning must
+    never be stored, judged, or trained on as if it were the response."""
+    text = _THINK_RE.sub("", text)
+    if "<think>" in text:
+        text = text.split("<think>", 1)[0]
+    return text.strip()
 
 
 @dataclass
@@ -73,10 +86,11 @@ def generate_replay(
                                   *arm._blocks(e.get("user_text", ""))])
             chat = [{"role": "system", "content": system}, *snapshot.get("messages", [])]
             templated = tokenizer.apply_chat_template(
-                chat, add_generation_prompt=True, tokenize=False
+                chat, add_generation_prompt=True, tokenize=False,
+                enable_thinking=False,  # Qwen3: answer directly; ignored by other templates
             )
-            out[e["id"]] = generate(lm, tokenizer, prompt=templated,
-                                    max_tokens=max_tokens).strip()
+            out[e["id"]] = strip_think(
+                generate(lm, tokenizer, prompt=templated, max_tokens=max_tokens))
         except Exception:
             logger.warning("Replay generation failed for exchange %s (arm %s)",
                            e.get("id"), arm.name, exc_info=True)
@@ -109,9 +123,11 @@ def generate_candidates(
                 {"role": "user", "content": p.prompt},
             ]
             templated = tokenizer.apply_chat_template(
-                chat, add_generation_prompt=True, tokenize=False
+                chat, add_generation_prompt=True, tokenize=False,
+                enable_thinking=False,  # Qwen3: answer directly; ignored by other templates
             )
-            out[p.id] = generate(lm, tokenizer, prompt=templated, max_tokens=max_tokens).strip()
+            out[p.id] = strip_think(
+                generate(lm, tokenizer, prompt=templated, max_tokens=max_tokens))
         except Exception:
             logger.warning("Generation failed for prompt %s (arm %s)", p.id, arm.name,
                            exc_info=True)

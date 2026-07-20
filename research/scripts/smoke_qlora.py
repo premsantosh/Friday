@@ -25,7 +25,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-MODEL = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+MODEL = "mlx-community/Qwen3-8B-4bit"
+OLLAMA_RESIDENT_MODEL = "qwen3:8b"  # the shadow model — worst-case co-residency
 OLLAMA_URL = "http://localhost:11434/api/generate"
 SEED = 42
 
@@ -64,8 +65,9 @@ def make_dataset(data_dir: Path, n_train: int = 100, n_valid: int = 20) -> None:
 
 
 def ollama_set_residency(load: bool) -> str:
-    """Load llama3.1 resident (worst case) or unload it. Returns a status string."""
-    body = json.dumps({"model": "llama3.1", "prompt": "", "keep_alive": "30m" if load else 0}).encode()
+    """Load the shadow model resident (worst case) or unload it. Returns a status string."""
+    body = json.dumps({"model": OLLAMA_RESIDENT_MODEL, "prompt": "",
+                       "keep_alive": "30m" if load else 0}).encode()
     req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -119,7 +121,7 @@ def main() -> int:
     make_dataset(data_dir)
 
     status = ollama_set_residency(load=not args.no_preload)
-    print(f"ollama llama3.1: {status}")
+    print(f"ollama {OLLAMA_RESIDENT_MODEL}: {status}")
 
     csv_path = out / ("mem_preload.csv" if not args.no_preload else "mem_nopreload.csv")
     stop = threading.Event()
