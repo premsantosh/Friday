@@ -60,7 +60,7 @@ from config import (
     FormalityLevel,
     WarmthLevel,
 )
-from core import VoiceAssistant, create_assistant, TelegramChannel
+from core import VoiceAssistant, create_assistant, TelegramChannel, VoicePEChannel
 from workflows import (
     WorkflowManager,
     create_default_workflow_manager,
@@ -426,6 +426,17 @@ def run_all(config: AssistantConfig, debug: bool = False):
     if telegram_channel is not None:
         _attach_listener(assistant, telegram_channel)
 
+    # Voice PE satellites — automatically on whenever configured. Each room's
+    # puck streams mic audio in; replies come out of this Mac's speakers.
+    voice_pe_channel = VoicePEChannel.from_env()
+    if voice_pe_channel is not None:
+        voice_pe_channel.bind(
+            stt=assistant.stt,
+            speak=assistant.speak,
+            has_active=assistant.sessions.has_active if assistant.sessions is not None else None,
+        )
+        _attach_listener(assistant, voice_pe_channel)
+
     # Voice — start in the background; don't grab stdin (the text loop owns it),
     # so a mic-less machine just runs text + Telegram instead of hijacking input.
     voice_active = assistant.start_listening(allow_keyboard_fallback=False)
@@ -436,6 +447,9 @@ def run_all(config: AssistantConfig, debug: bool = False):
     channels.append("text (type below)")
     if telegram_channel is not None:
         channels.append("Telegram")
+    if voice_pe_channel is not None:
+        names = ", ".join(d.name for d in voice_pe_channel.devices)
+        channels.append(f"Voice PE ({names})")
     print(f"  Channels: {' · '.join(channels)}")
     print(f"{'='*50}")
     print("  Talk, type, or text Friday. (Ctrl+C to quit)\n")
@@ -443,7 +457,8 @@ def run_all(config: AssistantConfig, debug: bool = False):
     try:
         reason = _text_chat_loop(assistant, config)
         # Ctrl+D / closed stdin shouldn't kill voice + Telegram — keep them alive.
-        if reason == "eof" and (voice_active or telegram_channel is not None):
+        if reason == "eof" and (voice_active or telegram_channel is not None
+                                or voice_pe_channel is not None):
             print("[text input closed — voice/Telegram still listening; Ctrl+C to quit]")
             while assistant._running:
                 time.sleep(0.1)
@@ -455,6 +470,8 @@ def run_all(config: AssistantConfig, debug: bool = False):
             coffee_workflow.stop_monitor()
         if telegram_channel is not None:
             telegram_channel.stop()
+        if voice_pe_channel is not None:
+            voice_pe_channel.stop()
 
 
 def main():
@@ -555,12 +572,25 @@ def main():
             _attach_listener(assistant, telegram_channel)
             print("ℹ️  Telegram two-way channel enabled")
 
+        voice_pe_channel = VoicePEChannel.from_env()
+        if voice_pe_channel is not None:
+            voice_pe_channel.bind(
+                stt=assistant.stt,
+                speak=assistant.speak,
+                has_active=assistant.sessions.has_active if assistant.sessions is not None else None,
+            )
+            _attach_listener(assistant, voice_pe_channel)
+            names = ", ".join(d.name for d in voice_pe_channel.devices)
+            print(f"ℹ️  Voice PE satellites enabled ({names})")
+
         assistant.run()
 
         if coffee_workflow is not None:
             coffee_workflow.stop_monitor()
         if telegram_channel is not None:
             telegram_channel.stop()
+        if voice_pe_channel is not None:
+            voice_pe_channel.stop()
         return
 
     # Default: listen on voice + text + Telegram together.
