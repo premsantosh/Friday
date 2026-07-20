@@ -85,6 +85,14 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS idx_exchanges_ts ON exchanges(ts);
 CREATE INDEX IF NOT EXISTS idx_feedback_exchange ON feedback(exchange_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_exchange ON shadow_responses(exchange_id);
+
+-- Feedback invariant: one row per (exchange, source). Early builds let the
+-- Telegram buttons insert a row per tap; collapse any such duplicates to the
+-- newest before enforcing (idempotent, runs on every open).
+DELETE FROM feedback WHERE id NOT IN
+    (SELECT MAX(id) FROM feedback GROUP BY exchange_id, source);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_unique
+    ON feedback(exchange_id, source);
 """
 
 _EXCHANGE_UPDATABLE = {"channel", "user_id", "route", "latency_ms"}
@@ -181,14 +189,39 @@ class ResearchStore:
         source: str,
         details: Optional[str] = None,
     ) -> int:
+        """First-wins insert (miners): a later row for the same (exchange,
+        source) is silently ignored. Returns the row id, or 0 when ignored."""
         with self._lock:
             cur = self.conn.execute(
-                "INSERT INTO feedback (exchange_id, kind, signal, source, ts, details)"
+                "INSERT OR IGNORE INTO feedback (exchange_id, kind, signal, source, ts, details)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
                 (exchange_id, kind, signal, source, time.time(), details),
             )
             self.conn.commit()
-            return int(cur.lastrowid)
+            return int(cur.lastrowid) if cur.rowcount else 0
+
+    def upsert_feedback(
+        self,
+        exchange_id: int,
+        kind: str,
+        signal: int,
+        source: str,
+        details: Optional[str] = None,
+    ) -> None:
+        """Latest-wins upsert (explicit 👍/👎 buttons): re-pressing the same
+        button is a no-op in effect, pressing the other one replaces the
+        earlier choice. The single deliberate exception to append-only —
+        exactly one button row per exchange, atomic under the unique index."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO feedback (exchange_id, kind, signal, source, ts, details)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(exchange_id, source) DO UPDATE SET"
+                " kind = excluded.kind, signal = excluded.signal,"
+                " ts = excluded.ts, details = excluded.details",
+                (exchange_id, kind, signal, source, time.time(), details),
+            )
+            self.conn.commit()
 
     def feedback_for(self, exchange_id: int) -> list[dict]:
         with self._lock:

@@ -62,6 +62,63 @@ def test_feedback_roundtrip(store):
     assert not store.has_feedback(eid, "miner:correction")
 
 
+def test_add_feedback_first_wins_per_source(store):
+    eid = store.record_exchange("hi", "Hello.", route="chat")
+    first = store.add_feedback(eid, kind="implicit", signal=-1, source="miner:rephrase")
+    second = store.add_feedback(eid, kind="implicit", signal=1, source="miner:rephrase")
+    assert first > 0
+    assert second == 0  # ignored
+    fb = store.feedback_for(eid)
+    assert [(f["signal"], f["source"]) for f in fb] == [(-1, "miner:rephrase")]
+
+
+def test_upsert_feedback_latest_wins(store):
+    eid = store.record_exchange("hi", "Hello.", route="chat")
+    store.upsert_feedback(eid, kind="explicit", signal=1, source="telegram_button")
+    first_ts = store.feedback_for(eid)[0]["ts"]
+
+    # Same signal again: still one row.
+    store.upsert_feedback(eid, kind="explicit", signal=1, source="telegram_button")
+    assert len(store.feedback_for(eid)) == 1
+
+    # Changed mind: the single row flips and the timestamp moves forward.
+    store.upsert_feedback(eid, kind="explicit", signal=-1, source="telegram_button")
+    fb = store.feedback_for(eid)
+    assert [(f["signal"], f["source"]) for f in fb] == [(-1, "telegram_button")]
+    assert fb[0]["ts"] >= first_ts
+
+    # A different source on the same exchange coexists.
+    store.add_feedback(eid, kind="implicit", signal=-1, source="miner:rephrase")
+    assert len(store.feedback_for(eid)) == 2
+
+
+def test_migration_collapses_existing_duplicate_feedback(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "research.db"
+    s = ResearchStore(str(db_path))
+    eid = s.record_exchange("hi", "Hello.", route="chat")
+    s.close()
+
+    # Simulate the pre-fix bug: raw duplicate button rows (no unique index yet).
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("DROP INDEX IF EXISTS idx_feedback_unique")
+    for signal in (-1, -1, 1):
+        raw.execute(
+            "INSERT INTO feedback (exchange_id, kind, signal, source, ts)"
+            " VALUES (?, 'explicit', ?, 'telegram_button', ?)",
+            (eid, signal, 100.0 + signal),
+        )
+    raw.commit()
+    raw.close()
+
+    # Reopening runs the schema script: duplicates collapse to the newest row.
+    s2 = ResearchStore(str(db_path))
+    fb = s2.feedback_for(eid)
+    assert [(f["signal"], f["source"]) for f in fb] == [(1, "telegram_button")]
+    s2.close()
+
+
 def test_shadow_response_roundtrip(store):
     eid = store.record_exchange("hi", "Hello.", route="chat")
     store.add_shadow_response(eid, arm="base", mode="live", response_text="Greetings.",

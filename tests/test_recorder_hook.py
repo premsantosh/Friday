@@ -94,15 +94,24 @@ def test_feedback_markup_absent_when_disabled(store):
     assert recorder.feedback_markup("555", "Hello.") is None
 
 
-def test_handle_callback_records_explicit_feedback(store, recorder):
+def test_handle_callback_latest_press_wins(store, recorder):
+    # Changing your mind (👍 then 👎) keeps ONE row holding the latest choice.
     eid = recorder.record_chat("hi", "Hello.")
     recorder.handle_callback("555", f"fb:{eid}:1")
     recorder.handle_callback("555", f"fb:{eid}:0")
     fb = store.feedback_for(eid)
     assert [(f["kind"], f["signal"], f["source"]) for f in fb] == [
-        ("explicit", 1, "telegram_button"),
         ("explicit", -1, "telegram_button"),
     ]
+
+
+def test_handle_callback_double_press_records_once(store, recorder):
+    eid = recorder.record_chat("hi", "Hello.")
+    recorder.handle_callback("555", f"fb:{eid}:0")
+    recorder.handle_callback("555", f"fb:{eid}:0")
+    fb = store.feedback_for(eid)
+    assert len(fb) == 1
+    assert fb[0]["signal"] == -1
 
 
 def test_handle_callback_ignores_malformed_data(store, recorder):

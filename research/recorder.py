@@ -150,7 +150,8 @@ class ConversationRecorder:
         except (ValueError, AttributeError):
             logger.debug("Ignoring malformed callback data: %r", data)
             return
-        self.store.add_feedback(
+        # Latest press wins: one button row per exchange; re-presses replace it.
+        self.store.upsert_feedback(
             exchange_id,
             kind="explicit",
             signal=signal,
