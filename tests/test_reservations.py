@@ -432,11 +432,23 @@ class StubDiscovery:
     def __init__(self, decision, policy=None):
         self._decision, self._policy = decision, policy
 
-    def discover(self, name, location=None):
+    def discover(self, name, location=None, target_url=None, kind="dining"):
         return self._decision
 
     def resolve_release_policy(self, name, location=None):
         return self._policy
+
+
+def far_future_date(days: int = 75) -> str:
+    """An "M/D" date comfortably past every snipe horizon.
+
+    Hardcoding a calendar date here quietly rots: once the wall clock passes
+    (date - release_days_in_advance) the booking window is already open and the
+    snipe tests stop exercising a snipe at all.
+    """
+    from datetime import datetime, timedelta
+    target = datetime.now() + timedelta(days=days)
+    return f"{target.month}/{target.day}"
 
 
 def _bookable_decision():
@@ -453,8 +465,9 @@ async def test_autodetected_policy_offers_snipe():
                                    router=opentable_router(FakeChannel()))
     wf = mgr.workflows.workflows["reservations"]
 
-    # No release policy stated by the user; dining date is far enough out (8/15).
-    turn = await mgr.open(wf, "book a table for 2 at Bungalow on 8/15 at 7pm", {}, "default")
+    # No release policy stated by the user; dining date is far enough out.
+    turn = await mgr.open(
+        wf, f"book a table for 2 at Bungalow on {far_future_date()} at 7pm", {}, "default")
     assert turn.control == TurnControl.AWAIT_CONFIRMATION
     assert "open" in turn.message.lower()
     assert "opens 30 days out" in turn.message  # cites the discovered source
@@ -510,8 +523,8 @@ async def test_snipe_schedules_then_books_at_fire():
 
     # Dining date far enough out that the window (30 days prior) is still future.
     turn = await mgr.open(
-        wf, "book a table for 2 at Lazy Bear on 8/15 at 7pm — reservations open "
-            "30 days in advance at 10am ET", {}, "default")
+        wf, f"book a table for 2 at Lazy Bear on {far_future_date()} at 7pm — reservations "
+            f"open 30 days in advance at 10am ET", {}, "default")
     assert turn.control == TurnControl.AWAIT_CONFIRMATION
     assert "reservations open" in turn.message.lower()   # snipe gate, not a normal book
     assert fake.committed is False
@@ -557,8 +570,8 @@ async def test_snipe_miss_reports_honestly():
     mgr = make_reservation_manager(disc, router=opentable_router(miss))
     wf = mgr.workflows.workflows["reservations"]
 
-    await mgr.open(wf, "book a table for 2 at Lazy Bear on 8/15 at 7pm — reservations open "
-                       "30 days in advance at 10am ET", {}, "default")
+    await mgr.open(wf, f"book a table for 2 at Lazy Bear on {far_future_date()} at 7pm — "
+                       f"reservations open 30 days in advance at 10am ET", {}, "default")
     await mgr.handle("default", "yes")
     sess = mgr.store.list_waiting()[0]
     sess.slots["snipe_state"]["fire_ts"] = _time.time() - 1

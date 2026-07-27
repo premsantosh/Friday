@@ -1,0 +1,20 @@
+<!-- Two forms: a header search box and the real appointment form. Picking the
+     wrong one is the classic failure of "just grab the first form". -->
+<h1>Bay Area Chiropractic</h1>
+
+<form class="header-search" action="/search">
+  <input type="search" name="q" placeholder="Search the site">
+  <button type="submit">Search</button>
+</form>
+
+<form class="appointment" action="/book" method="post">
+  <label for="a-name">Full Name</label>
+  <input type="text" id="a-name" name="fullname" required>
+  <label for="a-email">Email</label>
+  <input type="email" id="a-email" name="email" required>
+  <label for="a-phone">Mobile</label>
+  <input type="tel" id="a-phone" name="mobile">
+  <label for="a-notes">Reason for visit</label>
+  <textarea id="a-notes" name="notes"></textarea>
+  <button type="submit">Request Appointment</button>
+</form>

@@ -55,11 +55,13 @@ from .discovery import BusinessDiscovery
 from .llm import ReservationLLM
 from .llm import extract_slots as llm_extract_slots
 from .models import (
-    ESSENTIAL_SLOTS,
     SLOT_PROMPTS,
     SLOT_SPECS_BY_NAME,
+    BookingKind,
     ChannelDecision,
     ReservationMethod,
+    parse_kind,
+    required_slots,
 )
 from .notify import TelegramNotifier
 from .payment import HARD_CAP_USD, PrivacyCardService, card_service_from_env
@@ -89,6 +91,7 @@ RESERVATION_MACHINE = Machine(
     states=frozenset({
         "start",            # opening turn
         "collecting",       # asking for the next essential slot
+        "collecting_facts",  # asking for a fact the business's form requires
         "confirm",          # booking gate (browser/phone commit)
         "confirm_email",    # editable email-draft gate
         "confirm_wait",     # offer to watch for an opening
@@ -104,15 +107,23 @@ RESERVATION_MACHINE = Machine(
                            "confirm_snipe", "confirm_sandbox"}),
     transitions={
         ("start", "need_slot"): "collecting",
+        ("start", "need_fact"): "collecting_facts",
         ("start", "gate_booking"): "confirm",
         ("start", "gate_email"): "confirm_email",
         ("start", "offer_wait"): "confirm_wait",
         ("start", "gate_snipe"): "confirm_snipe",
         ("collecting", "need_slot"): "collecting",
+        ("collecting", "need_fact"): "collecting_facts",
         ("collecting", "gate_booking"): "confirm",
         ("collecting", "gate_email"): "confirm_email",
         ("collecting", "offer_wait"): "confirm_wait",
         ("collecting", "gate_snipe"): "confirm_snipe",
+        ("collecting_facts", "need_fact"): "collecting_facts",
+        ("collecting_facts", "need_slot"): "collecting",
+        ("collecting_facts", "gate_booking"): "confirm",
+        ("collecting_facts", "gate_email"): "confirm_email",
+        ("collecting_facts", "offer_wait"): "confirm_wait",
+        ("collecting_facts", "gate_snipe"): "confirm_snipe",
         ("confirm", "call_started"): "calling",
         ("confirm", "offer_sandbox"): "confirm_sandbox",
         ("confirm_wait", "watch"): "watching",
@@ -147,6 +158,20 @@ _DATE_RE = re.compile(
     r"\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b",
     re.I,
 )
+_URL_RE = re.compile(r"https?://[^\s<>\"')]+", re.I)
+# What kind of booking this is, when the LLM isn't there to say. Dining wins on
+# a tie because that's what this workflow historically assumed.
+_DINING_RE = re.compile(
+    r"\b(table|dinner|lunch|brunch|breakfast|dine|dining|restaurant|bar|"
+    r"party of|covers|tasting menu|supper)\b", re.I)
+_APPOINTMENT_WORDS = (
+    "appointment|consultation|consult|check[- ]?up|checkup|session|"
+    "haircut|hair cut|barber|salon|massage|spa|facial|therapy|therapist|"
+    "physio|physical therapy|chiro|dentist|dental|doctor|clinic|vet|"
+    "tattoo|piercing|test drive|viewing|tour|fitting|lesson|class|"
+    "estimate|quote|inspection|repair|service call"
+)
+_APPOINTMENT_RE = re.compile(rf"\b({_APPOINTMENT_WORDS})\b", re.I)
 # Release policy: "tables drop 30 days in advance at 10am ET".
 _RELEASE_DAYS_RE = re.compile(
     r"\b(\d{1,3})\s*days?\s*(?:in advance|ahead|before|out|prior|early)\b", re.I)
@@ -163,6 +188,23 @@ class ReservationWorkflow(ConversationalWorkflow):
     # (business, date, time, confirmation) are kept for "what did you book?".
     pii_slots = ("guest_name", "phone", "email", "special_requests", "raw_request")
 
+    def on_terminal(self, session: Session) -> None:
+        """Purge the PII slots, and the values inside a stored form plan.
+
+        A generic-web plan carries the literal text that went into the form —
+        name, email, date of birth, insurance ID. The field *structure* is worth
+        keeping for "what did you submit?"; the values are not, and they live in
+        the profile store, which is their proper home.
+        """
+        super().on_terminal(session)
+        plan = session.slots.get("commit_plan")
+        form_plan = (plan or {}).get("details", {}).get("form_plan")
+        if not form_plan:
+            return
+        for entry in form_plan.get("entries") or []:
+            entry["value"] = "[purged]"
+            entry.pop("option_value", None)
+
     def __init__(self, discovery: Optional[BusinessDiscovery] = None,
                  router: Optional[ChannelRouter] = None,
                  payment: Optional[PrivacyCardService] = None,
@@ -170,6 +212,7 @@ class ReservationWorkflow(ConversationalWorkflow):
                  notifier: Optional[TelegramNotifier] = None,
                  sandbox: Optional[SandboxBotChannel] = None,
                  gate: Optional[ActionGate] = None,
+                 profile: Any = _UNSET,
                  llm: Any = _UNSET):
         # Sentinel: llm=None explicitly disables LLM refinement (tests); omitting
         # it wires the real one from the environment.
@@ -180,6 +223,10 @@ class ReservationWorkflow(ConversationalWorkflow):
         self.payment = payment if payment is not None else card_service_from_env()
         self.calendar = calendar if calendar is not None else CalendarService.from_env()
         self.notifier = notifier if notifier is not None else TelegramNotifier.from_env()
+        # Durable facts about the user (name, email, DOB, insurance…), used to
+        # fill business forms. Built lazily so constructing the workflow doesn't
+        # touch the database. Tests inject their own.
+        self._profile = None if profile is _UNSET else profile
         # Every irreversible action (book / call / email / mint / sandbox) goes
         # through the gate; the (channel, plan) under approval lives in
         # session.slots, never in process memory. Approvals are only valid if
@@ -213,33 +260,53 @@ class ReservationWorkflow(ConversationalWorkflow):
         self._snipe_min_confidence = float(os.getenv("RESERVATION_SNIPE_MIN_CONFIDENCE", "0.4"))
 
     @property
+    def profile(self):
+        if self._profile is None:
+            from core.profile import UserProfile
+            self._profile = UserProfile()
+            self._profile.seed_from_env()
+        return self._profile
+
+    @property
     def name(self) -> str:
         return "reservations"
 
     @property
     def description(self) -> str:
         return (
-            "Make a reservation or appointment at a business — looks it up online, "
-            "figures out how they take bookings, and arranges it."
+            "Book anything at a business that takes bookings — a restaurant table, "
+            "a clinic or therapist consultation, a haircut, a massage, a repair "
+            "estimate, a test drive. Looks the business up, works out how they take "
+            "bookings (OpenTable, Resy, their own web form, phone or email), fills "
+            "in their form, and arranges it. Also handles a URL the user pastes."
         )
 
     @property
     def trigger(self) -> WorkflowTrigger:
+        # The vocabulary is shared with _APPOINTMENT_RE, so a word that makes
+        # this an appointment also gets the workflow invoked in the first place.
+        # Generalising the workflow without generalising its front door just
+        # means the router answers conversationally and never calls it.
+        verbs = r"(?:book|reserve|schedule|arrange|set up|get|make)"
         return WorkflowTrigger(
             keywords=[
                 "reservation", "reserve", "book a table", "book a reservation",
-                "make a booking", "make a reservation", "appointment", "book an appointment",
+                "make a booking", "make a reservation", "appointment",
+                "book an appointment", "consultation", "book a consultation",
             ],
             patterns=[
-                r"\b(book|reserve|get).{0,20}(table|reservation|appointment|booking)\b",
+                rf"\b{verbs}\b.{{0,30}}\b(table|reservation|booking|{_APPOINTMENT_WORDS})\b",
                 r"\bmake (?:me )?(?:a |an )?(reservation|booking|appointment)\b",
-                r"\b(get|set up).{0,15}(appointment|booking)\b",
+                # "book me in at https://…" — a pasted booking page plus a verb.
+                rf"\b{verbs}\b.{{0,40}}https?://",
             ],
             examples=[
                 "Book me a table for 2 at Lazy Bear next Friday at 7pm",
                 "Make a dinner reservation for four tomorrow at 8",
                 "Book a haircut appointment at Fellow Barber on Saturday",
-                "Reserve a massage for two this weekend",
+                "Book me a consultation at Back on Track Physical Therapy in Pleasanton",
+                "Schedule a physio session next week",
+                "Get me an estimate from that plumber at https://example.com/contact",
             ],
         )
 
@@ -270,14 +337,15 @@ class ReservationWorkflow(ConversationalWorkflow):
             return {}
         out: Dict[str, Any] = {}
         ctx = NormalizeCtx.fresh()
-        for name in ESSENTIAL_SLOTS:
+        for name, spec in SLOT_SPECS_BY_NAME.items():
             raw = entities.get(name)
             if raw is None:
                 continue
-            value = SLOT_SPECS_BY_NAME[name].normalize(str(raw), ctx)
+            value = spec.normalize(str(raw), ctx)
             if value is not None:
                 out[name] = value
-        for name in ("location", "email", "phone", "special_requests"):
+        for name in ("location", "email", "phone", "special_requests",
+                     "booking_kind", "target_url"):
             if entities.get(name):
                 out[name] = entities[name]
         return out
@@ -300,6 +368,7 @@ class ReservationWorkflow(ConversationalWorkflow):
     async def resume(self, text: str, session: Session) -> TurnResult:
         handler = {
             "collecting": self._handle_collect,
+            "collecting_facts": self._handle_fact_collect,
             "confirm": self._handle_confirmation,
             "confirm_email": self._handle_email_confirmation,
             "confirm_wait": self._handle_wait_confirmation,
@@ -351,12 +420,16 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     async def _advance(self, session: Session, slots_update: Dict[str, Any]) -> TurnResult:
         merged = {**session.slots, **(slots_update or {})}
-        missing = [s for s in ESSENTIAL_SLOTS if not merged.get(s)]
+        kind = self._kind_of(merged)
+        slots_update = {**(slots_update or {}), "booking_kind": kind.value}
+        merged["booking_kind"] = kind.value
+
+        missing = [s for s in required_slots(kind) if not merged.get(s)]
         if missing:
             nxt = missing[0]
             return TurnResult.ask(
                 SLOT_PROMPTS[nxt],
-                slots_update={**(slots_update or {}), "_pending_slot": nxt},
+                slots_update={**slots_update, "_pending_slot": nxt},
                 next_state=self._fire(session, "need_slot"),
             )
 
@@ -365,14 +438,35 @@ class ReservationWorkflow(ConversationalWorkflow):
         self._remember_recent(session, merged)
         try:
             decision = await asyncio.to_thread(
-                self.discovery.discover, merged["business_name"], merged.get("location")
+                self.discovery.discover, merged["business_name"], merged.get("location"),
+                merged.get("target_url"), kind.value,
             )
         except EgressViolation:
             return TurnResult.complete(
                 "I stopped that lookup, sir — it was about to include something "
                 "it shouldn't. Could you give me just the business name and city?")
-        base_update = {**(slots_update or {}), "channel_decision": decision.to_dict()}
+        base_update = {**slots_update, "channel_decision": decision.to_dict()}
         return await self._route_and_gate(session, merged, decision, base_update)
+
+    @staticmethod
+    def _kind_of(slots: Dict[str, Any]) -> BookingKind:
+        """Dining, appointment or inquiry — the LLM's read, else the words used.
+
+        Only the *stated* signals count. Falling back to dining keeps every
+        existing restaurant path behaving exactly as before.
+        """
+        stated = slots.get("booking_kind")
+        if stated:
+            return parse_kind(stated)
+
+        text = str(slots.get("raw_request") or "")
+        if _DINING_RE.search(text) or slots.get("party_size"):
+            return BookingKind.DINING
+        if _APPOINTMENT_RE.search(text) or slots.get("service_type"):
+            return BookingKind.APPOINTMENT
+        if slots.get("target_url"):
+            return BookingKind.APPOINTMENT
+        return BookingKind.DINING
 
     async def _route_and_gate(self, session, slots, decision, base_update) -> TurnResult:
         """Pick a channel; for bookable methods, check availability and gate on confirmation."""
@@ -391,8 +485,9 @@ class ReservationWorkflow(ConversationalWorkflow):
 
         # Snipe: a release policy (stated by the user, or auto-detected) places
         # the window in the future → schedule the attempt rather than try (and
-        # fail) now. Phone is excluded for now (this covers browser booking).
-        if not getattr(channel, "is_async", False):
+        # fail) now. Restaurant-only: clinics don't drop appointments at 10am ET.
+        kind = self._kind_of(slots)
+        if kind is BookingKind.DINING and not getattr(channel, "is_async", False):
             snipe = await self._resolve_snipe(slots, decision)
             if snipe is not None:
                 plan = await channel.prepare(slots, decision)
@@ -413,9 +508,127 @@ class ReservationWorkflow(ConversationalWorkflow):
 
         plan = await channel.prepare(slots, decision)
         update = {**base_update, "commit_plan": plan.to_dict()}
+
+        # A form we can read may want facts we don't hold (date of birth,
+        # insurance carrier). Ask before showing a plan with holes in it.
+        gap = self._gap_turn(session, plan, update)
+        if gap is not None:
+            return gap
+
         return TurnResult.confirm(self._confirm_message(plan, availability),
                                   slots_update=update,
                                   next_state=self._fire(session, "gate_booking"))
+
+    # ------------------------------------------------------- form-fact collection
+    @staticmethod
+    def _missing_facts(plan: CommitPlan):
+        """(askable, unfillable) missing form fields for a generic-web plan.
+
+        Askable ones map to a key in the profile registry, so the answer can be
+        stored durably and reused. The rest are fields we have no vocabulary for
+        — we hand those back rather than submit a form we know is incomplete.
+        """
+        form_plan = (plan.details or {}).get("form_plan") or {}
+        missing = form_plan.get("missing") or []
+        askable = [m for m in missing if m.get("suggested_key")]
+        unfillable = [m for m in missing if not m.get("suggested_key")]
+        return askable, unfillable
+
+    def _gap_turn(self, session: Session, plan: CommitPlan,
+                  update: Dict[str, Any]) -> Optional[TurnResult]:
+        """The next turn when the form can't be filled completely, else None.
+
+        A gap we have a profile key for becomes a question; one we don't is a
+        hand-off. Either way we never submit a form we know is incomplete.
+        """
+        askable, unfillable = self._missing_facts(plan)
+
+        if unfillable:
+            names = ", ".join(m.get("label") or m.get("ref") for m in unfillable[:3])
+            url = plan.details.get("url") or "their site"
+            return TurnResult.complete(
+                f"I got their form open, sir, but it asks for {names}, which I've no "
+                f"way to answer for you. Best you finish this one: {url}.",
+                slots_update=update)
+
+        # Never ask for the same fact twice in one session. Without this, a
+        # stored answer that still doesn't satisfy the field loops forever.
+        asked = set(session.slots.get("_asked_facts") or [])
+        askable = [m for m in askable if m.get("suggested_key") not in asked]
+
+        if askable:
+            # Queue them all up front. Re-reading the page between every answer
+            # would mean relaunching a browser per question.
+            queue = [{"key": m.get("suggested_key"),
+                      "label": (m.get("label") or m.get("suggested_key") or "").rstrip(" *:"),
+                      "options": m.get("options") or []}
+                     for m in askable]
+            return self._ask_next_fact(session, queue, update)
+
+        return None
+
+    def _ask_next_fact(self, session: Session, queue: list,
+                       update: Dict[str, Any]) -> TurnResult:
+        head, rest = queue[0], queue[1:]
+        more = f" (and {len(rest)} more after that)" if rest else ""
+        # Offer the menu when there is one, so the answer can actually be used.
+        options = head.get("options") or []
+        if options:
+            choices = ", ".join(options[:6])
+            question = f"Their form asks for {head['label']}, sir — {choices}?"
+        else:
+            question = f"Their form asks for {head['label']}, sir — what shall I put?"
+
+        asked = list(session.slots.get("_asked_facts") or [])
+        if head["key"] and head["key"] not in asked:
+            asked.append(head["key"])
+        return TurnResult.ask(
+            question + more,
+            slots_update={**update, "_pending_fact": head["key"],
+                          "_fact_queue": rest, "_asked_facts": asked},
+            next_state=self._fire(session, "need_fact"))
+
+    async def _handle_fact_collect(self, text: str, session: Session) -> TurnResult:
+        """Store the answer durably, then re-read the form with it in hand."""
+        key = session.slots.get("_pending_fact")
+        value = (text or "").strip()
+        if not key:
+            return await self._advance(session, {})
+        if not value:
+            return TurnResult.ask("Sorry sir, I didn't catch that — what shall I put?",
+                                  next_state=self._fire(session, "need_fact"))
+
+        try:
+            # Stored against the shared default: a date of birth or an insurance
+            # policy is the same fact whichever name the booking goes under.
+            self.profile.set(key, value)
+        except Exception:
+            logger.warning("Couldn't store profile fact %s", key, exc_info=True)
+
+        # Work through the rest of the queue before re-reading the page.
+        queue = session.slots.get("_fact_queue") or []
+        if queue:
+            return self._ask_next_fact(session, queue, {})
+
+        # Re-plan against the form now that the facts exist.
+        decision = self._decision_from_slots(session)
+        channel = self.router.select(decision)
+        if channel is None:
+            return TurnResult.complete("I've lost that booking channel, sir — let's start afresh.")
+
+        slots = {**session.slots, "_pending_fact": None}
+        plan = await channel.prepare(slots, decision)
+        update = {"_pending_fact": None, "_fact_queue": None,
+                  "commit_plan": plan.to_dict()}
+
+        gap = self._gap_turn(session, plan, update)
+        if gap is not None:
+            return gap
+
+        availability = await channel.check_availability(slots)
+        return TurnResult.confirm(
+            f"Noted, sir — I'll remember that. " + self._confirm_message(plan, availability),
+            slots_update=update, next_state=self._fire(session, "gate_booking"))
 
     async def _gate_email(self, session, slots, decision, channel, base_update) -> TurnResult:
         plan = await channel.prepare(slots, decision)
@@ -468,8 +681,11 @@ class ReservationWorkflow(ConversationalWorkflow):
         result = outcome.result
 
         if result.success:
-            message = result.message + await self._on_confirmed(session, plan, result.confirmation)
-            update = {"booking_result": {"success": True, "confirmation": result.confirmation}}
+            pending = bool(getattr(result, "pending", False))
+            message = result.message + await self._on_confirmed(
+                session, plan, result.confirmation, pending=pending)
+            update = {"booking_result": {"success": True, "pending": pending,
+                                         "confirmation": result.confirmation}}
             return TurnResult.complete(message, slots_update=update)
 
         # Our own automation couldn't do it — optionally offer the sandboxed bot fallback (M7).
@@ -777,18 +993,22 @@ class ReservationWorkflow(ConversationalWorkflow):
             f"{biz} yourself: {plan.details.get('url') or 'their site'}.")
 
     async def _on_confirmed(self, session: Session, plan: CommitPlan,
-                            confirmation: Optional[str]) -> str:
-        """Calendar event + Telegram record on a confirmed booking. Never fails the booking."""
+                            confirmation: Optional[str], pending: bool = False) -> str:
+        """Calendar event + Telegram record on a confirmed booking. Never fails the booking.
+
+        `pending` means the business has our request but hasn't agreed a time —
+        there is nothing truthful to put in the calendar yet, so we only notify.
+        """
         decision = session.slots.get("channel_decision") or {}
         facts = {
-            **plan.details,
+            **{k: v for k, v in plan.details.items() if k not in ("form_plan", "request")},
             "address": decision.get("address"),
             "method": plan.channel,
             "confirmation": confirmation,
         }
 
         note = ""
-        if self.calendar is not None:
+        if self.calendar is not None and not pending:
             try:
                 guard(USER_DEST_SINK, facts)  # user-owned destination; card scan only
                 if await asyncio.to_thread(self.calendar.create_event, facts):
@@ -798,7 +1018,8 @@ class ReservationWorkflow(ConversationalWorkflow):
 
         if self.notifier is not None:
             try:
-                message = guard(USER_DEST_SINK, self._notify_text(facts))
+                message = guard(USER_DEST_SINK,
+                                self._notify_text(facts, session.slots, pending))
                 await asyncio.to_thread(self.notifier.send, message)
             except Exception:
                 logger.warning("Telegram notification failed", exc_info=True)
@@ -806,13 +1027,29 @@ class ReservationWorkflow(ConversationalWorkflow):
         return note
 
     @staticmethod
-    def _notify_text(facts: Dict[str, Any]) -> str:
+    def _notify_text(facts: Dict[str, Any], slots: Optional[Dict[str, Any]] = None,
+                     pending: bool = False) -> str:
         conf = f" Confirmation: {facts['confirmation']}." if facts.get("confirmation") else ""
-        return (
-            f"✅ Reservation confirmed: {facts.get('business_name')} for "
-            f"{facts.get('party_size')} on {display_date(facts.get('date'))} "
-            f"at {display_time(facts.get('time'))}.{conf}"
-        )
+        business = facts.get("business_name")
+        kind = parse_kind((slots or {}).get("booking_kind"))
+
+        if pending:
+            what = facts.get("service_type") or (slots or {}).get("service_type") or "an appointment"
+            when = f" for {display_date(facts.get('date'))}" if facts.get("date") else ""
+            return (f"📨 Request sent: {what} at {business}{when}. "
+                    f"Awaiting their reply.{conf}")
+
+        if kind is BookingKind.DINING:
+            return (
+                f"✅ Reservation confirmed: {business} for "
+                f"{facts.get('party_size')} on {display_date(facts.get('date'))} "
+                f"at {display_time(facts.get('time'))}.{conf}"
+            )
+
+        what = facts.get("service_type") or (slots or {}).get("service_type") or "Appointment"
+        when = display_date(facts.get("date")) if facts.get("date") else "a date to be confirmed"
+        at = f" at {display_time(facts.get('time'))}" if facts.get("time") else ""
+        return f"✅ Booked: {what} at {business} on {when}{at}.{conf}"
 
     # --------------------------------------------------------------- phone (async)
     max_call_retries = 3
@@ -1114,36 +1351,75 @@ class ReservationWorkflow(ConversationalWorkflow):
         """Used when we can't gate a booking (research-only, or phone/email/unknown method)."""
         name = decision.business_name or slots.get("business_name", "the business")
         addr = f" ({decision.address})" if decision.address else ""
-        party = slots.get("party_size", "your party")
-        date = display_date(slots.get("date", "the requested date"))
-        time = display_time(slots.get("time", "the requested time"))
 
         if bookable and kill_switch_on():
             tail = "I'm in research-only mode (kill switch on), so I won't book it."
         else:
             tail = "I can't place this type of booking automatically yet, so I've not booked anything."
 
-        return (
-            f"I found {name}{addr}, sir. {decision.method_phrase()} "
-            f"You've asked for {party} on {date} at {time}. {tail}"
-        )
+        if parse_kind(slots.get("booking_kind")) is BookingKind.DINING:
+            party = slots.get("party_size", "your party")
+            date = display_date(slots.get("date", "the requested date"))
+            time = display_time(slots.get("time", "the requested time"))
+            asked = f"You've asked for {party} on {date} at {time}."
+        else:
+            what = slots.get("service_type") or "an appointment"
+            when = (f" on {display_date(slots['date'])}" if slots.get("date") else "")
+            at = f" at {display_time(slots['time'])}" if slots.get("time") else ""
+            asked = f"You've asked for {what}{when}{at}."
+
+        return f"I found {name}{addr}, sir. {decision.method_phrase()} {asked} {tail}"
 
     @staticmethod
     def _confirm_message(plan: CommitPlan, availability) -> str:
         name = plan.details.get("business_name", "the business")
+        card = ""
+        if plan.requires_card:
+            card = " They may need a card to hold it; I'd use a single-use card capped at $10."
+
+        # A form we're going to fill: disclose every field and value. This is
+        # the whole point of the gate — the user approves the actual data, not
+        # a summary of it, and hash_plan binds the approval to exactly this.
+        form = ReservationWorkflow._form_disclosure(plan)
+        if form:
+            persona = ReservationWorkflow._persona_note(plan)
+            return (f"{plan.summary}. Here's what I'd put in their form{persona}:\n\n"
+                    f"{form}\n{card} Shall I submit it, sir?")
+
         party = plan.details.get("party_size", "your party")
         # The user approves the *resolved* facts ("Friday, June 19 at 7:00 pm"),
         # not the ambiguous phrase they originally used.
         date = display_date(plan.details.get("date"))
         time = display_time(plan.details.get("time"))
         verify = f" ({availability.note})" if availability.note else ""
-        card = ""
-        if plan.requires_card:
-            card = " They may need a card to hold it; I'd use a single-use card capped at $10."
         return (
             f"I'm ready to book {name} for {party} on {date} at {time} via {plan.channel}.{verify}"
             f"{card} Shall I go ahead and book it, sir?"
         )
+
+    @staticmethod
+    def _persona_note(plan: CommitPlan) -> str:
+        """Name the persona at the gate. Whether a form gets the full legal name
+        or the everyday one is a judgement call, so it's shown, not buried."""
+        context = ((plan.details or {}).get("form_plan") or {}).get("context")
+        if context == "formal":
+            return " (using your full name, as it's a medical/official form)"
+        if context == "casual":
+            return " (using your everyday name)"
+        return ""
+
+    @staticmethod
+    def _form_disclosure(plan: CommitPlan) -> str:
+        """The field-by-field listing shown before a web form is submitted."""
+        form_plan = (plan.details or {}).get("form_plan") or {}
+        entries = form_plan.get("entries") or []
+        if not entries:
+            return ""
+        labels = [(e.get("label") or e.get("ref") or "").rstrip(" *:") for e in entries]
+        width = min(32, max((len(label) for label in labels), default=10))
+        lines = [f"  {label.ljust(width)}  {e.get('value')}"
+                 for label, e in zip(labels, entries)]
+        return "\n".join(lines)
 
     @staticmethod
     def _snipe_confirm_message(plan: CommitPlan, snipe: Dict[str, Any]) -> str:
@@ -1195,6 +1471,20 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     def _extract_slots_regex(self, text: str) -> Dict[str, Any]:
         slots: Dict[str, Any] = {}
+
+        # A pasted booking page is the strongest signal there is. Pull it out
+        # first so it can't be swallowed by the business-name capture below.
+        m = _URL_RE.search(text)
+        if m:
+            slots["target_url"] = m.group(0).rstrip(".,)")
+            text = _URL_RE.sub(" ", text)
+
+        # The word that marks this as an appointment usually *is* the service:
+        # "book a consultation", "get a haircut". Cheap, and it saves a round
+        # trip asking what the user already said.
+        m = _APPOINTMENT_RE.search(text)
+        if m:
+            slots["service_type"] = m.group(0).strip().lower()
 
         m = _PARTY_RE.search(text)
         if m:

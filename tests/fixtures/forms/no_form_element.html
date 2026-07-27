@@ -1,0 +1,26 @@
+<!-- A JS widget with no <form> element at all — inputs wired up by script.
+     The harvester falls back to walking the document body. -->
+<h2>Book a Session</h2>
+<div class="widget">
+  <div class="row">
+    <span>Your name</span>
+    <input type="text" data-field="name" aria-label="Your name">
+  </div>
+  <div class="row">
+    <span>Email</span>
+    <input type="email" data-field="email" aria-label="Email">
+  </div>
+  <div class="row">
+    <span>Mobile</span>
+    <input type="tel" data-field="phone" aria-label="Mobile">
+  </div>
+  <div class="row">
+    <span>Service</span>
+    <select aria-label="Service">
+      <option value="">Choose one</option>
+      <option value="60">60 minute massage</option>
+      <option value="90">90 minute massage</option>
+    </select>
+  </div>
+  <div role="button" tabindex="0">Continue</div>
+</div>
