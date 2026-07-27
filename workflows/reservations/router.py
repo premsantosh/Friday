@@ -35,11 +35,14 @@ class ChannelRouter:
         browser_dir = os.path.expanduser(
             os.getenv("RESERVATION_BROWSER_DIR", "~/.friday/browser")
         )
+        llm = ReservationLLM.from_env()
         channels: Dict[ReservationMethod, ReservationChannel] = {
             ReservationMethod.OPENTABLE: OpenTableChannel(browser_dir),
             ReservationMethod.RESY: ResyChannel(browser_dir),
             ReservationMethod.YELP: YelpChannel(browser_dir),
-            ReservationMethod.GENERIC_WEB: GenericWebChannel(browser_dir),
+            # The generic channel reads the page's own form; the LLM only maps
+            # fields to fact *keys*, so it works (less well) without one.
+            ReservationMethod.GENERIC_WEB: GenericWebChannel(browser_dir, llm=llm),
         }
 
         phone = cls._phone_channel_from_env()
@@ -48,7 +51,6 @@ class ChannelRouter:
 
         email = EmailChannel.from_env()
         if email is not None:
-            llm = ReservationLLM.from_env()
             if llm is not None:
                 email.drafter = make_llm_drafter(llm, fallback=email.drafter)
             channels[ReservationMethod.EMAIL] = email

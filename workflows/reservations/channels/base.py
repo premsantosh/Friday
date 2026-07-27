@@ -107,6 +107,10 @@ class BookingResult:
     confirmation: Optional[str] = None
     error: Optional[str] = None
     needs_manual: bool = False   # we safely bailed; the user should finish it
+    # The request went through, but the business hasn't confirmed a time yet
+    # (a "request a consultation" form, not an instant booking). Success, but
+    # there is nothing to put in the calendar until they reply.
+    pending: bool = False
 
 
 class ReservationChannel(ABC):

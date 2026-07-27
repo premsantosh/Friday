@@ -53,11 +53,52 @@ ESSENTIAL_SLOT_SPECS: tuple = (
              "For how many people, sir?",
              "How many shall I say, sir — just a number?",
              normalize_party_size),
+    SlotSpec("service_type",
+             "What shall I book it for, sir — what sort of appointment?",
+             "I didn't catch what the appointment is for, sir — a consultation, "
+             "a haircut, something else?",
+             normalize_text),
 )
 
 SLOT_SPECS_BY_NAME: Dict[str, SlotSpec] = {s.name: s for s in ESSENTIAL_SLOT_SPECS}
-ESSENTIAL_SLOTS: tuple = tuple(s.name for s in ESSENTIAL_SLOT_SPECS)
 SLOT_PROMPTS: Dict[str, str] = {s.name: s.prompt for s in ESSENTIAL_SLOT_SPECS}
+
+
+class BookingKind(Enum):
+    """What sort of booking this is — it decides which slots are essential.
+
+    A restaurant needs a party size and an exact time; a physiotherapy
+    consultation needs neither, and asking "for how many people?" before a
+    clinic appointment is how this workflow used to give itself away.
+    """
+    DINING = "dining"            # a table: business, date, time, party size
+    APPOINTMENT = "appointment"  # a service at a time: business, service, date
+    INQUIRY = "inquiry"          # a request form with no times offered
+
+
+_REQUIRED_BY_KIND: Dict[BookingKind, tuple] = {
+    BookingKind.DINING: ("business_name", "date", "time", "party_size"),
+    BookingKind.APPOINTMENT: ("business_name", "service_type", "date"),
+    BookingKind.INQUIRY: ("business_name", "service_type"),
+}
+
+# The historical name, still the dining set — imported by workflows/__init__.py.
+ESSENTIAL_SLOTS: tuple = _REQUIRED_BY_KIND[BookingKind.DINING]
+
+
+def parse_kind(value: Any, default: BookingKind = BookingKind.DINING) -> BookingKind:
+    """Tolerant parse of a kind from a slot or an LLM field."""
+    if isinstance(value, BookingKind):
+        return value
+    try:
+        return BookingKind(str(value).strip().lower())
+    except (ValueError, AttributeError):
+        return default
+
+
+def required_slots(kind: Any) -> tuple:
+    """The slots that must be filled before this kind of booking can proceed."""
+    return _REQUIRED_BY_KIND[parse_kind(kind)]
 
 _METHOD_PHRASES: Dict[ReservationMethod, str] = {
     ReservationMethod.OPENTABLE: "They take reservations through OpenTable.",

@@ -37,3 +37,18 @@ def isolate_external_services(monkeypatch):
     for var in _EXTERNAL_SERVICE_ENV:
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_profile_store(monkeypatch, tmp_path):
+    """Point the durable user profile at a throwaway database.
+
+    `UserProfile()` otherwise opens the developer's real ~/.friday/memory.db,
+    and the form tests write to it — a test run would quietly edit the facts
+    Friday uses to fill live booking forms.
+    """
+    monkeypatch.setenv("FRIDAY_PROFILE_DB", str(tmp_path / "profile.db"))
+    # The form agent dumps a screenshot when a submission can't be confirmed;
+    # keep those out of the developer's real ~/.friday/browser-debug.
+    monkeypatch.setenv("RESERVATION_BROWSER_DEBUG_DIR", str(tmp_path / "browser-debug"))
+    yield
