@@ -33,10 +33,16 @@ responses better *for this specific user* than the vanilla local base model?
 - `curated`: hand-written probes with annotations
   (research/data/evalset/curated.yaml), categories: preference_recall, style,
   routine, correction_persistence, generic_control.
-- `harvested`: real chat prompts under a **temporal split** — an artifact
-  trained on data through day N is evaluated only on prompts from day N+1
-  onward. Weekly frozen artifacts are evaluated on the following week's
-  prompts.
+- `harvested` / `replay`: real chat prompts under a **temporal split** — an
+  artifact trained on data through day N is evaluated only on prompts from day
+  N+1 onward. Weekly frozen artifacts are evaluated on the following week's
+  prompts. These prompts carry category `harvested`: they are whatever the user
+  happened to say, so they are *not* labelled as personalization probes and
+  carry no annotations.
+- Condition 4 below is therefore measured on the **curated** split only, which
+  is the only split containing real `generic_control` probes. The curated split
+  runs weekly (`nightly --weekly`, automatic on Sundays); the replay split runs
+  nightly.
 
 ## Definition of "improved" (the pre-registered bar)
 
@@ -64,3 +70,17 @@ An arm beats base when ALL of:
 - 2026-07-19: base model switched Llama-3.1-8B-4bit → Qwen3-8B-4bit (thinking
   disabled) before any eval or training run; local judge auditor swapped
   qwen3:8b → llama3.1 to keep it a different family from the judged base.
+- 2026-08-14: eval-shape clarification, before any result was produced (the
+  study had collected no data until the ingress bug below was fixed).
+  Replay/harvested prompts are now labelled category `harvested` rather than
+  `preference_recall`, which was a fiction — they are unannotated real
+  utterances. Consequently `control_win_rate` is left blank for splits with no
+  `generic_control` probes instead of recording the neutral 0.500 that
+  `win_rate_for` returns for "no data", which would have satisfied condition 4
+  for free. Condition 4 is measured on the curated split, which runs weekly.
+  The six conditions are now evaluated in code (research/protocol.py) rather
+  than by eye. No threshold changed.
+- 2026-08-14: fixed the ingress bug that starved the study — free-chat turns
+  returned the intent router's draft reply and never reached the LLM provider,
+  so no exchange was ever recorded with a context snapshot and no shadow,
+  replay or eval could run. All data collection begins after this date.

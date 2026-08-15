@@ -160,3 +160,132 @@ def test_nightly_dry_run_selected_stages_only(store, art_dir):
                          artifacts_dir=art_dir, stages=["harvest", "report"])
     assert status["evolve"] == "skipped (not selected)"
     assert status["train"] == "skipped (not selected)"
+
+
+# ------------------------------------------------------- end-to-end dry run
+
+def _chat(store, user_text, reply_text, ts):
+    """A chat exchange complete with the snapshot replay needs."""
+    return store.record_exchange(
+        user_text, reply_text, route="chat", ts=ts,
+        model="Anthropic (claude-haiku-4-5-20251001)",
+        context_snapshot={"system_prompt": "persona", "messages": [
+            {"role": "user", "content": user_text}]},
+    )
+
+
+def test_dry_run_produces_real_output_end_to_end(store, art_dir, tmp_path):
+    """The regression harness for the whole loop.
+
+    Before this, `nightly --dry-run` printed "no chat exchanges with snapshots /
+    nothing to judge / nothing to report" and wrote nothing at all. Now it walks
+    harvest -> replay -> eval -> report with fake generation and FakeJudge, and
+    leaves eval rows, a CSV, a markdown digest and a full event trail.
+    """
+    import time as _time
+
+    now = _time.time()
+    for i in range(3):
+        _chat(store, f"question {i}", f"Answer {i}, sir.", now - 3600 + i)
+
+    status = run_nightly(store, dry_run=True, date_str="20260814",
+                         artifacts_dir=art_dir, results_dir=tmp_path / "results",
+                         stages=["harvest", "replay", "eval", "report"])
+
+    assert not any(v.startswith("FAILED") for v in status.values()), status
+
+    # Replay generated candidates for base + facts on every exchange.
+    shadow = store.query("SELECT arm, mode FROM shadow_responses")
+    assert shadow, "replay produced no candidates"
+    assert {r["mode"] for r in shadow} == {"replay"}
+    assert "base" in {r["arm"] for r in shadow}
+
+    # Eval judged them and wrote rows.
+    verdicts = store.query("SELECT arm, prompt_id, winner FROM eval_results")
+    assert verdicts, "eval judged nothing"
+    assert all(v["winner"] in ("arm", "base", "tie") for v in verdicts)
+
+    # Report wrote both artifacts.
+    csv_path = tmp_path / "results" / "eval.csv"
+    md_path = tmp_path / "results" / "nightly" / "20260814.md"
+    assert csv_path.exists(), "no eval.csv written"
+    assert md_path.exists(), "no markdown digest written"
+    assert "Split: replay" in md_path.read_text()
+
+    # And the whole run left a trail.
+    events = store.events_for_run(_last_run_id(store))
+    names = {e["event"] for e in events}
+    assert {"run.started", "run.stage_ok", "run.finished"} <= names
+    assert "replay.generated" in names
+    assert "judge.verdict" in names
+    assert "report.written" in names
+
+
+def _last_run_id(store):
+    return store.query("SELECT id FROM runs ORDER BY id DESC LIMIT 1")[0]["id"]
+
+
+def test_dry_run_emits_only_documented_events(store, art_dir, tmp_path):
+    """Guard on the taxonomy: an undocumented name breaks tooling silently."""
+    import time as _time
+
+    from research.events import KNOWN_EVENTS, STAGES, SUBJECT_TYPES
+
+    now = _time.time()
+    for i in range(3):
+        _chat(store, f"question {i}", f"Answer {i}, sir.", now - 3600 + i)
+
+    run_nightly(store, dry_run=True, date_str="20260814", artifacts_dir=art_dir,
+                results_dir=tmp_path / "results",
+                stages=["harvest", "replay", "eval", "report"])
+
+    for row in store.query("SELECT * FROM events"):
+        assert row["event"] in KNOWN_EVENTS, f"undocumented event {row['event']!r}"
+        assert row["stage"] in STAGES, f"unknown stage {row['stage']!r}"
+        assert row["subject_type"] in SUBJECT_TYPES
+
+
+def test_replay_is_capped_and_says_so(store, art_dir, monkeypatch):
+    """An uncapped replay grows without bound as the corpus does."""
+    import time as _time
+
+    from research import nightly
+
+    monkeypatch.setattr(nightly, "REPLAY_MAX_EXCHANGES", 2)
+    now = _time.time()
+    for i in range(5):
+        _chat(store, f"question {i}", f"Answer {i}, sir.", now - 3600 + i)
+
+    status = run_nightly(store, dry_run=True, date_str="20260814",
+                         artifacts_dir=art_dir, stages=["replay"])
+
+    assert "3 older exchange(s) not replayed" in status["replay"]
+    replayed = {r["exchange_id"] for r in
+                store.query("SELECT DISTINCT exchange_id FROM shadow_responses")}
+    assert len(replayed) == 2, "cap not applied"
+
+
+def test_run_lifecycle_events_record_a_stage_failure(store, art_dir, monkeypatch):
+    """A failing stage is isolated, and the trail says which one and why."""
+    from research import nightly
+
+    def boom(ctx):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(nightly, "STAGES", [("harvest", boom),
+                                            ("replay", nightly.stage_replay)])
+
+    status = run_nightly(store, dry_run=True, date_str="20260814",
+                         artifacts_dir=art_dir)
+
+    assert status["harvest"].startswith("FAILED: RuntimeError: disk on fire")
+    assert status["replay"].startswith("ok"), "later stages still run"
+
+    events = store.events_for_run(_last_run_id(store))
+    failed = [e for e in events if e["event"] == "run.stage_failed"]
+    assert len(failed) == 1
+    assert json.loads(failed[0]["detail"])["stage"] == "harvest"
+    assert "disk on fire" in json.loads(failed[0]["detail"])["message"]
+    assert json.loads(
+        [e for e in events if e["event"] == "run.finished"][0]["detail"]
+    )["failed"] == ["harvest"]

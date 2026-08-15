@@ -179,13 +179,17 @@ class LLMProvider(ABC):
         }
     
     @abstractmethod
-    def generate_response(self, user_input: str) -> str:
+    def generate_response(self, user_input: str, *,
+                         record_research: bool = True) -> str:
         """
         Generate a response to user input.
-        
+
         Args:
             user_input: What the user said
-            
+            record_research: Whether this exchange belongs in the research study.
+                False for internally synthesized prompts (e.g. workflow-failure
+                explanations) that the user never actually typed.
+
         Returns:
             The assistant's response
         """
@@ -269,8 +273,13 @@ class LLMProvider(ABC):
         self._last_augmented_prompt = augmented_prompt
         return None, augmented_prompt
 
-    def _record_exchange(self, user_input: str, response: str):
-        """Persist the exchange to the store and cache the response."""
+    def _record_exchange(self, user_input: str, response: str,
+                         *, record_research: bool = True):
+        """Persist the exchange to the store and cache the response.
+
+        record_research=False skips only the research substrate; normal
+        persistence, caching and fact extraction are unaffected.
+        """
         self.stats["llm_calls"] += 1
 
         if self.store is None:
@@ -294,7 +303,7 @@ class LLMProvider(ABC):
         # Research substrate: record the exchange with the exact context the LLM
         # saw, so the nightly replay can regenerate it fairly. Must never break
         # the user-facing reply.
-        if self.research_recorder is not None:
+        if self.research_recorder is not None and record_research:
             try:
                 snapshot = {
                     "system_prompt": self._last_augmented_prompt or self.system_prompt,
@@ -372,7 +381,8 @@ class AnthropicLLM(LLMProvider):
         import anthropic
         self._client = anthropic.Anthropic(api_key=self.api_key)
 
-    def generate_response(self, user_input: str) -> str:
+    def generate_response(self, user_input: str, *,
+                         record_research: bool = True) -> str:
         self._refresh_system_prompt()
 
         cached, augmented_prompt = self._prepare_request(user_input)
@@ -392,7 +402,8 @@ class AnthropicLLM(LLMProvider):
         assistant_message = response.content[0].text
 
         self.conversation_history.append({"role": "assistant", "content": assistant_message})
-        self._record_exchange(user_input, assistant_message)
+        self._record_exchange(user_input, assistant_message,
+                              record_research=record_research)
 
         return assistant_message
 
@@ -413,7 +424,8 @@ class OpenAILLM(LLMProvider):
         from openai import OpenAI
         self._client = OpenAI(api_key=self.api_key)
 
-    def generate_response(self, user_input: str) -> str:
+    def generate_response(self, user_input: str, *,
+                         record_research: bool = True) -> str:
         self._refresh_system_prompt()
 
         cached, augmented_prompt = self._prepare_request(user_input)
@@ -436,7 +448,8 @@ class OpenAILLM(LLMProvider):
         assistant_message = response.choices[0].message.content
 
         self.conversation_history.append({"role": "assistant", "content": assistant_message})
-        self._record_exchange(user_input, assistant_message)
+        self._record_exchange(user_input, assistant_message,
+                              record_research=record_research)
 
         return assistant_message
 
@@ -451,7 +464,8 @@ class OllamaLLM(LLMProvider):
         super().__init__(config, personality)
         self.base_url = config.ollama_base_url
     
-    def generate_response(self, user_input: str) -> str:
+    def generate_response(self, user_input: str, *,
+                         record_research: bool = True) -> str:
         import requests
 
         self._refresh_system_prompt()
@@ -484,7 +498,8 @@ class OllamaLLM(LLMProvider):
         assistant_message = result["message"]["content"]
 
         self.conversation_history.append({"role": "assistant", "content": assistant_message})
-        self._record_exchange(user_input, assistant_message)
+        self._record_exchange(user_input, assistant_message,
+                              record_research=record_research)
 
         return assistant_message
     

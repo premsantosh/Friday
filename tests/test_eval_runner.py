@@ -117,7 +117,9 @@ def test_style_checks():
 # ------------------------------------------------------------------ evalset
 
 def test_curated_evalset_loads_and_validates():
-    prompts = load_curated()
+    # allow_placeholders: the personalization probes are still FILL-IN, which
+    # load_curated refuses by default (see test_evalset.py).
+    prompts = load_curated(allow_placeholders=True)
     assert len(prompts) >= 15
     ids = [p.id for p in prompts]
     assert len(ids) == len(set(ids))

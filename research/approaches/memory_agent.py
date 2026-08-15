@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
-from research import artifacts
+from research import artifacts, provenance
 from research.db import ResearchStore
 
 logger = logging.getLogger(__name__)
@@ -138,19 +138,23 @@ class MemoryAgent:
         items = _parse_items(self._llm(_OBSERVE_PROMPT.format(transcript=transcript)))
         exchange_ids = [e["id"] for e in self.store.exchanges_since(since_ts)
                         if e["route"] == "chat"]
+        # Which turns this arm read, whether or not they yielded a memory.
+        self.store.emit_all("memory.consumed", subject_type="exchange",
+                            subject_ids=exchange_ids, arm=ARM,
+                            detail={"observations_extracted": len(items)})
         return self._insert(items, kind="observation", sources=exchange_ids)
 
     def maybe_reflect(self) -> int:
         """Synthesize reflections once REFLECT_EVERY observations accumulated
         since the last reflection."""
-        last_reflection_ts = self.store.conn.execute(
-            "SELECT COALESCE(MAX(ts), 0) FROM memories WHERE kind = 'reflection'"
-        ).fetchone()[0]
-        rows = self.store.conn.execute(
+        last_reflection_ts = self.store.query(
+            "SELECT COALESCE(MAX(ts), 0) AS ts FROM memories WHERE kind = 'reflection'"
+        )[0]["ts"]
+        rows = self.store.query(
             "SELECT id, text FROM memories WHERE kind = 'observation'"
             " AND retired = 0 AND ts > ? ORDER BY ts",
             (last_reflection_ts,),
-        ).fetchall()
+        )
         if len(rows) < REFLECT_EVERY:
             return 0
         listing = "\n".join(f"- {r['text']}" for r in rows)
@@ -161,17 +165,21 @@ class MemoryAgent:
     def _insert(self, items: list[dict], *, kind: str, sources: list[int]) -> int:
         inserted = 0
         for item in items:
-            with self.store._lock:
-                cur = self.store.conn.execute(
-                    "INSERT INTO memories (ts, kind, text, importance, source_exchange_ids)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (time.time(), kind, item["text"], item["importance"],
-                     json.dumps(sources)),
-                )
-                self.store.conn.commit()
+            memory_id = self.store.execute(
+                "INSERT INTO memories (ts, kind, text, importance, source_exchange_ids)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (time.time(), kind, item["text"], item["importance"],
+                 json.dumps(sources)),
+            )
+            self.store.emit(
+                "memory.observed" if kind == "observation" else "memory.reflected",
+                subject_type="memory", subject_id=memory_id, arm=ARM,
+                detail={"importance": item["importance"],
+                        "chars": len(item["text"]), "sources": sources},
+            )
             if self._index is not None:
                 try:
-                    self._index.add(int(cur.lastrowid), item["text"])
+                    self._index.add(memory_id, item["text"])
                 except Exception:
                     logger.warning("memory index add failed", exc_info=True)
             inserted += 1
@@ -184,10 +192,10 @@ class MemoryAgent:
         snapshot (memories that existed when that version was taken)."""
         where = "retired = 0" + (" AND id <= ?" if max_id is not None else "")
         params = (max_id,) if max_id is not None else ()
-        rows = [dict(r) for r in self.store.conn.execute(
+        rows = self.store.query(
             f"SELECT id, ts, kind, text, importance FROM memories WHERE {where}",
             params,
-        ).fetchall()]
+        )
         if not rows:
             return []
 
@@ -220,14 +228,40 @@ class MemoryAgent:
     def snapshot(self, date_str: str) -> str:
         """Dated snapshot of the memories table + pinned weights; advances
         `current`. Returns the version name."""
-        rows = [dict(r) for r in self.store.conn.execute(
-            "SELECT * FROM memories ORDER BY id").fetchall()]
+        rows = self.store.query("SELECT * FROM memories ORDER BY id")
         version_dir = artifacts.new_version(ARM, date_str, self.artifacts_dir)
+        max_memory_id = rows[-1]["id"] if rows else 0
         (version_dir / "memories.json").write_text(json.dumps(rows, indent=1))
         (version_dir / "config.json").write_text(json.dumps(
             {"weights": WEIGHTS, "observe_model": OBSERVE_MODEL,
-             "max_memory_id": rows[-1]["id"] if rows else 0}, indent=1))
+             "max_memory_id": max_memory_id}, indent=1))
+
+        source_exchanges = sorted({
+            eid for r in rows
+            for eid in json.loads(r["source_exchange_ids"] or "[]")
+        })
+        provenance.write_manifest(
+            version_dir, ARM,
+            built_ts=time.time(),
+            git_rev=provenance.git_rev(),
+            inputs={
+                "memories_total": len(rows),
+                "observations": sum(1 for r in rows if r["kind"] == "observation"),
+                "reflections": sum(1 for r in rows if r["kind"] == "reflection"),
+                "retired": sum(1 for r in rows if r["retired"]),
+                "source_exchanges": source_exchanges,
+                "max_memory_id": max_memory_id,
+            },
+            params={"weights": WEIGHTS, "observe_model": OBSERVE_MODEL},
+        )
+        version = f"{ARM}/{version_dir.name}"
+        self.store.emit("artifact.created", subject_type="artifact",
+                        subject_id=version, arm=ARM, artifact_version=version,
+                        detail={"memories": len(rows),
+                                "max_memory_id": max_memory_id})
         artifacts.advance_current(ARM, version_dir.name, self.artifacts_dir)
+        self.store.emit("artifact.advanced", subject_type="artifact",
+                        subject_id=version, arm=ARM, artifact_version=version)
         return version_dir.name
 
     def current_max_id(self) -> Optional[int]:

@@ -80,13 +80,51 @@ def test_correction_synthesis_cached_once(store, tmp_path):
     cache = tmp_path / "corrections.jsonl"
     examples = lora_pipeline.synthesize_corrections(store, cache, llm)
     assert len(examples) == 1
-    assert examples[0]["messages"][2]["content"] == "It is on Friday, sir."
+    assert examples[0]["exchange_id"] == eid
+    assert examples[0]["example"]["messages"][2]["content"] == "It is on Friday, sir."
     assert "no, it's on Friday" in calls[0]
 
     # Second build: served from cache, no second paid call.
     examples2 = lora_pipeline.synthesize_corrections(store, cache, llm)
     assert len(examples2) == 1
     assert len(calls) == 1
+
+
+def test_correction_synthesis_uses_followup_id_from_details(store, tmp_path):
+    """The miner recorded which message corrected; don't re-derive it.
+
+    Regression: the old lookup matched `user_id IS ?`, so with a NULL user_id
+    (record_chat inserts NULL) it picked the next exchange by any user, which on
+    a busy stretch is the wrong sentence entirely.
+    """
+    eid = _chat(store, "remind me about the birthday", "It is on Monday, sir.")
+    _chat(store, "unrelated question", "Indeed, sir.")
+    correcting = _chat(store, "no, it's on Friday", "Apologies, sir.")
+    store.add_feedback(eid, kind="implicit", signal=-1, source="miner:correction",
+                       details=json.dumps({"followup_id": correcting,
+                                           "opener": "no,"}))
+
+    calls = []
+    lora_pipeline.synthesize_corrections(store, tmp_path / "c.jsonl",
+                                         lambda p: (calls.append(p), "Friday, sir.")[1])
+
+    assert "no, it's on Friday" in calls[0]
+    assert "unrelated question" not in calls[0]
+
+
+def test_correction_synthesis_tolerates_legacy_details(store, tmp_path):
+    """Rows written before details became JSON must not break the build."""
+    eid = _chat(store, "remind me about the birthday", "It is on Monday, sir.")
+    _chat(store, "no, it's on Friday", "Apologies, sir.")
+    store.add_feedback(eid, kind="implicit", signal=-1, source="miner:correction",
+                       details="opener='no,'")  # old free-text format
+
+    calls = []
+    examples = lora_pipeline.synthesize_corrections(
+        store, tmp_path / "c.jsonl", lambda p: (calls.append(p), "Friday, sir.")[1])
+
+    assert len(examples) == 1
+    assert "no, it's on Friday" in calls[0]  # falls back to the next exchange
 
 
 # -------------------------------------------------------------------- dataset

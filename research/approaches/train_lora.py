@@ -17,9 +17,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
-from research import artifacts
+from research import artifacts, provenance
 from research.approaches import lora_pipeline
 from research.db import ResearchStore
 
@@ -89,7 +88,11 @@ def quality_gate(adapter_path: Path) -> tuple[bool, str]:
     from research.generate import ArmSpec, generate_candidates
     from research.style import style_score
 
-    controls = [p for p in load_curated() if p.category == "generic_control"]
+    # allow_placeholders: the gate reads only generic_control probes, which are
+    # all written. An unfilled personalization probe elsewhere in the file must
+    # not stop the forgetting canary from running.
+    controls = [p for p in load_curated(allow_placeholders=True)
+                if p.category == "generic_control"]
     responses = generate_candidates(
         controls, ArmSpec(name=ARM, adapter_path=str(adapter_path)))
     texts = [t for t in responses.values() if t]
@@ -102,12 +105,7 @@ def quality_gate(adapter_path: Path) -> tuple[bool, str]:
 
 
 def git_rev() -> str:
-    try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True,
-                              cwd=Path(__file__).parent).stdout.strip()
-    except Exception:
-        return "unknown"
+    return provenance.git_rev() or "unknown"
 
 
 def train_nightly(
@@ -129,6 +127,7 @@ def train_nightly(
         unload_ollama()
 
     version_dir = artifacts.new_version(ARM, date_str, Path(artifacts_dir))
+    version = f"{ARM}/{version_dir.name}"
     data_dir = version_dir / "data"
     corrections_cache = artifacts.arm_dir(ARM, Path(artifacts_dir)) / "corrections.jsonl"
     stats = lora_pipeline.build_dataset(
@@ -136,24 +135,68 @@ def train_nightly(
         correction_llm_fn=correction_llm_fn,
         corrections_cache=corrections_cache,
     )
+    store.emit("dataset.built", subject_type="artifact", subject_id=version,
+               arm=ARM, artifact_version=version,
+               detail={k: v for k, v in stats.items() if not isinstance(v, list)})
     if stats["n_personal"] < MIN_EXAMPLES:
         return (f"skipped: {stats['n_personal']} personal examples "
                 f"< {MIN_EXAMPLES} minimum (adapter dir {version_dir.name} left without weights)")
 
+    iters = min(MAX_ITERS, 4 * stats["n_train"])
+    store.emit("train.started", subject_type="artifact", subject_id=version,
+               arm=ARM, artifact_version=version,
+               detail={"iters": iters, "n_train": stats["n_train"],
+                       "base_model": BASE_MODEL, "free_pct": free})
+    t0 = time.monotonic()
     code = run_training(data_dir, version_dir, stats["n_train"])
+    store.emit("train.finished", subject_type="artifact", subject_id=version,
+               arm=ARM, artifact_version=version,
+               detail={"returncode": code, "seconds": round(time.monotonic() - t0, 1)})
     if code != 0:
         return f"FAILED: mlx_lm lora exit {code} (see {version_dir}/train.log)"
 
-    (version_dir / "config.json").write_text(json.dumps({
+    params = {
         "base_model": BASE_MODEL, "seed": SEED, "learning_rate": LEARNING_RATE,
-        "num_layers": NUM_LAYERS, "max_seq": MAX_SEQ,
-        "iters": min(MAX_ITERS, 4 * stats["n_train"]),
-        "git_rev": git_rev(), **stats,
-    }, indent=1))
+        "num_layers": NUM_LAYERS, "max_seq": MAX_SEQ, "iters": iters,
+        "git_rev": git_rev(),
+    }
+    (version_dir / "config.json").write_text(
+        json.dumps({**params, **{k: v for k, v in stats.items()
+                                 if not isinstance(v, list)}}, indent=1))
+    provenance.write_manifest(
+        version_dir, ARM,
+        built_ts=time.time(),
+        git_rev=params["git_rev"],
+        inputs={
+            "exchanges_included": stats.get("included_ids", []),
+            "exchanges_banked_negative": stats.get("banked_negative", []),
+            "exchanges_deferred": stats.get("deferred", []),
+            "corrections_synthesized": stats.get("correction_ids", []),
+            "replay_examples": stats.get("n_replay", 0),
+            "replay_path": str(lora_pipeline.REPLAY_PATH),
+        },
+        dataset={k: v for k, v in stats.items() if not isinstance(v, list)},
+        params=params,
+    )
+    store.emit("artifact.created", subject_type="artifact", subject_id=version,
+               arm=ARM, artifact_version=version,
+               detail={"n_train": stats["n_train"], "n_valid": stats.get("n_valid")})
 
     passed, gate_note = quality_gate(version_dir)
     if not passed:
         (version_dir / "GATED").write_text(gate_note + "\n")
+        store.emit("gate.failed", subject_type="artifact", subject_id=version,
+                   arm=ARM, artifact_version=version, detail={"note": gate_note})
+        store.emit("artifact.gated", subject_type="artifact", subject_id=version,
+                   arm=ARM, artifact_version=version,
+                   detail={"note": gate_note,
+                           "current_unchanged": artifacts.current_version(
+                               ARM, Path(artifacts_dir))})
         return f"trained but GATED (current unchanged): {gate_note}"
+    store.emit("gate.passed", subject_type="artifact", subject_id=version,
+               arm=ARM, artifact_version=version, detail={"note": gate_note})
+    previous = artifacts.current_version(ARM, Path(artifacts_dir))
     artifacts.advance_current(ARM, version_dir.name, Path(artifacts_dir))
+    store.emit("artifact.advanced", subject_type="artifact", subject_id=version,
+               arm=ARM, artifact_version=version, detail={"previous": previous})
     return f"advanced to {version_dir.name} ({stats['n_train']} train ex): {gate_note}"

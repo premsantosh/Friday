@@ -237,9 +237,6 @@ class ResearchConfig:
     # Must stay the same family as research/generate.py BASE_MODEL (the study's
     # trained/evaluated base) or the comparison is confounded.
     shadow_model: str = "qwen3:8b"
-    # Which retrieval the memory arm uses during eval: existing 'facts' store
-    # (baseline) or the new 'reflection' memory.
-    memory_arm_retrieval: str = "facts"
 
 
 @dataclass

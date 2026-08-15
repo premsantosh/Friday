@@ -40,3 +40,18 @@ def isolate_external_services(monkeypatch):
     for var in _EXTERNAL_SERVICE_ENV:
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def no_results_writes_into_the_repo(tmp_path, monkeypatch):
+    """Point research/report.py's default output at tmp_path.
+
+    The eval CSV is the study's longitudinal record. A test that forgets to pass
+    results_dir would otherwise append synthetic FakeJudge rows to the real
+    results/eval.csv, which is a quietly corrupted dataset rather than a visible
+    failure. Tests that assert on output pass results_dir explicitly.
+    """
+    from research import report
+
+    monkeypatch.setattr(report, "RESULTS_DIR", tmp_path / "repo-results")
+    yield

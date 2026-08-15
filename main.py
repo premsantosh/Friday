@@ -342,9 +342,29 @@ def _setup_research(assistant: VoiceAssistant, config: AssistantConfig,
     rc = config.research
     if not rc.enabled:
         return None
+    import logging
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
     from research.db import ResearchStore
     from research.recorder import ConversationRecorder
     from research.shadow import ShadowRunner
+
+    # Give the research tree a log file of its own. Without this its loggers have
+    # no handler in-process, so shadow/recorder failures went nowhere and the
+    # loop could starve invisibly. Scoped to the `research` logger so production
+    # logging is untouched; same directory the launchd nightly job writes to.
+    log_dir = Path(rc.artifacts_dir).expanduser() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    research_logger = logging.getLogger("research")
+    if not any(isinstance(h, RotatingFileHandler) for h in research_logger.handlers):
+        handler = RotatingFileHandler(log_dir / "live.log", maxBytes=2_000_000,
+                                      backupCount=3)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        research_logger.setLevel(logging.INFO)
+        research_logger.addHandler(handler)
+        research_logger.propagate = False
 
     store = ResearchStore(rc.db_path)
     shadow = None

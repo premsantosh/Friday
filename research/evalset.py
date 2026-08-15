@@ -21,12 +21,16 @@ from research.db import ResearchStore
 
 CURATED_PATH = Path(__file__).parent / "data" / "evalset" / "curated.yaml"
 
+# Marks an annotation only the user can write (see curated.yaml's header).
+PLACEHOLDER_MARKER = "FILL-IN"
+
 VALID_CATEGORIES = {
     "preference_recall",      # does it remember what the user likes
     "style",                  # persona compliance (brevity, tone, address)
     "routine",                # knowledge of the user's habits/schedule
     "correction_persistence", # does a past correction stick
     "generic_control",        # no personalization needed — regression canary
+    "harvested",              # a real prompt the user sent; category unknown
 }
 
 
@@ -41,10 +45,35 @@ class EvalPrompt:
     meta: dict = field(default_factory=dict)
 
 
-def load_curated(path: Path = CURATED_PATH) -> list[EvalPrompt]:
+def count_placeholders(path: Path = CURATED_PATH) -> int:
+    """How many curated probes still carry a FILL-IN annotation.
+
+    Annotations are injected verbatim into the judge rubric as known facts about
+    the user, so a placeholder does not merely fail to help — it tells the judge
+    something false. Surfaced by `research status` until they're written.
+    """
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        return 0
+    return sum(1 for item in raw.get("prompts", [])
+               if PLACEHOLDER_MARKER in str(item.get("annotations", "")))
+
+
+def load_curated(path: Path = CURATED_PATH, *,
+                 allow_placeholders: bool = False) -> list[EvalPrompt]:
+    """Curated probes, refusing placeholder annotations by default.
+
+    Annotations go verbatim into the judge rubric as "known facts about this
+    user" (research/judge.py). A FILL-IN placeholder therefore does not merely
+    fail to help — it tells the judge that a known fact about the user is the
+    string "FILL-IN: your actual coffee order", and every verdict on that probe
+    is noise dressed as a measurement. Refusing beats warning.
+    """
     raw = yaml.safe_load(path.read_text())
     prompts = []
     seen_ids = set()
+    placeholders = []
     for item in raw["prompts"]:
         pid = str(item["id"])
         if pid in seen_ids:
@@ -53,12 +82,20 @@ def load_curated(path: Path = CURATED_PATH) -> list[EvalPrompt]:
         category = item["category"]
         if category not in VALID_CATEGORIES:
             raise ValueError(f"unknown category {category!r} for prompt {pid}")
+        annotations = item.get("annotations", "")
+        if PLACEHOLDER_MARKER in str(annotations):
+            placeholders.append(pid)
         prompts.append(EvalPrompt(
             id=pid,
             prompt=item["prompt"],
             category=category,
-            annotations=item.get("annotations", ""),
+            annotations=annotations,
         ))
+    if placeholders and not allow_placeholders:
+        raise ValueError(
+            f"{len(placeholders)} curated probe(s) still have {PLACEHOLDER_MARKER} "
+            f"annotations: {', '.join(placeholders)}. Fill them in "
+            f"({path}) or pass allow_placeholders=True for a smoke run.")
     return prompts
 
 
@@ -69,16 +106,18 @@ def load_harvested(store: ResearchStore, *, after_ts: float,
     Only route='chat' exchanges qualify — workflow commands ("lights on") are
     not free-conversation and their replies aren't comparable across arms.
     """
-    rows = store.conn.execute(
+    rows = store.query(
         "SELECT id, ts, user_text FROM exchanges"
         " WHERE route = 'chat' AND ts > ? ORDER BY ts LIMIT ?",
         (after_ts, limit),
-    ).fetchall()
+    )
     return [
         EvalPrompt(
             id=f"harvest-{r['id']}",
             prompt=r["user_text"],
-            category="preference_recall",
+            # Whatever the user happened to say. Labelling it a personalization
+            # probe would put a fiction into the results.
+            category="harvested",
             source="harvested",
             ts=r["ts"],
             meta={"exchange_id": r["id"]},

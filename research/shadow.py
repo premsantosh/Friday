@@ -3,7 +3,11 @@
 The production reply (Haiku) has already been sent by the time a job lands
 here; this only generates the local model's answer for later evaluation. It
 must therefore never block or surface an error into the user-facing path:
-enqueue drops on overflow, the worker swallows every exception at debug level.
+enqueue drops on overflow and the worker swallows every exception.
+
+Swallowed is not the same as hidden. Every drop and every failure is logged at
+warning level and recorded as an event, so `research trace --exchange N` shows
+why a shadow row is missing instead of showing nothing at all.
 """
 
 from __future__ import annotations
@@ -66,9 +70,15 @@ class ShadowRunner:
         """Queue an exchange for shadow generation. Drops when full."""
         try:
             self._queue.put_nowait(exchange_id)
+            self.store.emit("shadow.enqueued", subject_type="exchange",
+                            subject_id=exchange_id, arm="base",
+                            detail={"queue_depth": self._queue.qsize()})
             return True
         except queue.Full:
-            logger.debug("Shadow queue full — dropping exchange %s", exchange_id)
+            logger.warning("Shadow queue full — dropping exchange %s", exchange_id)
+            self.store.emit("shadow.dropped", subject_type="exchange",
+                            subject_id=exchange_id, arm="base",
+                            detail={"reason": "queue_full"})
             return False
 
     # ------------------------------------------------------------- internals
@@ -79,15 +89,30 @@ class ShadowRunner:
                 return
             try:
                 self._process(job)
-            except Exception:
-                logger.debug("Shadow generation failed for exchange %s", job, exc_info=True)
+            except Exception as e:
+                logger.warning("Shadow generation failed for exchange %s: %s: %s",
+                               job, type(e).__name__, e, exc_info=True)
+                self.store.emit("shadow.failed", subject_type="exchange",
+                                subject_id=job, arm="base",
+                                detail={"error": type(e).__name__,
+                                        "message": str(e)[:200]})
 
     def _process(self, exchange_id: int) -> None:
         exchange = self.store.get_exchange(exchange_id)
         if exchange is None:
+            self.store.emit("shadow.failed", subject_type="exchange",
+                            subject_id=exchange_id, arm="base",
+                            detail={"error": "no_such_exchange"})
             return
         snapshot = exchange.get("context_snapshot")
         if not snapshot:
+            # The starvation signature: a chat turn recorded without the context
+            # the LLM actually saw cannot be replayed by any arm.
+            logger.warning("Exchange %s has no context snapshot — skipping shadow",
+                           exchange_id)
+            self.store.emit("shadow.failed", subject_type="exchange",
+                            subject_id=exchange_id, arm="base",
+                            detail={"error": "no_snapshot"})
             return
         messages = [{"role": "system", "content": snapshot.get("system_prompt", "")}]
         messages.extend(snapshot.get("messages", []))
@@ -109,10 +134,20 @@ class ShadowRunner:
         )
         status = int(getattr(resp, "status_code", 200))
         if not (200 <= status < 300):
-            logger.debug("Shadow Ollama call returned HTTP %s", status)
+            logger.warning("Shadow Ollama call returned HTTP %s for exchange %s",
+                           status, exchange_id)
+            self.store.emit("shadow.failed", subject_type="exchange",
+                            subject_id=exchange_id, arm="base",
+                            detail={"error": "http_status", "status": status})
             return
         text = strip_think((resp.json().get("message") or {}).get("content", ""))
         if not text:
+            logger.warning("Shadow generation returned empty text for exchange %s",
+                           exchange_id)
+            self.store.emit("shadow.failed", subject_type="exchange",
+                            subject_id=exchange_id, arm="base",
+                            detail={"error": "empty_response",
+                                    "model_tag": self.model_tag})
             return
         self.store.add_shadow_response(
             exchange_id,

@@ -49,6 +49,24 @@ def test_record_turn_alone_inserts_workflow_exchange(store, recorder):
     assert store.counts()["exchanges"] == 1
 
 
+def test_workflow_failure_banks_an_implicit_negative(store, recorder):
+    eid = recorder.record_turn("turn on the lights", "The bridge is offline, sir.",
+                               route="keyword:philips_hue", user_id="555",
+                               outcome="failure")
+    rows = store.feedback_for(eid)
+    assert len(rows) == 1
+    assert (rows[0]["kind"], rows[0]["signal"], rows[0]["source"]) == \
+        ("implicit", -1, "workflow_failure")
+
+
+def test_workflow_success_banks_nothing(store, recorder):
+    """Successful routing says nothing about reply quality — not a +1."""
+    eid = recorder.record_turn("turn on the lights", "Done, sir.",
+                               route="keyword:philips_hue", user_id="555",
+                               outcome="success")
+    assert store.feedback_for(eid) == []
+
+
 def test_shadow_enqueued_on_chat_record(store):
     enqueued = []
 

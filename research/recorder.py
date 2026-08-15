@@ -86,8 +86,16 @@ class ConversationRecorder:
         latency_ms: Optional[int] = None,
         user_id: str = "default",
         channel: Optional[str] = None,
+        outcome: Optional[str] = None,
     ) -> int:
-        """Called by the assistant after every processed input."""
+        """Called by the assistant after every processed input.
+
+        `outcome` is "success"/"failure" for workflow routes. A failure is a
+        free, high-precision negative signal, so it is banked as implicit
+        feedback. Success is deliberately not banked as a positive: it says the
+        routing was right, not that the reply was any good, and treating it as
+        +1 would flood the corpus with meaningless approval.
+        """
         now = time.monotonic()
         with self._lock:
             last = self._last_chat
@@ -115,6 +123,14 @@ class ConversationRecorder:
         if is_chat:
             with self._lock:
                 self._last_for_user[user_id] = (exchange_id, now)
+        if outcome == "failure":
+            self.store.add_feedback(
+                exchange_id,
+                kind="implicit",
+                signal=-1,
+                source="workflow_failure",
+                details=json.dumps({"route": route}),
+            )
         return exchange_id
 
     # -------------------------------------------------------------- feedback

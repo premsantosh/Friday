@@ -149,9 +149,11 @@ class VoiceAssistant:
         self.on_error: Optional[Callable[[str], None]] = None
 
         # Research substrate (see research/): set externally from main.py when
-        # FRIDAY_RESEARCH=1. last_route records which pipeline step answered.
+        # FRIDAY_RESEARCH=1. last_route records which pipeline step answered and
+        # last_outcome whether the workflow it ran succeeded.
         self.research_recorder = None
         self.last_route: Optional[str] = None
+        self.last_outcome: Optional[str] = None  # "success" | "failure" | None
     
     def _set_state(self, state: AssistantState):
         """Update state and notify callback."""
@@ -184,7 +186,11 @@ class VoiceAssistant:
             f"The {workflow_name} system responded with an error: "
             f"{result.error or result.message}"
         )
-        return self.llm.generate_response(failure_context)
+        # record_research=False: the prompt above is synthetic, so recording it
+        # would put a sentence the user never said into the study's corpus and
+        # from there into the eval split and the SFT dataset.
+        self.last_outcome = "failure"
+        return self.llm.generate_response(failure_context, record_research=False)
 
     async def process_input(self, text: str, user_id: str = "default",
                             channel: Optional[str] = None) -> str:
@@ -195,6 +201,7 @@ class VoiceAssistant:
         recorder call must never affect the reply.
         """
         self.last_route = None
+        self.last_outcome = None
         start = time.monotonic()
         reply = await self._process_input_inner(text, user_id)
         if self.research_recorder is not None:
@@ -206,6 +213,7 @@ class VoiceAssistant:
                     latency_ms=int((time.monotonic() - start) * 1000),
                     user_id=user_id,
                     channel=channel,
+                    outcome=self.last_outcome,
                 )
             except Exception:
                 self._log("Research recorder failed for turn.")
@@ -250,6 +258,7 @@ class VoiceAssistant:
                 return started
             result = await matching_workflow.execute(text, {})
             if result.status == WorkflowStatus.SUCCESS:
+                self.last_outcome = "success"
                 self.context.update(matching_workflow.name, {}, text)
                 return result.message
             elif result.status == WorkflowStatus.FAILURE:
@@ -270,6 +279,7 @@ class VoiceAssistant:
                         return started
                     result = await workflow.execute(text, entities)
                     if result.status == WorkflowStatus.SUCCESS:
+                        self.last_outcome = "success"
                         self.context.update(workflow_name, entities, text)
                         return result.message
                     elif result.status == WorkflowStatus.FAILURE:
@@ -289,6 +299,7 @@ class VoiceAssistant:
                     return started
                 result = await workflow.execute(text, route.entities)
                 if result.status == WorkflowStatus.SUCCESS:
+                    self.last_outcome = "success"
                     # Only cache routes decided from the raw utterance. When the
                     # router saw context-enriched text (enriched != text), the
                     # decision may reflect transient prior-turn context — caching
@@ -303,9 +314,16 @@ class VoiceAssistant:
                     return self._handle_workflow_failure(text, route.workflow_name, result)
                 return result.message
 
-        # No workflow matched — use Claude's conversational response or fall back
+        # No workflow matched — answer conversationally.
+        #
+        # This must go through the LLM provider, never a reply drafted by the
+        # router. The router runs a bare classifier prompt: no personality, no
+        # conversation history, no remembered facts, no search. Short-circuiting
+        # on its draft made every free-chat turn sound like a help menu, and it
+        # also bypassed the provider's exchange recording, which is the only
+        # place the research substrate captures the context snapshot.
         self.last_route = "chat"
-        return route.response or self.llm.generate_response(text)
+        return self.llm.generate_response(text)
     
     def speak(self, text: str):
         """
