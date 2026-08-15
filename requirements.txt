@@ -35,6 +35,10 @@ pvporcupine>=3.0.0
 # Home Assistant Integration (optional)
 aiohttp>=3.9.0
 
+# Voice PE satellites — ESPHome native API client (core/voice_pe_channel.py).
+# Needs Python >= 3.11. Imports are guarded, so Friday runs without it.
+aioesphomeapi>=45.6.2,<46
+
 # Utilities
 python-dotenv>=1.0.0
 # Harness slot normalization (deterministic date parsing; core/harness/normalize.py)

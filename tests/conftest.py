@@ -21,6 +21,8 @@ import pytest
 _EXTERNAL_SERVICE_ENV = (
     # Telegram bot channel + reservation notifier
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_IDS", "TELEGRAM_NOTIFY_CHAT_ID",
+    # Voice PE satellite devices (ESPHome native API connections)
+    "VOICE_PE_DEVICES", "VOICE_PE_NOISE_PSK",
     # Google Calendar service-account inserter
     "GOOGLE_APPLICATION_CREDENTIALS",
     # Bland.ai autonomous phone calls
