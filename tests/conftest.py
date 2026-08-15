@@ -30,6 +30,9 @@ _EXTERNAL_SERVICE_ENV = (
     # Outbound email (SMTP) + reply polling (IMAP)
     "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "RESERVATION_EMAIL_FROM",
     "IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD",
+    # TableCheck watcher: a developer's endpoint override would change the URLs
+    # the fixture-driven channel tests assert on.
+    "TABLECHECK_AVAILABILITY_URL",
 )
 
 

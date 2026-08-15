@@ -114,6 +114,13 @@ class VoiceAssistant:
                 default_timeout_s=conv_cfg.default_session_timeout_s,
                 context=self.context,
             )
+            # Workflows that manage their own WAITING sessions across new turns
+            # (e.g. the reservation watcher's "stop watching" / "any luck")
+            # need the shared store — WAITING sessions never take a user turn
+            # directly, so control verbs reach them through the store.
+            for wf in self.workflows.workflows.values():
+                if hasattr(wf, "session_store") and wf.session_store is None:
+                    wf.session_store = session_store
             # Drives WAITING sessions + expiry sweep; started in run(), stopped in stop().
             # Not started for ephemeral one-shot interactions (--test / --chat).
             self.background_runner: Optional[BackgroundTaskRunner] = (

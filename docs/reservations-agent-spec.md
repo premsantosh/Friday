@@ -591,6 +591,49 @@ deps in `requirements.txt` (`playwright`, `docker`; HTTP for Bland.ai/Yelp/Teleg
    booking isn't reliably solvable or fully safe — the harness runs best-effort and hands off when
    it can't confirm; live container execution is unverified here.
 
+8. **M8 — TableCheck standing watch.** ✅ **Done.** A notify-only, multi-criteria availability
+   watcher for venues on TableCheck (driving case: Bar BenFiddich, `benfiddich-tokyo`), built
+   on the existing session/runner machinery — no new process, no new store.
+   - **Channel** (`channels/tablecheck.py`): pure-HTTP `TableCheckChannel` (aiohttp, no
+     browser/login) — the first channel whose `check_availability` returns concrete
+     AVAILABLE/UNAVAILABLE, which also makes the M6 wait-and-book path live for TableCheck
+     bookings. `fetch_month(slug, party_size, month)` is the watcher's polling primitive
+     (TableCheck availability is party-size-dependent, so each distinct party size is its own
+     fetch unit). `commit()` is a safe hand-off with a reserve-page deep link (no auto-booking).
+     The endpoint template is env-overridable (`TABLECHECK_AVAILABILITY_URL`) and responses are
+     strictly schema-validated — an unrecognised shape raises `SchemaDrift`, which **pauses the
+     watch and alerts** instead of silently reporting "no availability" (endpoint drift is the
+     #1 failure mode; fixtures in `tests/fixtures/tablecheck/` make re-adaptation fast).
+     ⚠️ The default endpoint/params encode the documented web_booking pattern and still need
+     one manual verification against live widget devtools traffic before production reliance.
+   - **Pure core** (`watcher.py`): `WatchCriterion` (date range × acceptable times × party
+     size, independent lifecycle: active/fulfilled/expired), fetch-unit planning, the snapshot
+     differ (`slot_opened/closed`, `calendar_published`, `venue_halted/resumed`; first snapshot
+     is a baseline), the event×criteria matcher, and conversational date-range/time parsing.
+     Side-effect-free, like `snipe.py`.
+   - **Workflow**: "Watch BenFiddich for September 5th or 6th at 7 or 9pm for 2" →
+     gather → `confirm_watchlist` gate → `watching_list` (WAITING). `_tick_watchlist` polls
+     each fetch unit (≥`TABLECHECK_UNIT_SPACING_SECONDS` apart), diffs against the last
+     snapshot (kept in `session.scratch`), and Telegram-notifies matches with a booking deep
+     link (30-min dedupe per slot; close→reopen re-notifies; one summary on calendar-publish
+     day instead of per-slot spam). Cadence: normal 300s ± jitter, hourly idle while the
+     calendar is closed, 60s burst around a known drop; hard floor 60s; exponential backoff on
+     429/5xx with an alert after 3 consecutive failures. Criteria auto-expire venue-local.
+   - **Release-time research**: when the calendar isn't published and no drop time is known,
+     the watch reuses `resolve_release_policy` (web + Reddit + LLM, M-snipe Phase 2) once per
+     watch, converts a credible policy (≥ `RESERVATION_SNIPE_MIN_CONFIDENCE`) into a burst
+     window via `compute_release_fire_ts`, self-schedules it, and tells the user what it found;
+     a user-stated policy ("they open 25 days out at 9am JST") does the same at confirmation.
+   - **Control verbs**: WAITING sessions never take a user turn, so "stop watching X" /
+     "any luck with the watch?" / "we got the table" arrive as new turns and act on standing
+     watches **through the shared session store** (injected by the assistant); a second
+     "watch <same venue>" ask folds new criteria into the existing watch session.
+   Tested end-to-end with a fixture-driven fake fetcher: gather/confirm/decline, non-TableCheck
+   refusal, baseline + notify + dedupe + reopen, unmatched-slot silence, multi-party fetch
+   units, backoff + drift-pause, halted/resumed, publish summary, research → burst scheduling,
+   low-confidence idling, manual policy, publish-beats-prediction, and all control verbs
+   (`tests/test_watcher.py`, `tests/test_tablecheck.py`).
+
 Each milestone is independently shippable and gated behind env vars, so partial rollout never
 destabilizes existing Friday behaviour.
 

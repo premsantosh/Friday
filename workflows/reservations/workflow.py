@@ -20,10 +20,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..base import ConversationalWorkflow, WorkflowTrigger
 from core.conversation.session import Session, TurnResult
@@ -49,6 +50,7 @@ from core.harness import (
 from .calendar import CalendarService
 from .channels import AvailabilityStatus, CommitPlan, kill_switch_on
 from .channels.sandbox_bot import BotCandidate, SandboxBotChannel
+from .channels.tablecheck import SchemaDrift, TableCheckError, slug_from_url
 from .channels.email import EMAIL_POLL_SECONDS
 from .channels.phone import POLL_SECONDS, RETRY_DELAY_SECONDS, PhoneOutcome
 from .discovery import BusinessDiscovery
@@ -71,6 +73,17 @@ from .snipe import (
     describe_fire,
     resolve_timezone,
     timezone_for_location,
+)
+from .watcher import (
+    WatchCriterion,
+    dedupe_key,
+    diff_states,
+    expire_criteria,
+    fetch_units,
+    open_dates,
+    parse_date_range,
+    parse_times,
+    relevant_open_dates,
 )
 
 _UNSET = object()
@@ -97,14 +110,16 @@ RESERVATION_MACHINE = Machine(
         "confirm_wait",     # offer to watch for an opening
         "confirm_snipe",    # approve a scheduled snipe at the release time
         "confirm_sandbox",  # repo-named consent gate for untrusted code
+        "confirm_watchlist",  # approve a standing multi-criteria availability watch
         "calling",          # WAITING: call placed/deferred, polling Bland
         "awaiting_reply",   # WAITING: email sent, polling the thread
         "watching",         # WAITING: re-checking availability
+        "watching_list",    # WAITING: standing watch, notify-only (no auto-book)
         "scheduled",        # WAITING: parked until the reservation window opens
     }),
     initial="start",
     gate_states=frozenset({"confirm", "confirm_email", "confirm_wait",
-                           "confirm_snipe", "confirm_sandbox"}),
+                           "confirm_snipe", "confirm_sandbox", "confirm_watchlist"}),
     transitions={
         ("start", "need_slot"): "collecting",
         ("start", "need_fact"): "collecting_facts",
@@ -124,6 +139,9 @@ RESERVATION_MACHINE = Machine(
         ("collecting_facts", "gate_email"): "confirm_email",
         ("collecting_facts", "offer_wait"): "confirm_wait",
         ("collecting_facts", "gate_snipe"): "confirm_snipe",
+        ("start", "gate_watchlist"): "confirm_watchlist",
+        ("collecting", "gate_watchlist"): "confirm_watchlist",
+        ("confirm_watchlist", "watch_list"): "watching_list",
         ("confirm", "call_started"): "calling",
         ("confirm", "offer_sandbox"): "confirm_sandbox",
         ("confirm_wait", "watch"): "watching",
@@ -176,7 +194,32 @@ _APPOINTMENT_RE = re.compile(rf"\b({_APPOINTMENT_WORDS})\b", re.I)
 _RELEASE_DAYS_RE = re.compile(
     r"\b(\d{1,3})\s*days?\s*(?:in advance|ahead|before|out|prior|early)\b", re.I)
 _RELEASE_CTX_RE = re.compile(r"(?:open|drop|release|go live|available|bookable)\w*", re.I)
-_RELEASE_TZ_RE = re.compile(r"\b(ET|EST|EDT|CT|CST|CDT|MT|MST|MDT|PT|PST|PDT|GMT|UTC)\b")
+_RELEASE_TZ_RE = re.compile(
+    r"\b(ET|EST|EDT|CT|CST|CDT|MT|MST|MDT|PT|PST|PDT|GMT|UTC|JST)\b")
+
+# Standing availability watch (M8): "watch BenFiddich for cancellations Sep 4-12".
+_WATCH_ADD_RE = re.compile(
+    r"\b(?:watch|keep (?:an eye|watch(?:ing)?|checking)|monitor)\b"
+    r"|\blet me know (?:if|when|the moment)\b.{0,50}"
+    r"\b(?:opens?|frees? up|available|cancell?ation)", re.I)
+_WATCH_STOP_RE = re.compile(
+    r"\bstop (?:watching|the watch)\b|\bcall off the watch\b|\bcancel the watch\b", re.I)
+_WATCH_STATUS_RE = re.compile(
+    r"\bany luck\b|\bwatch(?:es)? status\b|\bstatus of (?:the |my )?watch(?:es)?\b"
+    r"|\bhow(?:'s| is| are) (?:the |my )?watch(?:es)? (?:going|doing)\b", re.I)
+_WATCH_FULFILLED_RE = re.compile(
+    r"\b(?:got|we got|i got|grabbed|snagged|booked)\b.{0,30}"
+    r"\b(?:table|reservation|spot|seat)\b"
+    r"|\bmark (?:it |that )?(?:booked|fulfilled|done)\b", re.I)
+_MONTH_TOKEN = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+_WATCH_RANGE_RE = re.compile(
+    rf"\b({_MONTH_TOKEN}\s+\d{{1,2}}(?:st|nd|rd|th)?|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?)"
+    rf"\s*(?:to|through|thru|until|[-–—])\s*"
+    rf"((?:{_MONTH_TOKEN}\s+)?\d{{1,2}}(?:st|nd|rd|th)?|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?)\b",
+    re.I)
+_WATCH_SINGLE_DATE_RE = re.compile(
+    rf"\b({_MONTH_TOKEN}\s+\d{{1,2}}(?:st|nd|rd|th)?|\d{{1,2}}/\d{{1,2}}(?:/\d{{2,4}})?)\b",
+    re.I)
 
 
 class ReservationWorkflow(ConversationalWorkflow):
@@ -213,7 +256,8 @@ class ReservationWorkflow(ConversationalWorkflow):
                  sandbox: Optional[SandboxBotChannel] = None,
                  gate: Optional[ActionGate] = None,
                  profile: Any = _UNSET,
-                 llm: Any = _UNSET):
+                 llm: Any = _UNSET,
+                 session_store: Any = None):
         # Sentinel: llm=None explicitly disables LLM refinement (tests); omitting
         # it wires the real one from the environment.
         self.llm = ReservationLLM.from_env() if llm is _UNSET else llm
@@ -258,6 +302,20 @@ class ReservationWorkflow(ConversationalWorkflow):
         self._snipe_autodetect_min_days = float(
             os.getenv("RESERVATION_SNIPE_AUTODETECT_MIN_DAYS", "14"))
         self._snipe_min_confidence = float(os.getenv("RESERVATION_SNIPE_MIN_CONFIDENCE", "0.4"))
+        # Standing availability watch (M8). The store is how control verbs
+        # ("stop watching", "got the table") reach WAITING watch sessions —
+        # injected by the assistant after the SessionManager exists; None means
+        # control verbs degrade to "I'm not watching anything".
+        self.session_store = session_store
+        self._tc_watch_interval_s = max(60, int(
+            os.getenv("TABLECHECK_WATCH_INTERVAL_SECONDS", "300")))
+        self._tc_watch_idle_s = max(300, int(
+            os.getenv("TABLECHECK_WATCH_IDLE_INTERVAL_SECONDS", "3600")))
+        self._tc_burst_s = max(60, int(os.getenv("TABLECHECK_WATCH_BURST_SECONDS", "60")))
+        self._tc_burst_tail_s = float(os.getenv("TABLECHECK_BURST_TAIL_SECONDS", "3600"))
+        self._tc_unit_spacing_s = float(os.getenv("TABLECHECK_UNIT_SPACING_SECONDS", "5"))
+        self._tc_dedupe_s = 1800.0
+        self._tc_max_backoff_s = 1800.0
 
     @property
     def profile(self):
@@ -293,12 +351,18 @@ class ReservationWorkflow(ConversationalWorkflow):
                 "reservation", "reserve", "book a table", "book a reservation",
                 "make a booking", "make a reservation", "appointment",
                 "book an appointment", "consultation", "book a consultation",
+                "keep an eye on", "stop watching", "any luck",
             ],
             patterns=[
                 rf"\b{verbs}\b.{{0,30}}\b(table|reservation|booking|{_APPOINTMENT_WORDS})\b",
                 r"\bmake (?:me )?(?:a |an )?(reservation|booking|appointment)\b",
                 # "book me in at https://…" — a pasted booking page plus a verb.
                 rf"\b{verbs}\b.{{0,40}}https?://",
+                # Standing availability watch (M8).
+                r"\b(watch|monitor|keep checking)\b.{0,60}"
+                r"\b(table|reservation|availability|opening|cancell?ations?|spot)\b",
+                r"\blet me know\b.{0,50}\b(opens?|frees? up|available|cancell?ation)\b",
+                r"\bwatch\b.{0,40}\bfor (?:me|us|cancell?ations?|openings?)\b",
             ],
             examples=[
                 "Book me a table for 2 at Lazy Bear next Friday at 7pm",
@@ -307,11 +371,21 @@ class ReservationWorkflow(ConversationalWorkflow):
                 "Book me a consultation at Back on Track Physical Therapy in Pleasanton",
                 "Schedule a physio session next week",
                 "Get me an estimate from that plumber at https://example.com/contact",
+                "Watch BenFiddich for September 5th or 6th at 7 or 9pm for 2",
+                "Keep an eye on Bar BenFiddich for cancellations Sept 4 to 12",
+                "Any luck with the BenFiddich watch?",
+                "Stop watching BenFiddich",
             ],
         )
 
     # --------------------------------------------------------------- dialogue
     async def start(self, intent: str, entities: Dict[str, Any], session: Session) -> TurnResult:
+        # Standing-watch turns (add / status / stop / fulfilled) never enter the
+        # booking flow — they either manage existing WAITING watch sessions or
+        # start gathering criteria for a new one.
+        watch_turn = await self._maybe_watch_turn(intent or "", session)
+        if watch_turn is not None:
+            return watch_turn
         try:
             # Off the event loop: extraction may make an LLM call.
             extracted = await asyncio.to_thread(self._extract_slots, intent)
@@ -374,6 +448,7 @@ class ReservationWorkflow(ConversationalWorkflow):
             "confirm_wait": self._handle_wait_confirmation,
             "confirm_snipe": self._handle_snipe_confirmation,
             "confirm_sandbox": self._handle_sandbox_consent,
+            "confirm_watchlist": self._handle_watchlist_confirmation,
         }.get(session.fsm_state)
         if handler is None:
             return TurnResult.complete("Very good, sir.")
@@ -386,6 +461,14 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     async def _handle_collect(self, text: str, session: Session) -> TurnResult:
         slot = session.slots.get("_pending_slot") or ""
+        if slot == "watch_dates":
+            rng = parse_date_range(text)
+            if rng is None:
+                return TurnResult.ask(
+                    "I couldn't make out the dates, sir — something like "
+                    "\"September 5 to 6\" or a single date?",
+                    next_state=self._fire(session, "need_slot"))
+            return await self._advance_watch(session, {"watch_ranges": [list(rng)]})
         spec = SLOT_SPECS_BY_NAME.get(slot)
         if spec is None:
             return await self._advance(session, {})
@@ -395,6 +478,8 @@ class ReservationWorkflow(ConversationalWorkflow):
             # rather than store a raw string downstream code would guess at.
             return TurnResult.ask(spec.reask,
                                   next_state=self._fire(session, "need_slot"))
+        if session.slots.get("_watch_mode"):
+            return await self._advance_watch(session, {slot: value})
         return await self._advance(session, {slot: value})
 
     def _fire(self, session: Session, event: str) -> str:
@@ -892,6 +977,564 @@ class ReservationWorkflow(ConversationalWorkflow):
         except Exception:
             logger.warning("Snipe Telegram notification failed", exc_info=True)
 
+    # ------------------------------------------------- standing watch (M8)
+    _WATCH_BIZ_RE = re.compile(
+        r"\b(?:watch|keep an eye on|keep watching|keep checking|monitor)\s+"
+        r"([A-Za-z][\w'&.\- ]*?)"
+        r"(?=\s+(?:for|on|at|from|between|next|this|tomorrow|today|in)\b|[?.!,]|$)",
+        re.I)
+    _WATCH_LABEL_RE = re.compile(r"['\"]([^'\"]{2,40})['\"]")
+    _WATCH_EXTRA_DAY_RE = re.compile(r"\b(?:or|and|,)\s+(\d{1,2})(?:st|nd|rd|th)\b", re.I)
+
+    async def _maybe_watch_turn(self, text: str, session: Session) -> Optional[TurnResult]:
+        """Route watch verbs. Order matters: control phrases contain the word
+        'watch' too, so they must win over the add-a-watch match."""
+        if _WATCH_STOP_RE.search(text):
+            return self._watch_stop(text, session)
+        if _WATCH_STATUS_RE.search(text):
+            return self._watch_status(session)
+        if _WATCH_FULFILLED_RE.search(text):
+            return self._watch_fulfilled(text, session)
+        if not _WATCH_ADD_RE.search(text):
+            return None
+        extracted = self._extract_watch_request(text)
+        extracted["raw_request"] = text
+        return await self._advance_watch(session, extracted)
+
+    def _extract_watch_request(self, text: str) -> Dict[str, Any]:
+        """Watch criteria from the opening request: venue, date range(s),
+        acceptable times, party size, optional label and stated release policy."""
+        slots: Dict[str, Any] = {}
+        work = text
+        m = _URL_RE.search(work)
+        if m:
+            slots["target_url"] = m.group(0).rstrip(".,)")
+            work = _URL_RE.sub(" ", work)
+
+        m = self._WATCH_BIZ_RE.search(work) or _BUSINESS_RE.search(work)
+        if m:
+            name = m.group(1).strip(" .,'\"").strip()
+            lowered = name.lower()
+            is_filler = (lowered in _BUSINESS_STOPWORDS or lowered.startswith("for ")
+                         or any(w in lowered for w in ("reservation", "booking",
+                                                       "cancellation", "table", "opening"))
+                         or len(lowered) < 2)
+            if name and not is_filler:
+                slots["business_name"] = name
+
+        m = self._WATCH_LABEL_RE.search(work)
+        if m:
+            slots["watch_label"] = m.group(1)
+
+        # A stated release policy ("the September calendar drops 30 days out at
+        # 9am JST") is parsed off the tail so its clock time isn't read as a
+        # dining time.
+        self._extract_release_policy_regex(work, slots)
+        release_cut = work
+        kw = _RELEASE_DAYS_RE.search(work)
+        if kw:
+            release_cut = work[:kw.start()]
+
+        ranges: List[List[str]] = []
+        date_free = release_cut
+        m = _WATCH_RANGE_RE.search(release_cut)
+        if m:
+            rng = parse_date_range(f"{m.group(1)} to {m.group(2)}")
+            if rng:
+                ranges.append(list(rng))
+                date_free = release_cut[:m.start()] + " " + release_cut[m.end():]
+        else:
+            sm = _WATCH_SINGLE_DATE_RE.search(release_cut) or _DATE_RE.search(release_cut)
+            if sm:
+                rng = parse_date_range(sm.group(0))
+                if rng:
+                    ranges.append(list(rng))
+                    date_free = release_cut[:sm.start()] + " " + release_cut[sm.end():]
+                    # "September 5th or 6th": ordinal continuations borrow the
+                    # first date's month (ordinal-only, so times/party never match).
+                    for extra in self._WATCH_EXTRA_DAY_RE.findall(
+                            release_cut[sm.end():sm.end() + 40]):
+                        day = f"{rng[0][:8]}{int(extra):02d}"
+                        try:
+                            datetime.strptime(day, "%Y-%m-%d")
+                            ranges.append([day, day])
+                        except ValueError:
+                            pass
+        if ranges:
+            slots["watch_ranges"] = ranges
+
+        # Party size and times are read off the date-free text so "for 9/20"
+        # (a date) is never mistaken for a party of nine.
+        m = _PARTY_RE.search(date_free)
+        if m:
+            slots["party_size"] = int(m.group(1) or m.group(2))
+
+        times = parse_times(date_free)
+        if times:
+            slots["watch_times"] = times
+        return slots
+
+    async def _advance_watch(self, session: Session, slots_update: Dict[str, Any]) -> TurnResult:
+        """Slot loop for a standing watch: venue → dates → party size, then the
+        confirmation gate. Mirrors _advance, but never books anything."""
+        merged = {**session.slots, **(slots_update or {})}
+        update = {**(slots_update or {}), "_watch_mode": True}
+
+        if not (merged.get("business_name") or merged.get("target_url")):
+            return TurnResult.ask(
+                "Which establishment shall I watch, sir?",
+                slots_update={**update, "_pending_slot": "business_name"},
+                next_state=self._fire(session, "need_slot"))
+        if not merged.get("watch_ranges"):
+            return TurnResult.ask(
+                "For which dates, sir — a single date or a range?",
+                slots_update={**update, "_pending_slot": "watch_dates"},
+                next_state=self._fire(session, "need_slot"))
+        if not merged.get("party_size"):
+            return TurnResult.ask(
+                SLOT_PROMPTS["party_size"],
+                slots_update={**update, "_pending_slot": "party_size"},
+                next_state=self._fire(session, "need_slot"))
+
+        biz = merged.get("business_name") or "the venue"
+        try:
+            decision = await asyncio.to_thread(
+                self.discovery.discover, biz, merged.get("location"),
+                merged.get("target_url"), BookingKind.DINING.value)
+        except EgressViolation:
+            return TurnResult.complete(
+                "I stopped that lookup, sir — it was about to include something "
+                "it shouldn't. Could you give me just the venue name and city?")
+        biz = decision.business_name or biz
+        slug = slug_from_url(decision.url) or slug_from_url(merged.get("target_url"))
+        if decision.method is not ReservationMethod.TABLECHECK or not slug:
+            return TurnResult.complete(
+                f"I found {biz}, sir. {decision.method_phrase()} I can only run "
+                f"standing watches on TableCheck venues for now — for this one "
+                f"I'd have to check by hand.",
+                slots_update={**update, "channel_decision": decision.to_dict()})
+
+        times = merged.get("watch_times")
+        criteria = [WatchCriterion(date_start=r[0], date_end=r[1],
+                                   party_size=int(merged["party_size"]),
+                                   times=times, label=merged.get("watch_label") or "")
+                    for r in merged["watch_ranges"]]
+
+        # A watch on this venue already stands → fold the new criteria in.
+        existing = self._find_watch_session(session.user_id, slug)
+        if existing is not None:
+            ws = existing.slots["watchlist_state"]
+            ws["criteria"] = list(ws.get("criteria", [])) + [c.to_dict() for c in criteria]
+            existing.wake_at = time.time() + 2
+            self.session_store.save(existing)
+            return TurnResult.complete(
+                f"I've added that to the standing watch on {biz}, sir: "
+                + "; ".join(c.describe() for c in criteria) + ".")
+
+        venue_tz = (decision.timezone
+                    or timezone_for_location(decision.address or merged.get("location")
+                                             or slug or biz))
+        manual_release = None
+        if merged.get("release_days_ahead") and merged.get("release_time"):
+            manual_release = {"days": merged["release_days_ahead"],
+                              "time": merged["release_time"],
+                              "tz": merged.get("release_timezone")}
+        update.update({
+            "channel_decision": decision.to_dict(), "_pending_slot": None,
+            "watch_pending": {"slug": slug, "business_name": biz,
+                              "venue_tz": venue_tz,
+                              "criteria": [c.to_dict() for c in criteria],
+                              "release_manual": manual_release},
+        })
+        wants = "; ".join(c.describe() for c in criteria)
+        return TurnResult.confirm(
+            f"I'll keep a standing watch on {biz} via TableCheck for: {wants}. "
+            f"The moment something opens I'll message you on Telegram with a "
+            f"booking link — I won't book anything myself. Shall I set it up, sir?",
+            slots_update=update,
+            next_state=self._fire(session, "gate_watchlist"))
+
+    async def _handle_watchlist_confirmation(self, text: str, session: Session) -> TurnResult:
+        decision = parse_confirmation(text)
+        if decision == ConfirmDecision.UNCLEAR:
+            return self._reask(session, "Shall I set up the watch, sir — yes or no?")
+        if decision != ConfirmDecision.YES:
+            return TurnResult.cancel("Very well, sir — no watch.")
+        pending = session.slots.get("watch_pending")
+        if not pending:
+            return TurnResult.complete(
+                "I've lost the watch details, sir — let's start it again.")
+
+        now = time.time()
+        ws: Dict[str, Any] = {
+            "slug": pending["slug"], "business_name": pending["business_name"],
+            "venue_tz": pending.get("venue_tz"),
+            "criteria": pending["criteria"],
+            "notified": {}, "failures": 0, "venue_status": "ok",
+            "release": {"checked": False}, "created_at": now,
+        }
+        note = ""
+        manual = pending.get("release_manual")
+        if manual:
+            rel = self._watch_release_from_policy(
+                ws, manual.get("days"), manual.get("time"), manual.get("tz"),
+                source="you", confidence=1.0)
+            if rel:
+                ws["release"] = rel
+                note = (f" Reservations open {rel['display']} — I'll check every "
+                        f"minute around the drop.")
+        return TurnResult.background(
+            f"Very good, sir — the watch on {pending['business_name']} is on."
+            f"{note} First check momentarily.",
+            wake_at=now + 2,
+            slots_update={"watchlist_state": ws, "watch_pending": None},
+            next_state=self._fire(session, "watch_list"))
+
+    def _watch_release_from_policy(self, ws: Dict[str, Any], days, time_raw, tz_name,
+                                   *, source: str, confidence: float,
+                                   quote: str = "") -> Optional[Dict[str, Any]]:
+        """(days-ahead, clock time, tz) → the watch's burst window around the
+        predicted drop, computed off the earliest active criterion date. None
+        when incomplete or the window has already opened."""
+        active = [c for c in ws.get("criteria", [])
+                  if c.get("status", "active") == "active"]
+        if not active or not days:
+            return None
+        hhmm = normalize_time(str(time_raw)) if time_raw else None
+        if not hhmm:
+            return None
+        earliest = min(c["date_start"] for c in active)
+        tz = resolve_timezone(tz_name, ws.get("venue_tz"))
+        fire = compute_release_fire_ts(earliest, int(days), hhmm, tz)
+        if fire is None or fire <= time.time():
+            return None
+        return {"checked": True, "fire_ts": fire,
+                "burst_until": fire + self._tc_burst_tail_s,
+                "display": describe_fire(fire, tz), "source": source,
+                "confidence": round(float(confidence), 2),
+                "quote": (quote or "")[:300]}
+
+    async def _tick_watchlist(self, session: Session) -> Optional[TurnResult]:
+        """One polling cycle of a standing watch: fetch each (party, month)
+        unit, diff against the last snapshot, notify on matches, then choose
+        the next wake — normal / idle-until-drop / burst cadence."""
+        ws = session.slots["watchlist_state"]
+        now = time.time()
+        biz = ws.get("business_name") or "the venue"
+
+        if ws.get("control") == "stop":
+            # The control verb already confirmed to the user; close silently.
+            return TurnResult.complete("", slots_update={"watchlist_state": None})
+
+        criteria = [WatchCriterion.from_dict(c) for c in ws.get("criteria", [])]
+        tz = resolve_timezone(ws.get("venue_tz"))
+        expire_criteria(criteria, datetime.now(tz).date().isoformat())
+        ws["criteria"] = [c.to_dict() for c in criteria]
+        active = [c for c in criteria if c.status == "active"]
+        if not active:
+            if ws.get("quiet_close"):
+                return TurnResult.complete("", slots_update={"watchlist_state": None})
+            await self._watch_notify(session, f"⌛ Watch ended: {biz} — the dates passed.")
+            return TurnResult.complete(
+                f"The watch on {biz} has run its course, sir — the dates passed "
+                f"without an opening I could catch.",
+                slots_update={"watchlist_state": None})
+
+        if ws.get("paused"):
+            return TurnResult.background("", wake_at=now + 6 * 3600,
+                                         slots_update={"watchlist_state": ws})
+
+        channel = self.router.select(ChannelDecision(method=ReservationMethod.TABLECHECK))
+        if channel is None or not hasattr(channel, "fetch_month"):
+            return TurnResult.complete(
+                f"I can no longer reach TableCheck for {biz}, sir.",
+                slots_update={"watchlist_state": None})
+
+        slug = ws["slug"]
+        snapshots = session.scratch.setdefault("tc_snapshots", {})
+        cycle = []   # (party, state, events) per fetch unit
+        try:
+            for i, (party, month) in enumerate(fetch_units(active)):
+                if i:
+                    await asyncio.sleep(self._tc_unit_spacing_s)  # venue politeness
+                state = await channel.fetch_month(slug, party, month)
+                key = f"{party}|{month}"
+                cycle.append((party, state, diff_states(snapshots.get(key), state)))
+                snapshots[key] = state
+        except SchemaDrift as exc:
+            ws["paused"] = True
+            await self._watch_notify(
+                session,
+                f"⚠️ Watch paused: TableCheck's availability responses changed "
+                f"shape for {biz} ({exc}). The adapter needs a re-look before "
+                f"checks can continue.")
+            return TurnResult.background("", wake_at=now + 6 * 3600,
+                                         slots_update={"watchlist_state": ws})
+        except TableCheckError as exc:
+            failures = int(ws.get("failures", 0)) + 1
+            ws["failures"] = failures
+            if failures == 3:
+                await self._watch_notify(
+                    session,
+                    f"⚠️ Trouble reaching TableCheck for {biz} three checks in a "
+                    f"row ({exc}). I'll keep retrying with longer gaps.")
+            backoff = min(self._tc_watch_interval_s * (2 ** failures),
+                          self._tc_max_backoff_s)
+            return TurnResult.background("", wake_at=now + backoff,
+                                         slots_update={"watchlist_state": ws})
+
+        ws["failures"] = 0
+        ws["last_checked_at"] = now
+        await self._watch_deliver_events(session, ws, channel, cycle, active, now)
+
+        any_open = any(open_dates(s) for _, s, _ in cycle)
+        if not any_open and not (ws.get("release") or {}).get("checked"):
+            ws["release"] = await self._watch_research_release(session, ws, biz)
+
+        notified = ws.get("notified") or {}
+        for k in [k for k, ts in notified.items()
+                  if not str(k).startswith("cal|")
+                  and isinstance(ts, (int, float)) and now - ts > 86400]:
+            notified.pop(k)
+
+        return TurnResult.background(
+            "", wake_at=self._watch_next_wake(ws, now, any_open),
+            slots_update={"watchlist_state": ws})
+
+    async def _watch_deliver_events(self, session, ws, channel, cycle, active, now) -> None:
+        """Turn one cycle's diff events into Telegram notifications (deduped)."""
+        biz = ws.get("business_name") or "the venue"
+        slug = ws["slug"]
+        notified = ws.setdefault("notified", {})
+
+        halted = any(s.get("venue_status") == "halted" for _, s, _ in cycle)
+        new_status = "halted" if halted else "ok"
+        if new_status != ws.get("venue_status", "ok"):
+            ws["venue_status"] = new_status
+            if halted:
+                await self._watch_notify(
+                    session, f"⏸️ {biz} has temporarily halted taking reservations "
+                             f"— I'll keep watching for it to resume.")
+            else:
+                await self._watch_notify(
+                    session, f"▶️ {biz} is accepting reservations again — watching closely.")
+
+        for party, state, events in cycle:
+            party_criteria = [c for c in active if c.party_size == party]
+            published = next((e for e in events if e["type"] == "calendar_published"), None)
+
+            for ev in events:
+                if ev["type"] == "slot_closed":
+                    # close → reopen should notify again, so clear the dedupe entry
+                    notified.pop(dedupe_key(party, ev.get("date"), ev.get("time")), None)
+
+            opened_matched = []
+            for ev in events:
+                if ev["type"] != "slot_opened":
+                    continue
+                matching = [c for c in party_criteria
+                            if c.matches(ev.get("date"), ev.get("time"))]
+                if matching:
+                    opened_matched.append((ev, min(matching, key=lambda c: c.priority)))
+
+            if published and f"cal|{party}|{state.get('month')}" not in notified:
+                # First publish of the month: one summary beats a burst of
+                # per-slot messages. A later re-publish (calendar emptied and
+                # refilled) falls through to ordinary per-slot notifications.
+                notified[f"cal|{party}|{state.get('month')}"] = now
+                for ev, _ in opened_matched:
+                    notified[dedupe_key(party, ev.get("date"), ev.get("time"))] = now
+                relevant = relevant_open_dates(state, party_criteria)
+                if relevant:
+                    days = ", ".join(display_date(d) for d in relevant[:8])
+                    await self._watch_notify(
+                        session,
+                        f"📅 {biz}: the {state.get('month')} calendar is live "
+                        f"for {party} — open on your dates: {days}. Book: "
+                        f"{channel.booking_url(slug, relevant[0], None, party)}")
+                continue
+
+            for ev, best in opened_matched:
+                key = dedupe_key(party, ev.get("date"), ev.get("time"))
+                if now - float(notified.get(key, 0)) < self._tc_dedupe_s:
+                    continue
+                notified[key] = now
+                when = display_date(ev.get("date"))
+                if ev.get("time"):
+                    when += f" {display_time(ev['time'])}"
+                tag = f" ({best.label})" if best.label else ""
+                bang = "‼️ " if best.priority <= 10 else ""
+                link = channel.booking_url(slug, ev.get("date"), ev.get("time"), party)
+                await self._watch_notify(
+                    session, f"{bang}🎯 {biz}: {when} OPEN x{party}{tag} — book now: {link}")
+
+    async def _watch_research_release(self, session, ws, biz) -> Dict[str, Any]:
+        """Nothing bookable and no known drop time → research when the venue
+        releases tables (web + Reddit, LLM-grounded) and, when credible,
+        self-schedule the burst window around the predicted drop. Runs once
+        per watch; the result (found or not) is remembered."""
+        policy = None
+        try:
+            policy = await asyncio.to_thread(
+                self.discovery.resolve_release_policy, ws.get("business_name"), None)
+        except Exception:
+            logger.warning("Watch release-policy research failed", exc_info=True)
+        if policy is not None and policy.confidence >= self._snipe_min_confidence:
+            rel = self._watch_release_from_policy(
+                ws, policy.days_in_advance, policy.release_time, policy.timezone,
+                source="web", confidence=policy.confidence,
+                quote=policy.source_quote)
+            if rel:
+                cite = f' (a source notes: "{rel["quote"][:120]}")' if rel.get("quote") else ""
+                await self._watch_notify(
+                    session,
+                    f"🔎 {biz}'s calendar isn't open for your dates yet. From what "
+                    f"I can find, reservations open {rel['display']}{cite}. I'll "
+                    f"check hourly until then and every minute around the drop.")
+                return rel
+        await self._watch_notify(
+            session,
+            f"🔎 {biz}'s calendar isn't open for your dates yet, and I couldn't "
+            f"pin down when they release tables. I'll keep checking hourly — "
+            f"tell me the drop time if you learn it.")
+        return {"checked": True}
+
+    def _watch_next_wake(self, ws: Dict[str, Any], now: float, any_open: bool) -> float:
+        """Cadence: 60s burst around a predicted drop, hourly idle while the
+        calendar is closed with a known future drop, hourly when closed with no
+        known drop, else the normal interval. Hard floor 60s (politeness)."""
+        rel = ws.get("release") or {}
+        fire, burst_until = rel.get("fire_ts"), rel.get("burst_until")
+        if fire and burst_until and (fire - self._tc_burst_s) <= now <= burst_until:
+            interval = self._tc_burst_s + random.uniform(0, 10)
+        elif not any_open and rel.get("checked") and fire and now < fire:
+            # Park until just before the drop (or the idle interval, if sooner).
+            interval = min(self._tc_watch_idle_s + random.uniform(-60, 60),
+                           fire - self._tc_burst_s - now)
+        elif not any_open and rel.get("checked") and not fire:
+            interval = self._tc_watch_idle_s + random.uniform(-60, 60)
+        else:
+            interval = self._tc_watch_interval_s + random.uniform(-30, 30)
+        return now + max(60.0, interval)
+
+    async def _watch_notify(self, session: Session, message: str) -> None:
+        """Best-effort Telegram note — the watch's only notification path while
+        the session stays WAITING (spoken output only fires on completion)."""
+        if self.notifier is None:
+            return
+        try:
+            await asyncio.to_thread(self.notifier.send, guard(USER_DEST_SINK, message))
+        except Exception:
+            logger.warning("Watch Telegram notification failed", exc_info=True)
+
+    # ------------------------------------------ watch control (store-mediated)
+    # WAITING sessions never take a user turn, so "stop watching" / "any luck" /
+    # "got the table" arrive as *new* sessions and act on the standing watches
+    # through the shared session store: mutate slots, pull wake_at forward, and
+    # let the next background tick apply the change.
+    def _watch_sessions(self, user_id: str) -> List[Session]:
+        store = self.session_store
+        if store is None:
+            return []
+        try:
+            waiting = store.list_waiting()
+        except Exception:
+            logger.warning("Couldn't list watch sessions", exc_info=True)
+            return []
+        return [s for s in waiting
+                if s.user_id == user_id and s.workflow_name == self.name
+                and s.slots.get("watchlist_state")]
+
+    def _find_watch_session(self, user_id: str, slug: str) -> Optional[Session]:
+        for s in self._watch_sessions(user_id):
+            if s.slots["watchlist_state"].get("slug") == slug:
+                return s
+        return None
+
+    @staticmethod
+    def _watch_named_in(ws: Dict[str, Any], text: str) -> bool:
+        name = (ws.get("business_name") or "").lower()
+        low = text.lower()
+        return bool(name) and (name in low or any(
+            part in low for part in name.split() if len(part) > 3))
+
+    def _watch_stop(self, text: str, session: Session) -> TurnResult:
+        watches = self._watch_sessions(session.user_id)
+        if not watches:
+            return TurnResult.complete("I'm not watching anything at the moment, sir.")
+        named = [s for s in watches
+                 if self._watch_named_in(s.slots["watchlist_state"], text)]
+        targets = named or watches
+        for s in targets:
+            s.slots["watchlist_state"]["control"] = "stop"
+            s.wake_at = time.time()
+            self.session_store.save(s)
+        names = ", ".join(s.slots["watchlist_state"].get("business_name", "a venue")
+                          for s in targets)
+        return TurnResult.complete(f"Very good, sir — I've called off the watch on {names}.")
+
+    def _watch_fulfilled(self, text: str, session: Session) -> TurnResult:
+        watches = self._watch_sessions(session.user_id)
+        if not watches:
+            return TurnResult.complete("Duly noted, sir.")
+        named = [s for s in watches
+                 if self._watch_named_in(s.slots["watchlist_state"], text)]
+        targets = named or watches
+        rng = None
+        dm = _WATCH_SINGLE_DATE_RE.search(text)
+        if dm:
+            rng = parse_date_range(dm.group(0))
+        changed_any, remaining = False, False
+        for s in targets:
+            ws = s.slots["watchlist_state"]
+            changed = False
+            for c in ws.get("criteria", []):
+                if c.get("status", "active") != "active":
+                    continue
+                if rng and not (c["date_start"] <= rng[0] <= c["date_end"]):
+                    continue
+                c["status"] = "fulfilled"
+                changed = True
+            if changed:
+                changed_any = True
+                if any(c.get("status", "active") == "active"
+                       for c in ws.get("criteria", [])):
+                    remaining = True
+                else:
+                    ws["quiet_close"] = True
+                s.wake_at = time.time()
+                self.session_store.save(s)
+        if not changed_any:
+            return TurnResult.complete(
+                "I had no active watch matching that, sir — but well done.")
+        tail = " I'll keep watching the rest." if remaining else ""
+        return TurnResult.complete(f"Splendid, sir — marked as booked.{tail}")
+
+    def _watch_status(self, session: Session) -> TurnResult:
+        watches = self._watch_sessions(session.user_id)
+        if not watches:
+            return TurnResult.complete("No standing watches at the moment, sir.")
+        now = time.time()
+        lines = []
+        for s in watches:
+            ws = s.slots["watchlist_state"]
+            crits = "; ".join(
+                f"{WatchCriterion.from_dict(c).describe()} [{c.get('status', 'active')}]"
+                for c in ws.get("criteria", []))
+            bits = [crits]
+            last = ws.get("last_checked_at")
+            if last:
+                bits.append(f"last checked {max(0, int((now - last) / 60))} min ago")
+            if ws.get("paused"):
+                bits.append("paused: the availability API changed shape")
+            elif ws.get("venue_status") == "halted":
+                bits.append("venue has reservations halted")
+            rel = ws.get("release") or {}
+            if rel.get("fire_ts") and now < rel["fire_ts"]:
+                bits.append(f"expecting the drop {rel.get('display')}")
+            lines.append(f"{ws.get('business_name', 'A venue')}: " + " — ".join(bits))
+        return TurnResult.complete("Here's where we stand, sir. " + " | ".join(lines))
+
     # ------------------------------------------------------------ gate helpers
     def _action(self, kind: ActionKind, session: Session, plan: CommitPlan,
                 scope: Optional[str] = None, attempt: int = 0) -> Action:
@@ -1103,6 +1746,8 @@ class ReservationWorkflow(ConversationalWorkflow):
             return await self._tick_email(session)
         if session.slots.get("watch_state"):
             return await self._tick_watch(session)
+        if session.slots.get("watchlist_state"):
+            return await self._tick_watchlist(session)
         return None
 
     async def _tick_watch(self, session: Session) -> Optional[TurnResult]:
