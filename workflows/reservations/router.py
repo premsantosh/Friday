@@ -20,6 +20,7 @@ from .channels import (
     PhoneChannel,
     ReservationChannel,
     ResyChannel,
+    TableCheckChannel,
     YelpChannel,
 )
 from .llm import ReservationLLM, make_llm_drafter
@@ -40,6 +41,8 @@ class ChannelRouter:
             ReservationMethod.OPENTABLE: OpenTableChannel(browser_dir),
             ReservationMethod.RESY: ResyChannel(browser_dir),
             ReservationMethod.YELP: YelpChannel(browser_dir),
+            # Pure HTTP (no browser/login): availability polling + deep-link hand-off.
+            ReservationMethod.TABLECHECK: TableCheckChannel(),
             # The generic channel reads the page's own form; the LLM only maps
             # fields to fact *keys*, so it works (less well) without one.
             ReservationMethod.GENERIC_WEB: GenericWebChannel(browser_dir, llm=llm),

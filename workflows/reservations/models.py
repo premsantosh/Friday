@@ -17,6 +17,7 @@ class ReservationMethod(Enum):
     OPENTABLE = "opentable"
     RESY = "resy"
     YELP = "yelp"
+    TABLECHECK = "tablecheck"
     GENERIC_WEB = "generic_web"
     PHONE = "phone"
     EMAIL = "email"
@@ -104,6 +105,7 @@ _METHOD_PHRASES: Dict[ReservationMethod, str] = {
     ReservationMethod.OPENTABLE: "They take reservations through OpenTable.",
     ReservationMethod.RESY: "They use Resy for reservations.",
     ReservationMethod.YELP: "They accept reservations via Yelp.",
+    ReservationMethod.TABLECHECK: "They take reservations through TableCheck.",
     ReservationMethod.GENERIC_WEB: "They have an online booking page.",
     ReservationMethod.PHONE: "I found no online booking, so I'd reserve by telephone.",
     ReservationMethod.EMAIL: "They take reservation requests by email.",

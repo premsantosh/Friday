@@ -10,6 +10,7 @@ from .calendar import CalendarService
 from .notify import TelegramNotifier
 from .payment import ManualCardService, PrivacyCardService, VirtualCard, card_service_from_env
 from .router import ChannelRouter
+from .watcher import WatchCriterion
 from .workflow import ReservationWorkflow
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "ChannelDecision",
     "ReservationMethod",
     "ESSENTIAL_SLOTS",
+    "WatchCriterion",
 ]
