@@ -116,6 +116,56 @@ def compute_release_fire_ts(dining_date_iso: str, days_ahead: int,
         return None
 
 
+def compute_batch_release_fire_ts(dining_date_iso: str, day_of_month: int,
+                                  release_hhmm: str, tz: ZoneInfo) -> Optional[float]:
+    """The UTC epoch a *batch* (monthly) window opens: the whole dining month is
+    released at once on `day_of_month` of the month before it, at `release_hhmm`
+    local to `tz` — e.g. BenFiddich drops September on August 20 at 10am JST.
+    The day is clamped to the opening month's length. None on bad input."""
+    try:
+        d = date.fromisoformat(dining_date_iso)
+        hour, minute = (int(x) for x in release_hhmm.split(":"))
+        if not 1 <= int(day_of_month) <= 31:
+            return None
+        open_y, open_m = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
+        from calendar import monthrange
+        open_day = min(int(day_of_month), monthrange(open_y, open_m)[1])
+        fire_local = datetime(open_y, open_m, open_day, hour, minute, tzinfo=tz)
+        return fire_local.timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def compute_absolute_release_fire_ts(release_date_iso: str, release_hhmm: str,
+                                     tz: ZoneInfo) -> Optional[float]:
+    """The UTC epoch for a stated one-off drop date ("reservations open on
+    August 20 at 10am JST"), local to `tz`. None on bad input."""
+    try:
+        d = date.fromisoformat(release_date_iso)
+        hour, minute = (int(x) for x in release_hhmm.split(":"))
+        return datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def resolve_release_fire_ts(dining_date_iso: Optional[str], release_hhmm: str,
+                            tz: ZoneInfo, *, days_ahead: Optional[int] = None,
+                            day_of_month: Optional[int] = None,
+                            release_date_iso: Optional[str] = None) -> Optional[float]:
+    """Fire instant for whichever release-policy shape is known, most specific
+    first: a stated absolute date, a monthly batch drop (day-of-month), then a
+    rolling days-ahead window. None when nothing computes."""
+    if release_date_iso:
+        return compute_absolute_release_fire_ts(release_date_iso, release_hhmm, tz)
+    if day_of_month and dining_date_iso:
+        return compute_batch_release_fire_ts(dining_date_iso, int(day_of_month),
+                                             release_hhmm, tz)
+    if days_ahead and dining_date_iso:
+        return compute_release_fire_ts(dining_date_iso, int(days_ahead),
+                                       release_hhmm, tz)
+    return None
+
+
 def describe_fire(fire_ts: float, tz: ZoneInfo) -> str:
     """Human-friendly local rendering of the fire instant, e.g.
     'Sat, May 31 at 10:00 AM EDT'."""

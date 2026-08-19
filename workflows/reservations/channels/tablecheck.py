@@ -11,8 +11,15 @@ deep link (no auto-booking in v1).
 ENDPOINT CONTRACT — verify against live widget traffic (plan M0):
 The default URL template and the response shapes accepted by `_parse_raw`
 encode the documented web_booking API pattern. Before relying on this in
-production, capture the real request the reserve widget makes (browser
-devtools → XHR on the /reserve page), then:
+production, run the live probe from a machine with normal internet access:
+
+    python -m workflows.reservations.channels.tablecheck benfiddich-tokyo 2 2026-09 \
+        [--save tests/fixtures/tablecheck/live_benfiddich.json]
+
+It fetches the real endpoint, validates the response through `_parse_raw`,
+and prints the normalized snapshot — or, on SchemaDrift, dumps the raw JSON
+so the parser/fixtures can be refreshed. If the widget's real traffic differs
+(browser devtools → XHR on the /reserve page):
   * set TABLECHECK_AVAILABILITY_URL if the path/params differ
     (placeholders: {slug}, {party_size}, {start_date}, {end_date}), and
   * refresh tests/fixtures/tablecheck/*.json with real responses —
@@ -293,3 +300,85 @@ class TableCheckChannel(ReservationChannel):
         decision = slots.get("channel_decision") or {}
         return (slug_from_url(decision.get("url"))
                 or slug_from_url(slots.get("target_url")))
+
+
+def _probe_cli(argv) -> int:   # pragma: no cover — live-network tool
+    """Endpoint-contract probe (module docstring, plan M0). Fetches the real
+    availability endpoint for one (venue, party, month), validates it through
+    `_parse_raw`, and prints the normalized snapshot. On SchemaDrift the raw
+    response is printed so the parser and fixtures can be refreshed."""
+    import argparse
+    import asyncio
+    import json
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(
+        prog="python -m workflows.reservations.channels.tablecheck",
+        description="Probe TableCheck's live availability endpoint for a venue.")
+    parser.add_argument("venue", help="TableCheck slug or venue URL "
+                                      "(e.g. benfiddich-tokyo)")
+    parser.add_argument("party_size", nargs="?", type=int, default=2)
+    parser.add_argument("month", nargs="?",
+                        default=datetime.now().strftime("%Y-%m"),
+                        help="YYYY-MM (default: current month)")
+    parser.add_argument("--save", metavar="PATH",
+                        help="also write the RAW response JSON to PATH "
+                             "(fixture refresh)")
+    args = parser.parse_args(argv)
+    slug = slug_from_url(args.venue) or args.venue
+
+    net = TableCheckChannel()          # bare channel: real aiohttp fetch path
+    raw_holder: Dict[str, Any] = {}
+
+    async def recording_fetch(url, headers):
+        # Capture the raw body alongside the parse, whatever happens.
+        print(f"GET {url}")
+        status, body = await net._fetch(url)
+        raw_holder["status"], raw_holder["body"] = status, body
+        return status, body
+
+    channel = TableCheckChannel(fetcher=recording_fetch)
+
+    async def run():
+        return await channel.fetch_month(slug, args.party_size, args.month)
+
+    try:
+        state = asyncio.run(run())
+    except SchemaDrift as exc:
+        print(f"SCHEMA DRIFT: {exc}")
+        print("Raw response (refresh _parse_raw/fixtures against this):")
+        print(json.dumps(raw_holder.get("body"), indent=2, ensure_ascii=False)[:8000])
+        _save_raw(args.save, raw_holder)
+        return 2
+    except TableCheckError as exc:
+        print(f"HTTP/network trouble: {exc}")
+        return 3
+    print("Contract OK — normalized snapshot:")
+    print(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True))
+    open_days = sorted(d for d, i in state["dates"].items() if i.get("open"))
+    print(f"\n{len(open_days)} open date(s)"
+          + (f": {', '.join(open_days[:10])}" if open_days else "")
+          + f"; venue_status={state['venue_status']}")
+    if open_days:
+        d = open_days[0]
+        times = sorted(t for t, s in state["dates"][d]["slots"].items()
+                       if s == "available")
+        print("Example booking deep link: "
+              + TableCheckChannel.booking_url(slug, d, times[0] if times else None,
+                                              args.party_size))
+    _save_raw(args.save, raw_holder)
+    return 0
+
+
+def _save_raw(path: Optional[str], raw_holder: Dict[str, Any]) -> None:   # pragma: no cover
+    if not path or "body" not in raw_holder:
+        return
+    import json
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(raw_holder["body"], fh, indent=2, ensure_ascii=False)
+    print(f"Raw response saved to {path}")
+
+
+if __name__ == "__main__":   # pragma: no cover
+    import sys
+    sys.exit(_probe_cli(sys.argv[1:]))

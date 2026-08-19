@@ -115,10 +115,17 @@ _METHOD_PHRASES: Dict[ReservationMethod, str] = {
 
 @dataclass
 class ReleasePolicy:
-    """When a venue releases reservations, as discovered from the web/forums."""
-    days_in_advance: int
-    release_time: str               # verbatim clock time, e.g. "10am"
+    """When a venue releases reservations, as discovered from the web/forums.
+
+    Two shapes: a *rolling* window (`days_in_advance` before each dining date)
+    or a *batch* drop (`day_of_month`: the whole following month opens at once
+    on that day — e.g. BenFiddich releases September on August 20). At least
+    one of the two must be present, along with `release_time`.
+    """
+    days_in_advance: Optional[int] = None
+    release_time: str = ""          # verbatim clock time, e.g. "10am"
     timezone: Optional[str] = None  # "ET" / "America/New_York" / None
+    day_of_month: Optional[int] = None  # batch drop: day of the prior month
     rolling: bool = True
     confidence: float = 0.0
     source_quote: str = ""
@@ -126,11 +133,17 @@ class ReleasePolicy:
 
     @classmethod
     def from_extraction(cls, d: Dict[str, Any]) -> "ReleasePolicy":
+        days = d.get("opens_days_in_advance")
+        dom = d.get("opens_on_day_of_month")
+        if days is None and dom is None:
+            raise ValueError("release policy needs opens_days_in_advance "
+                             "or opens_on_day_of_month")
         return cls(
-            days_in_advance=int(d["opens_days_in_advance"]),
+            days_in_advance=int(days) if days is not None else None,
             release_time=d["release_time"],
             timezone=d.get("release_timezone"),
-            rolling=bool(d.get("rolling", True)),
+            day_of_month=int(dom) if dom is not None else None,
+            rolling=bool(d.get("rolling", dom is None)),
             confidence=float(d.get("confidence", 0.0)),
             source_quote=d.get("source_quote", ""),
             notes=d.get("notes", ""),

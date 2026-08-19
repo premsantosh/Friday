@@ -79,6 +79,11 @@ Reply with ONLY a JSON object — no prose. Keys (use null when not stated; neve
   location: city/neighbourhood if the user states one
   release_days_ahead: integer, ONLY if the user says how many days in advance
     bookings open (e.g. "tables drop 30 days in advance" -> 30); else null
+  release_day_of_month: integer, ONLY if the user says the venue batch-releases
+    a whole month's tables on a fixed day of the month (e.g. "they open next
+    month's reservations on the 20th" -> 20); else null
+  release_date: a specific calendar date the user says bookings open, verbatim
+    (e.g. "reservations open on August 20" -> "August 20"); else null
   release_time: the time bookings open, verbatim, ONLY if stated
     (e.g. "at 10am", "9:00 ET"); else null
   release_timezone: a timezone the user attaches to the release time
@@ -118,6 +123,9 @@ EXTRACT_TASK = LLMTask(
                   valid=lambda n: 1 <= n <= 100),
         FieldSpec("release_days_ahead", int, coerce=_coerce_party,
                   valid=lambda n: 1 <= n <= 365),
+        FieldSpec("release_day_of_month", int, coerce=_coerce_party,
+                  valid=lambda n: 1 <= n <= 31),
+        FieldSpec("release_date", str, max_len=40),
         FieldSpec("release_time", str, max_len=40),
         FieldSpec("release_timezone", str, max_len=40),
     ),
@@ -206,12 +214,15 @@ _RELEASE_SYSTEM = """You determine WHEN a venue releases its reservations, from
 search evidence (which may include forum/Reddit threads). Reply with ONLY a JSON object:
   opens_days_in_advance: integer days before the dining date that booking opens
     (e.g. "tables drop 30 days out" -> 30) or null
+  opens_on_day_of_month: for a batch drop, the day of the month the *following*
+    month's tables are all released at once (e.g. "reservations for the next
+    month open on the 20th" -> 20) or null
   release_time: the local clock time bookings open, copied verbatim from the
     evidence (e.g. "10am", "9:00 AM") or null
   release_timezone: the timezone for that time, copied from the evidence
     (e.g. "ET", "PT", "America/New_York") or null
   rolling: true if a new day opens each day at that lead time; false for a batch
-    drop (e.g. all of next month at once)
+    drop (e.g. all of next month at once — set opens_on_day_of_month then)
   confidence: 0.0-1.0 — lower it when sources disagree or are old/anecdotal
   source_quote: the sentence from the evidence that states the policy
   notes: one short sentence (mention if this came from a forum rather than the venue)
@@ -222,11 +233,17 @@ Rules:
 
 
 def _finalize_release(values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # A usable policy needs both the lead days and the clock time to fire on.
-    if values.get("opens_days_in_advance") is None or not values.get("release_time"):
+    # A usable policy needs a clock time to fire on, plus either the rolling
+    # lead days or the batch drop's day of the month.
+    if not values.get("release_time"):
         return None
+    if values.get("opens_days_in_advance") is None \
+            and values.get("opens_on_day_of_month") is None:
+        return None
+    values.setdefault("opens_days_in_advance", None)
+    values.setdefault("opens_on_day_of_month", None)
     values.setdefault("release_timezone", None)
-    values.setdefault("rolling", True)
+    values.setdefault("rolling", values.get("opens_on_day_of_month") is None)
     values.setdefault("confidence", 0.5)
     values.setdefault("source_quote", "")
     values.setdefault("notes", "")
@@ -241,6 +258,8 @@ RELEASE_POLICY_TASK = LLMTask(
     fields=(
         FieldSpec("opens_days_in_advance", int, coerce=_coerce_party,
                   valid=lambda n: 1 <= n <= 365),
+        FieldSpec("opens_on_day_of_month", int, coerce=_coerce_party,
+                  valid=lambda n: 1 <= n <= 31),
         FieldSpec("release_time", str, grounded=True, max_len=40),
         # Not grounded: a small closed vocabulary, and the model reliably maps
         # "Eastern Time" -> "ET"; grounding it just drops the normalized form.

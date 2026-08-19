@@ -513,6 +513,139 @@ def test_snipe_datetime_math():
     assert compute_release_fire_ts("not-a-date", 30, "10:00", tz) is None
 
 
+def test_batch_release_datetime_math():
+    from workflows.reservations.snipe import (
+        compute_absolute_release_fire_ts, compute_batch_release_fire_ts,
+        resolve_release_fire_ts, resolve_timezone)
+    from datetime import datetime as _dt
+
+    tz = resolve_timezone("JST")
+    # BenFiddich-style: all of September opens on August 20 at 10:00 JST.
+    ts = compute_batch_release_fire_ts("2026-09-05", 20, "10:00", tz)
+    local = _dt.fromtimestamp(ts, tz)
+    assert (local.year, local.month, local.day, local.hour, local.minute) \
+        == (2026, 8, 20, 10, 0)
+    # January's batch opens in December of the prior year.
+    local = _dt.fromtimestamp(
+        compute_batch_release_fire_ts("2027-01-10", 20, "10:00", tz), tz)
+    assert (local.year, local.month, local.day) == (2026, 12, 20)
+    # The drop day clamps to the opening month's length (Sep 31 → Sep 30).
+    local = _dt.fromtimestamp(
+        compute_batch_release_fire_ts("2026-10-05", 31, "10:00", tz), tz)
+    assert (local.month, local.day) == (9, 30)
+    assert compute_batch_release_fire_ts("2026-09-05", 0, "10:00", tz) is None
+    assert compute_batch_release_fire_ts("not-a-date", 20, "10:00", tz) is None
+    # Absolute drop dates, and the dispatcher's most-specific-first precedence.
+    local = _dt.fromtimestamp(
+        compute_absolute_release_fire_ts("2026-08-20", "10:00", tz), tz)
+    assert (local.month, local.day, local.hour) == (8, 20, 10)
+    assert resolve_release_fire_ts(
+        "2026-09-05", "10:00", tz, days_ahead=30, day_of_month=20,
+        release_date_iso="2026-08-21") \
+        == compute_absolute_release_fire_ts("2026-08-21", "10:00", tz)
+    assert resolve_release_fire_ts(None, "10:00", tz) is None
+
+
+def test_release_policy_regex_shapes():
+    from workflows.reservations.workflow import ReservationWorkflow
+
+    slots = {}
+    cut = ReservationWorkflow._extract_release_policy_regex(
+        "book me in — reservations open on 20th Aug at 10am JST", slots)
+    assert slots["release_date"].endswith("-08-20")
+    assert slots["release_time"] == "10am" and slots["release_timezone"] == "JST"
+    assert cut is not None
+
+    slots = {}
+    cut = ReservationWorkflow._extract_release_policy_regex(
+        "they release next month's tables on the 20th at 9am", slots)
+    assert slots["release_day_of_month"] == 20 and slots["release_time"] == "9am"
+    assert cut is not None
+
+    # A dining phrase must never be read as a policy.
+    slots = {}
+    assert ReservationWorkflow._extract_release_policy_regex(
+        "book a table available on September 5 at 7pm", slots) is None
+    assert slots == {}
+
+
+def test_resolve_release_policy_batch_day_of_month():
+    quote = "BenFiddich opens the following month's seats on the 20th at 10am JST."
+    search = FakeSearch([SearchResult(
+        title="r/JapanTravel — BenFiddich", snippet=quote,
+        url="https://www.reddit.com/r/JapanTravel/comments/xyz")])
+    llm = FakeLLM({"opens_on_day_of_month": 20, "release_time": "10am",
+                   "release_timezone": "JST", "rolling": False, "confidence": 0.85,
+                   "source_quote": quote, "notes": "per a Reddit thread"})
+    disc = BusinessDiscovery(search_provider=search, yelp_client=FakeYelp(None), llm=llm)
+
+    policy = disc.resolve_release_policy("Bar BenFiddich", "Tokyo")
+    assert policy is not None
+    assert policy.day_of_month == 20 and policy.days_in_advance is None
+    assert policy.rolling is False and policy.release_time == "10am"
+
+
+def _second_month_out_dining_date():
+    """An 'M/D' dining date two months out, so a batch drop on the 20th of the
+    month before it is always still in the future whenever the test runs."""
+    from datetime import date as _date
+    today = _date.today()
+    m = today.month + 2
+    y, m = today.year + (m - 1) // 12, (m - 1) % 12 + 1
+    return _date(y, m, 5)
+
+
+@pytest.mark.asyncio
+async def test_stated_absolute_release_date_schedules_snipe():
+    from datetime import datetime, timedelta
+    disc = BusinessDiscovery(FakeSearch(opentable_result()), FakeYelp(yelp_business()))
+    mgr = make_reservation_manager(disc, router=opentable_router(FakeChannel()))
+    wf = mgr.workflows.workflows["reservations"]
+
+    drop = datetime.now() + timedelta(days=40)
+    turn = await mgr.open(
+        wf, f"book a table for 2 at Lazy Bear on {far_future_date()} at 7pm — "
+            f"reservations open on {drop:%B} {drop.day} at 10am ET", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "reservations open" in turn.message.lower()   # snipe gate, not a book
+
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.BACKGROUND
+    snipe = mgr.store.list_waiting()[0].slots["snipe_plan"]
+    assert snipe["release_date"] == drop.date().isoformat()
+    from zoneinfo import ZoneInfo
+    local = datetime.fromtimestamp(snipe["fire_ts"], ZoneInfo("America/New_York"))
+    assert (local.day, local.hour, local.minute) == (drop.day, 10, 0)
+
+
+@pytest.mark.asyncio
+async def test_autodetected_batch_policy_offers_snipe():
+    from workflows.reservations.models import ReleasePolicy
+    policy = ReleasePolicy(day_of_month=20, release_time="10am", timezone="JST",
+                           rolling=False, confidence=0.8,
+                           source_quote="the following month opens on the 20th at 10am")
+    mgr = make_reservation_manager(StubDiscovery(_bookable_decision(), policy),
+                                   router=opentable_router(FakeChannel()))
+    wf = mgr.workflows.workflows["reservations"]
+
+    d = _second_month_out_dining_date()
+    turn = await mgr.open(
+        wf, f"book a table for 2 at Bungalow on {d.month}/{d.day} at 7pm", {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    assert "the following month opens" in turn.message    # cites the source
+
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.BACKGROUND
+    sess = mgr.store.list_waiting()[0]
+    assert sess.slots.get("snipe_state") is not None
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    local = datetime.fromtimestamp(sess.slots["snipe_plan"]["fire_ts"],
+                                   ZoneInfo("Asia/Tokyo"))
+    prev_month = d.month - 1 or 12
+    assert (local.month, local.day, local.hour) == (prev_month, 20, 10)
+
+
 @pytest.mark.asyncio
 async def test_snipe_schedules_then_books_at_fire():
     import time as _time

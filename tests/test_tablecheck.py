@@ -471,6 +471,35 @@ async def test_manual_release_policy_sets_burst_at_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_manual_batch_release_policy_sets_burst_at_confirmation():
+    """The BenFiddich pattern: the whole following month drops on a fixed day
+    ("they open reservations for the following month on the 20th at 10am JST")."""
+    mgr, wf, store, fetch, notifier = make_watch_env(
+        FakeFetch({"availability_calendar": {}, "shop": {"status": "open"}}))
+    today = date.today()
+    m = today.month + 2
+    y, m = today.year + (m - 1) // 12, (m - 1) % 12 + 1
+    d = date(y, m, 5)   # two months out → the prior month's 20th is always future
+    turn = await mgr.open(
+        wf, f"Watch BenFiddich for {d.month}/{d.day} at 9pm for 2 — they open "
+            f"reservations for the following month on the 20th at 10am JST",
+        {}, "default")
+    assert turn.control == TurnControl.AWAIT_CONFIRMATION
+    # The release clock time must not leak into the watch criteria.
+    assert "10:00" not in turn.message and "9:00 pm" in turn.message.lower()
+    turn = await mgr.handle("default", "yes")
+    assert turn.control == TurnControl.BACKGROUND
+    assert "Reservations open" in turn.message
+    rel = mgr.store.list_waiting()[0].slots["watchlist_state"]["release"]
+    assert rel["source"] == "you" and rel["fire_ts"] > time.time()
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    local = datetime.fromtimestamp(rel["fire_ts"], ZoneInfo("Asia/Tokyo"))
+    prev_month = d.month - 1 or 12
+    assert (local.month, local.day, local.hour) == (prev_month, 20, 10)
+
+
+@pytest.mark.asyncio
 async def test_calendar_publish_before_predicted_drop_beats_the_burst():
     policy = ReleasePolicy(days_in_advance=25, release_time="9am", timezone="JST",
                            confidence=0.9)

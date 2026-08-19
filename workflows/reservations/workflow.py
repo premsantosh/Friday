@@ -44,6 +44,7 @@ from core.harness import (
     display_date,
     display_time,
     guard,
+    normalize_date,
     normalize_time,
     parse_confirmation,
 )
@@ -69,8 +70,8 @@ from .notify import TelegramNotifier
 from .payment import HARD_CAP_USD, PrivacyCardService, card_service_from_env
 from .router import ChannelRouter
 from .snipe import (
-    compute_release_fire_ts,
     describe_fire,
+    resolve_release_fire_ts,
     resolve_timezone,
     timezone_for_location,
 )
@@ -196,6 +197,21 @@ _RELEASE_DAYS_RE = re.compile(
 _RELEASE_CTX_RE = re.compile(r"(?:open|drop|release|go live|available|bookable)\w*", re.I)
 _RELEASE_TZ_RE = re.compile(
     r"\b(ET|EST|EDT|CT|CST|CDT|MT|MST|MDT|PT|PST|PDT|GMT|UTC|JST)\b")
+# Batch releases: an absolute drop date ("reservations open on August 20 at
+# 10am JST" / "on 20th Aug") or a recurring day of the month ("they release
+# next month's tables on the 20th"). The verbs are kept narrow (open / drop /
+# release / go live) so a dining phrase like "available on September 5" is
+# never read as a policy.
+_RELEASE_VERBS = r"(?:open|drop|release|go(?:es)?\s+live)\w*"
+_RELEASE_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+_RELEASE_ON_DATE_RE = re.compile(
+    rf"\b{_RELEASE_VERBS}[^.?!]{{0,50}}?"
+    rf"\bon\s+(?:the\s+)?({_RELEASE_MONTH}\s+\d{{1,2}}(?:st|nd|rd|th)?"
+    rf"|\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_RELEASE_MONTH})\b", re.I)
+_RELEASE_DOM_RE = re.compile(
+    rf"\b{_RELEASE_VERBS}[^.?!]{{0,60}}?"
+    rf"\bon the (\d{{1,2}})(?:st|nd|rd|th)?\b"
+    rf"(?!\s+(?:of\s+)?{_RELEASE_MONTH})", re.I)
 
 # Standing availability watch (M8): "watch BenFiddich for cancellations Sep 4-12".
 _WATCH_ADD_RE = re.compile(
@@ -828,35 +844,49 @@ class ReservationWorkflow(ConversationalWorkflow):
             return None
         return self._build_snipe(date_iso, policy.days_in_advance, policy.release_time,
                                  policy.timezone, decision, slots, source="web",
-                                 confidence=policy.confidence, quote=policy.source_quote)
+                                 confidence=policy.confidence, quote=policy.source_quote,
+                                 day_of_month=policy.day_of_month)
 
     def _snipe_from_manual(self, slots: Dict[str, Any], decision) -> Optional[Dict[str, Any]]:
         if not self._snipe_enabled:
             return None
         return self._build_snipe(slots.get("date"), slots.get("release_days_ahead"),
                                  slots.get("release_time"), slots.get("release_timezone"),
-                                 decision, slots, source="you")
+                                 decision, slots, source="you",
+                                 day_of_month=slots.get("release_day_of_month"),
+                                 release_date=slots.get("release_date"))
 
     def _build_snipe(self, date_iso, days, release_time_raw, tz_name, decision, slots, *,
-                     source: str, confidence: float = 1.0, quote: str = ""
-                     ) -> Optional[Dict[str, Any]]:
-        """Normalize a (date, lead-days, release-time, tz) into a snipe plan, or
-        None if incomplete/unparseable or the window has already opened."""
-        if not (days and release_time_raw and date_iso):
+                     source: str, confidence: float = 1.0, quote: str = "",
+                     day_of_month=None, release_date=None) -> Optional[Dict[str, Any]]:
+        """Normalize a stated release policy (rolling lead-days, a batch
+        day-of-month, or an absolute drop date, plus release-time and tz) into
+        a snipe plan, or None if incomplete/unparseable or the window has
+        already opened."""
+        if not (release_time_raw and date_iso and (days or day_of_month or release_date)):
             return None
         release_hhmm = normalize_time(str(release_time_raw))
         if not release_hhmm:
             return None
+        # An LLM-extracted release date arrives verbatim ("August 20"); the
+        # regex path stores ISO. Normalize either way (ISO passes through).
+        release_date_iso = (normalize_date(str(release_date), NormalizeCtx.fresh())
+                            if release_date else None)
         # When the release tz isn't stated, prefer the *venue's* zone (from its
         # address/city) over the user's own — a NYC drop opens on NYC time.
         venue_tz = getattr(decision, "timezone", None) or timezone_for_location(
             getattr(decision, "address", None) or (slots or {}).get("location"))
         tz = resolve_timezone(tz_name, venue_tz)
-        fire_ts = compute_release_fire_ts(date_iso, int(days), release_hhmm, tz)
+        fire_ts = resolve_release_fire_ts(date_iso, release_hhmm, tz,
+                                          days_ahead=days, day_of_month=day_of_month,
+                                          release_date_iso=release_date_iso)
         if fire_ts is None or fire_ts <= time.time() + self._snipe_lead_s:
             return None   # bad input, or the window is already open → just book now
         return {"fire_ts": fire_ts, "display": describe_fire(fire_ts, tz),
-                "days_ahead": int(days), "release_hhmm": release_hhmm, "tz": str(tz),
+                "days_ahead": int(days) if days else None,
+                "day_of_month": int(day_of_month) if day_of_month else None,
+                "release_date": release_date_iso,
+                "release_hhmm": release_hhmm, "tz": str(tz),
                 "source": source, "confidence": round(float(confidence), 2),
                 "quote": (quote or "")[:300]}
 
@@ -1027,13 +1057,10 @@ class ReservationWorkflow(ConversationalWorkflow):
             slots["watch_label"] = m.group(1)
 
         # A stated release policy ("the September calendar drops 30 days out at
-        # 9am JST") is parsed off the tail so its clock time isn't read as a
-        # dining time.
-        self._extract_release_policy_regex(work, slots)
-        release_cut = work
-        kw = _RELEASE_DAYS_RE.search(work)
-        if kw:
-            release_cut = work[:kw.start()]
+        # 9am JST", "they open next month on the 20th at 10am") is parsed off
+        # the tail so its clock time / date isn't read as a dining one.
+        cut = self._extract_release_policy_regex(work, slots)
+        release_cut = work[:cut] if cut is not None else work
 
         ranges: List[List[str]] = []
         date_free = release_cut
@@ -1135,10 +1162,14 @@ class ReservationWorkflow(ConversationalWorkflow):
                     or timezone_for_location(decision.address or merged.get("location")
                                              or slug or biz))
         manual_release = None
-        if merged.get("release_days_ahead") and merged.get("release_time"):
-            manual_release = {"days": merged["release_days_ahead"],
+        if merged.get("release_time") and (merged.get("release_days_ahead")
+                                           or merged.get("release_day_of_month")
+                                           or merged.get("release_date")):
+            manual_release = {"days": merged.get("release_days_ahead"),
                               "time": merged["release_time"],
-                              "tz": merged.get("release_timezone")}
+                              "tz": merged.get("release_timezone"),
+                              "day_of_month": merged.get("release_day_of_month"),
+                              "release_date": merged.get("release_date")}
         update.update({
             "channel_decision": decision.to_dict(), "_pending_slot": None,
             "watch_pending": {"slug": slug, "business_name": biz,
@@ -1178,7 +1209,9 @@ class ReservationWorkflow(ConversationalWorkflow):
         if manual:
             rel = self._watch_release_from_policy(
                 ws, manual.get("days"), manual.get("time"), manual.get("tz"),
-                source="you", confidence=1.0)
+                source="you", confidence=1.0,
+                day_of_month=manual.get("day_of_month"),
+                release_date=manual.get("release_date"))
             if rel:
                 ws["release"] = rel
                 note = (f" Reservations open {rel['display']} — I'll check every "
@@ -1192,20 +1225,26 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     def _watch_release_from_policy(self, ws: Dict[str, Any], days, time_raw, tz_name,
                                    *, source: str, confidence: float,
-                                   quote: str = "") -> Optional[Dict[str, Any]]:
-        """(days-ahead, clock time, tz) → the watch's burst window around the
-        predicted drop, computed off the earliest active criterion date. None
-        when incomplete or the window has already opened."""
+                                   quote: str = "", day_of_month=None,
+                                   release_date=None) -> Optional[Dict[str, Any]]:
+        """A release policy (rolling days-ahead, a batch day-of-month, or an
+        absolute drop date, with clock time and tz) → the watch's burst window
+        around the predicted drop, computed off the earliest active criterion
+        date. None when incomplete or the window has already opened."""
         active = [c for c in ws.get("criteria", [])
                   if c.get("status", "active") == "active"]
-        if not active or not days:
+        if not active or not (days or day_of_month or release_date):
             return None
         hhmm = normalize_time(str(time_raw)) if time_raw else None
         if not hhmm:
             return None
+        release_date_iso = (normalize_date(str(release_date), NormalizeCtx.fresh())
+                            if release_date else None)
         earliest = min(c["date_start"] for c in active)
         tz = resolve_timezone(tz_name, ws.get("venue_tz"))
-        fire = compute_release_fire_ts(earliest, int(days), hhmm, tz)
+        fire = resolve_release_fire_ts(earliest, hhmm, tz, days_ahead=days,
+                                       day_of_month=day_of_month,
+                                       release_date_iso=release_date_iso)
         if fire is None or fire <= time.time():
             return None
         return {"checked": True, "fire_ts": fire,
@@ -1383,7 +1422,7 @@ class ReservationWorkflow(ConversationalWorkflow):
             rel = self._watch_release_from_policy(
                 ws, policy.days_in_advance, policy.release_time, policy.timezone,
                 source="web", confidence=policy.confidence,
-                quote=policy.source_quote)
+                quote=policy.source_quote, day_of_month=policy.day_of_month)
             if rel:
                 cite = f' (a source notes: "{rel["quote"][:120]}")' if rel.get("quote") else ""
                 await self._watch_notify(
@@ -2160,15 +2199,35 @@ class ReservationWorkflow(ConversationalWorkflow):
         return slots
 
     @staticmethod
-    def _extract_release_policy_regex(text: str, slots: Dict[str, Any]) -> None:
-        """Pull a stated release policy ("tables drop 30 days in advance at 10am
-        ET") so sniping works even without the LLM. The release time is taken
-        from after the open/drop keyword so it isn't confused with the dining
-        time stated earlier in the sentence."""
+    def _extract_release_policy_regex(text: str, slots: Dict[str, Any]) -> Optional[int]:
+        """Pull a stated release policy so sniping works even without the LLM.
+        Three shapes: rolling ("tables drop 30 days in advance at 10am ET"),
+        an absolute drop date ("reservations open on August 20 at 10am JST"),
+        or a monthly batch day ("they release next month on the 20th at 10am").
+        The release time is taken from after the open/drop keyword so it isn't
+        confused with the dining time stated earlier in the sentence.
+
+        Returns the offset where the policy statement starts — callers that
+        parse dining dates/times must ignore the text from there on — or None
+        when no policy was stated."""
+        cut: Optional[int] = None
         m = _RELEASE_DAYS_RE.search(text)
-        if not m:
-            return
-        slots["release_days_ahead"] = int(m.group(1))
+        if m:
+            slots["release_days_ahead"] = int(m.group(1))
+            cut = m.start()
+        dm = _RELEASE_ON_DATE_RE.search(text)
+        if dm:
+            iso = normalize_date(dm.group(1), NormalizeCtx.fresh())
+            if iso:
+                slots["release_date"] = iso
+                cut = dm.start() if cut is None else min(cut, dm.start())
+        elif m is None:
+            om = _RELEASE_DOM_RE.search(text)
+            if om:
+                slots["release_day_of_month"] = int(om.group(1))
+                cut = om.start()
+        if cut is None:
+            return None
         kw = _RELEASE_CTX_RE.search(text)
         region = text[kw.start():] if kw else text
         tm = _TIME_RE.search(region)
@@ -2177,4 +2236,5 @@ class ReservationWorkflow(ConversationalWorkflow):
         tz = _RELEASE_TZ_RE.search(text)
         if tz:
             slots["release_timezone"] = tz.group(1)
+        return cut
 
