@@ -325,9 +325,11 @@ class _SatelliteConnection:
             logger.info("Voice PE [%s] heard: %r", self.cfg.name, text)
             reply = await ch._handler(text, self.user_id)
             if reply and reply.strip():
-                # TTS_START drives the "replying" LED phase; without a TTS_END
-                # (which would carry a URL) the puck plays nothing itself.
-                self._send_event(VoiceAssistantEventType.VOICE_ASSISTANT_TTS_START, {"text": reply})
+                # No TTS_START here: Voice PE firmware (seen on 2025.5.1) enters
+                # its TTS phase on TTS_START and wedges there waiting for a
+                # TTS_END url we never send — frozen LEDs, wake word dead until
+                # power-cycle. The reply plays on the Mac before INTENT_END so
+                # the puck isn't listening while Friday talks.
                 await loop.run_in_executor(None, ch._speak_locked, reply)
             cont = "1" if ch._has_active(self.user_id) else "0"
             self._send_event(

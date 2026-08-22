@@ -21,8 +21,10 @@ requests>=2.28.0
 # piper-tts>=1.0.0
 # TTS>=0.17.0  # Coqui TTS
 
-# For MP3 playback
+# For MP3 playback. pydub needs stdlib audioop, removed in Python 3.13 —
+# audioop-lts is the drop-in backport (without it, MP3 replies fail silently).
 pydub>=0.25.1
+audioop-lts>=0.2; python_version >= "3.13"
 
 # LLM Providers
 anthropic>=0.18.0

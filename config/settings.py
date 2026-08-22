@@ -99,7 +99,9 @@ class TTSConfig:
     # ElevenLabs settings
     elevenlabs_api_key: Optional[str] = None  # Set via environment variable
     elevenlabs_voice_id: Optional[str] = None  # Set via ELEVENLABS_VOICE_ID env var
-    elevenlabs_model: str = "eleven_monolingual_v1"
+    # eleven_monolingual_v1 was deprecated by ElevenLabs (API now 400s on it);
+    # flash_v2_5 is their low-latency tier for assistants.
+    elevenlabs_model: str = "eleven_flash_v2_5"
     elevenlabs_stability: float = 0.5
     elevenlabs_similarity_boost: float = 0.75
     

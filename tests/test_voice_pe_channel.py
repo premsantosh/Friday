@@ -196,15 +196,16 @@ def test_full_utterance_event_sequence_and_handler():
         ET.VOICE_ASSISTANT_STT_START,
         ET.VOICE_ASSISTANT_STT_END,
         ET.VOICE_ASSISTANT_INTENT_START,
-        ET.VOICE_ASSISTANT_TTS_START,
         ET.VOICE_ASSISTANT_INTENT_END,
         ET.VOICE_ASSISTANT_RUN_END,
     ]
-    assert ET.VOICE_ASSISTANT_TTS_END not in types  # nothing plays on the puck
+    # No TTS events at all: TTS_END would carry a URL for the puck to play, and
+    # TTS_START alone wedges the firmware's TTS phase (seen live on 2025.5.1).
+    assert ET.VOICE_ASSISTANT_TTS_START not in types
+    assert ET.VOICE_ASSISTANT_TTS_END not in types
 
     by_type = dict(_events(timeline))
     assert by_type[ET.VOICE_ASSISTANT_STT_END] == {"text": "what time is it"}
-    assert by_type[ET.VOICE_ASSISTANT_TTS_START] == {"text": "It is noon, sir."}
     assert by_type[ET.VOICE_ASSISTANT_INTENT_END] == {
         "conversation_id": "conv-1", "continue_conversation": "0",
     }

@@ -1,0 +1,126 @@
+{
+ "cart": {
+  "id": "6a853ec2fa551d7161765a81",
+  "access_token": "XXXXXX",
+  "expires_at": "2026-08-19T14:37:30.777+09:00",
+  "service_mode": "dining",
+  "pax_adult": 1,
+  "pax_senior": 0,
+  "pax_child": 0,
+  "pax_baby": 0,
+  "start_at": "2026-08-24T23:00:00.000+09:00",
+  "manual_duration": null,
+  "seat_types": [],
+  "purpose": null,
+  "visit_history": null,
+  "special_request": "",
+  "smoking": "none",
+  "service_category_id": "661e2ceaeefe0c01f9b2c054",
+  "is_advance_postpay_allowed": null,
+  "is_smartpay_requested": false,
+  "show_billing_address_form": false,
+  "show_invoice_form": false,
+  "show_payment_form": true,
+  "show_smartpay_message": false,
+  "booking_fee_caveat_html": null,
+  "booking_fee_policy_html": null,
+  "input_orders": "one_or_more",
+  "payment_type": "postpay",
+  "payment_transaction_type": "register",
+  "is_payment_combined": false,
+  "payment_gateways": [
+   {
+    "id": "ba777992-5df1-4dd4-a063-2402ed219495",
+    "provider": "gmo",
+    "payment_methods": [
+     "card"
+    ],
+    "card_brands": [
+     "visa",
+     "mastercard",
+     "amex",
+     "diners",
+     "jcb"
+    ],
+    "public_key": "9200008019306",
+    "gateway_ref": "9200008019306",
+    "ui_type": "inline",
+    "is_3ds": true,
+    "input_billing_address": "hide",
+    "is_profile_enabled": false
+   }
+  ],
+  "payment_gateway_ui_options": [
+   {
+    "payment_method": "card",
+    "payment_gateway_id": "ba777992-5df1-4dd4-a063-2402ed219495",
+    "position": 0
+   }
+  ],
+  "bin_promotion": null,
+  "bin_promotion_conflicting": false,
+  "payment_group_fee_amt": 0,
+  "payment_pax_fee_amt": "5000.0",
+  "payment_subtotal_amt": 0,
+  "payment_discount_amt": 0,
+  "payment_service_fee_amt": 0,
+  "payment_delivery_fee_amt": "0.0",
+  "payment_tax_amt": 0,
+  "payment_total_amt": 0,
+  "payment_price_percent": 1,
+  "points_award_amt": 0,
+  "points_redeem_amt": "0.0",
+  "points_balance": null,
+  "points_earn_enabled": false,
+  "points_redeem_enabled": false,
+  "points_currency": "JPY",
+  "voucher_credit_amt": "0.0",
+  "cash_subtotal_amt": "0",
+  "cash_discount_amt": "0.0",
+  "cash_service_fee_amt": "0.0",
+  "cash_tax_amt": "0.0",
+  "cash_total_amt": "0.0",
+  "grand_total_amt": "5000.0",
+  "cancel_fee_amts": [
+   {
+    "advance_time": 86400,
+    "total_cancel_fee_amt": "5000.0"
+   }
+  ],
+  "applicable_cancel_fee_rule_ids": [
+   "661e3d325a39ac02fabebb48"
+  ],
+  "booking_fee_amt": "0",
+  "booking_fee_public_key": "9200006520132",
+  "booking_fee_supported_brands": [],
+  "booking_fee_provider": null,
+  "payment_maintenance_alert_html": null,
+  "menu_item_ids": [],
+  "menu_list_ids": [],
+  "validation_errors": {},
+  "show_voucher_policy_text": false,
+  "tc_points_cancel_policy_applicable": false,
+  "preferred_text_provider_options": [],
+  "magic_link_required": false,
+  "magic_link_verified": true,
+  "authorized_customer": null,
+  "membership_auth": null,
+  "amend_reservation": null,
+  "promo": null,
+  "orders": [],
+  "answers": [],
+  "vouchers": [],
+  "pax_qtys": [],
+  "pax_categories": [],
+  "payment_profiles": [],
+  "invalid_payment_profiles": [],
+  "valid_payment_profiles": []
+ },
+ "availability": {
+  "code": "success",
+  "type": "success",
+  "data": null,
+  "message": null
+ },
+ "is_request_enabled": false
+}

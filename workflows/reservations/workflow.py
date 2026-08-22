@@ -202,6 +202,12 @@ _WATCH_ADD_RE = re.compile(
     r"\b(?:watch|keep (?:an eye|watch(?:ing)?|checking)|monitor)\b"
     r"|\blet me know (?:if|when|the moment)\b.{0,50}"
     r"\b(?:opens?|frees? up|available|cancell?ation)", re.I)
+# "...and book it" / "grab it the moment it opens": the watch should book, not
+# just alert. Checked only on a turn that already matched _WATCH_ADD_RE.
+_WATCH_BOOK_RE = re.compile(
+    r"\b(?:and\s+)?(?:book|grab|snag|snap up|reserve|lock in)\b(?!\s+(?:link|url))", re.I)
+_WATCH_RESUME_RE = re.compile(
+    r"\bresume (?:auto[- ]?)?booking\b|\btry booking again\b|\bstart booking again\b", re.I)
 _WATCH_STOP_RE = re.compile(
     r"\bstop (?:watching|the watch)\b|\bcall off the watch\b|\bcancel the watch\b", re.I)
 _WATCH_STATUS_RE = re.compile(
@@ -311,8 +317,18 @@ class ReservationWorkflow(ConversationalWorkflow):
             os.getenv("TABLECHECK_WATCH_INTERVAL_SECONDS", "300")))
         self._tc_watch_idle_s = max(300, int(
             os.getenv("TABLECHECK_WATCH_IDLE_INTERVAL_SECONDS", "3600")))
-        self._tc_burst_s = max(60, int(os.getenv("TABLECHECK_WATCH_BURST_SECONDS", "60")))
+        # Burst cadence around a predicted drop. Floor 20s: one cheap POST per
+        # party size, and a contested drop is decided in well under a minute.
+        self._tc_burst_s = max(20, int(os.getenv("TABLECHECK_WATCH_BURST_SECONDS", "60")))
         self._tc_burst_tail_s = float(os.getenv("TABLECHECK_BURST_TAIL_SECONDS", "3600"))
+        # While bursting, one tick keeps polling inside itself for up to this
+        # long, so the cadence isn't quantised to the runner's 30s tick.
+        self._tc_burst_inner_s = float(os.getenv("TABLECHECK_BURST_INNER_SECONDS", "240"))
+        # Auto-book: how many booking attempts one watch may make in total, and
+        # how long to leave a date alone after a failed attempt on it.
+        self._tc_book_max_attempts = int(os.getenv("TABLECHECK_BOOK_MAX_ATTEMPTS", "40"))
+        self._tc_book_cooldown_s = float(os.getenv("TABLECHECK_BOOK_COOLDOWN_SECONDS", "120"))
+        self._watch_card: Any = None   # minted card kept in-process for retries
         self._tc_unit_spacing_s = float(os.getenv("TABLECHECK_UNIT_SPACING_SECONDS", "5"))
         self._tc_dedupe_s = 1800.0
         self._tc_max_backoff_s = 1800.0
@@ -783,13 +799,15 @@ class ReservationWorkflow(ConversationalWorkflow):
                                    slots_update={"booking_result": {"success": False,
                                                                      "needs_manual": True}})
 
-    async def _execute_mint(self, session: Session, plan: CommitPlan):
+    async def _execute_mint(self, session: Session, plan: CommitPlan, attempt: int = 0):
         """Run the (already-approved) single-use card mint when one is needed.
         Returns (payment, error_turn): payment is None when no card is required;
-        error_turn is a terminal TurnResult when the mint is refused or fails."""
+        error_turn is a terminal TurnResult when the mint is refused or fails.
+        `attempt` distinguishes repeated mints for one plan (a watch that
+        retries across ticks/restarts) in the idempotency key."""
         if not (plan.requires_card and self.payment is not None):
             return None, None
-        mint_action = self._mint_action(session, plan)
+        mint_action = self._mint_action(session, plan, attempt=attempt)
         minted = await self.gate.execute(
             mint_action, session,
             lambda: asyncio.to_thread(self.payment.mint_single_use))
@@ -984,13 +1002,17 @@ class ReservationWorkflow(ConversationalWorkflow):
         r"(?=\s+(?:for|on|at|from|between|next|this|tomorrow|today|in)\b|[?.!,]|$)",
         re.I)
     _WATCH_LABEL_RE = re.compile(r"['\"]([^'\"]{2,40})['\"]")
-    _WATCH_EXTRA_DAY_RE = re.compile(r"\b(?:or|and|,)\s+(\d{1,2})(?:st|nd|rd|th)\b", re.I)
+    # No leading \b: the scanned window starts right at the "," after the first
+    # date ("September 5th, 9th, …"), where a word boundary can't match.
+    _WATCH_EXTRA_DAY_RE = re.compile(r"(?:\bor|\band|,)\s+(\d{1,2})(?:st|nd|rd|th)\b", re.I)
 
     async def _maybe_watch_turn(self, text: str, session: Session) -> Optional[TurnResult]:
         """Route watch verbs. Order matters: control phrases contain the word
         'watch' too, so they must win over the add-a-watch match."""
         if _WATCH_STOP_RE.search(text):
             return self._watch_stop(text, session)
+        if _WATCH_RESUME_RE.search(text):
+            return self._watch_resume(session)
         if _WATCH_STATUS_RE.search(text):
             return self._watch_status(session)
         if _WATCH_FULFILLED_RE.search(text):
@@ -1072,6 +1094,8 @@ class ReservationWorkflow(ConversationalWorkflow):
         times = parse_times(date_free)
         if times:
             slots["watch_times"] = times
+        if _WATCH_BOOK_RE.search(work):
+            slots["watch_autobook"] = True
         return slots
 
     async def _advance_watch(self, session: Session, slots_update: Dict[str, Any]) -> TurnResult:
@@ -1139,20 +1163,85 @@ class ReservationWorkflow(ConversationalWorkflow):
             manual_release = {"days": merged["release_days_ahead"],
                               "time": merged["release_time"],
                               "tz": merged.get("release_timezone")}
-        update.update({
-            "channel_decision": decision.to_dict(), "_pending_slot": None,
-            "watch_pending": {"slug": slug, "business_name": biz,
-                              "venue_tz": venue_tz,
-                              "criteria": [c.to_dict() for c in criteria],
-                              "release_manual": manual_release},
-        })
+        autobook = bool(merged.get("watch_autobook"))
+        pending = {"slug": slug, "business_name": biz, "venue_tz": venue_tz,
+                   "criteria": [c.to_dict() for c in criteria],
+                   "release_manual": manual_release, "autobook": autobook}
         wants = "; ".join(c.describe() for c in criteria)
-        return TurnResult.confirm(
-            f"I'll keep a standing watch on {biz} via TableCheck for: {wants}. "
-            f"The moment something opens I'll message you on Telegram with a "
-            f"booking link — I won't book anything myself. Shall I set it up, sir?",
-            slots_update=update,
-            next_state=self._fire(session, "gate_watchlist"))
+        if autobook:
+            contact = self._watch_contact_facts(merged)
+            missing = [k for k in ("guest_name", "email", "phone") if not contact.get(k)]
+            if missing:
+                return TurnResult.complete(
+                    f"To book {biz} for you I need your full name, email and phone on "
+                    f"file, sir (missing: {', '.join(missing)}). Add them with "
+                    f"`python -m core.profile set <key> <value>` and ask again.",
+                    slots_update={**update, "channel_decision": decision.to_dict()})
+            pending["contact"] = contact
+            pending["book_plan"] = self._watch_book_plan(pending)
+            card_note = (" They'll want a card on file for their cancellation policy, "
+                         "so I'll use the single-use card." if self.payment is not None else
+                         " Note: I have no card configured, so a venue that needs one "
+                         "will fall back to a booking link.")
+            prompt = (f"I'll keep a standing watch on {biz} via TableCheck for: {wants}, "
+                      f"and the moment a matching table opens I'll book it for "
+                      f"{contact['guest_name']} ({contact['email']}, {contact['phone']}) "
+                      f"without asking again — earliest listed date first, earliest "
+                      f"seating first.{card_note} You'll get Telegram updates either way. "
+                      f"Shall I set it up, sir?")
+        else:
+            prompt = (f"I'll keep a standing watch on {biz} via TableCheck for: {wants}. "
+                      f"The moment something opens I'll message you on Telegram with a "
+                      f"booking link — I won't book anything myself. Shall I set it up, sir?")
+        update.update({"channel_decision": decision.to_dict(), "_pending_slot": None,
+                       "watch_pending": pending})
+        return TurnResult.confirm(prompt, slots_update=update,
+                                  next_state=self._fire(session, "gate_watchlist"))
+
+    def _watch_contact_facts(self, merged: Dict[str, Any]) -> Dict[str, str]:
+        """Name/email/phone for an auto-booking watch: explicit slots, then the
+        durable profile (casual persona — restaurants), then env."""
+        out = {"guest_name": merged.get("guest_name") or "",
+               "email": merged.get("email") or "", "phone": merged.get("phone") or ""}
+        try:
+            prof = self.profile
+            from core.profile import DEFAULT_CONTEXT
+            for ctx in ("casual", DEFAULT_CONTEXT):
+                vals = prof.values(["full_name", "email", "phone"], ctx)
+                out["guest_name"] = out["guest_name"] or vals.get("full_name", "")
+                out["email"] = out["email"] or vals.get("email", "")
+                out["phone"] = out["phone"] or vals.get("phone", "")
+        except Exception:
+            logger.debug("Profile lookup failed for watch contact", exc_info=True)
+        out["guest_name"] = out["guest_name"] or os.getenv("RESERVATION_GUEST_NAME", "")
+        out["email"] = out["email"] or os.getenv("RESERVATION_USER_EMAIL", "")
+        out["phone"] = out["phone"] or os.getenv("RESERVATION_USER_PHONE", "")
+        return {k: (v or "").strip() for k, v in out.items()}
+
+    @staticmethod
+    def _watch_book_plan(pending: Dict[str, Any]) -> Dict[str, Any]:
+        """The *envelope* the user approves for an auto-booking watch: venue,
+        party, the acceptable dates/times and the contact facts. Its hash is
+        the approval's identity; the concrete slot booked must fall inside it.
+        Kept free of volatile fields so retries hash identically."""
+        criteria = pending.get("criteria") or []
+        contact = pending.get("contact") or {}
+        return CommitPlan(
+            channel="tablecheck",
+            summary=(f"Auto-book {pending.get('business_name')} via TableCheck for "
+                     f"{criteria[0]['party_size'] if criteria else '?'} on any of "
+                     + "; ".join(WatchCriterion.from_dict(c).describe() for c in criteria)),
+            details={
+                "slug": pending.get("slug"), "business_name": pending.get("business_name"),
+                "party_size": criteria[0]["party_size"] if criteria else None,
+                "criteria": [{"date_start": c["date_start"], "date_end": c["date_end"],
+                              "times": c.get("times"), "party_size": c["party_size"]}
+                             for c in criteria],
+                "guest_name": contact.get("guest_name"), "email": contact.get("email"),
+                "phone": contact.get("phone"),
+            },
+            requires_card=True,
+        ).to_dict()
 
     async def _handle_watchlist_confirmation(self, text: str, session: Session) -> TurnResult:
         decision = parse_confirmation(text)
@@ -1174,6 +1263,21 @@ class ReservationWorkflow(ConversationalWorkflow):
             "release": {"checked": False}, "created_at": now,
         }
         note = ""
+        if pending.get("autobook") and pending.get("book_plan"):
+            # The yes just given covers booking any slot inside the envelope,
+            # and the card mint, for as long as the watch can run.
+            plan = CommitPlan.from_dict(pending["book_plan"])
+            last_day = max(c["date_end"] for c in pending["criteria"])
+            ttl = max(0.0, datetime.fromisoformat(last_day + "T23:59:59").timestamp() - now) \
+                + 2 * 86400
+            self.gate.record_approval(session, self._action(ActionKind.BOOK, session, plan),
+                                      ttl_s=ttl, max_uses=self._tc_book_max_attempts + 1)
+            if plan.requires_card and self.payment is not None:
+                self.gate.record_approval(session, self._mint_action(session, plan),
+                                          ttl_s=ttl, max_uses=self._tc_book_max_attempts + 1)
+            ws["autobook"] = {"plan": pending["book_plan"], "attempts": {}, "count": 0,
+                              "paused": None, "booked": None}
+            note = " I'll book the first matching table I see."
         manual = pending.get("release_manual")
         if manual:
             rel = self._watch_release_from_policy(
@@ -1181,8 +1285,8 @@ class ReservationWorkflow(ConversationalWorkflow):
                 source="you", confidence=1.0)
             if rel:
                 ws["release"] = rel
-                note = (f" Reservations open {rel['display']} — I'll check every "
-                        f"minute around the drop.")
+                note += (f" Reservations open {rel['display']} — I'll check every "
+                         f"minute around the drop.")
         return TurnResult.background(
             f"Very good, sir — the watch on {pending['business_name']} is on."
             f"{note} First check momentarily.",
@@ -1216,8 +1320,11 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     async def _tick_watchlist(self, session: Session) -> Optional[TurnResult]:
         """One polling cycle of a standing watch: fetch each (party, month)
-        unit, diff against the last snapshot, notify on matches, then choose
-        the next wake — normal / idle-until-drop / burst cadence."""
+        unit, diff against the last snapshot, notify on matches, try to book
+        when the watch is auto-booking, then choose the next wake — normal /
+        idle-until-drop / burst cadence. Around a predicted drop the tick keeps
+        cycling inside itself for a bounded stretch so the cadence isn't
+        quantised to the runner's tick."""
         ws = session.slots["watchlist_state"]
         now = time.time()
         biz = ws.get("business_name") or "the venue"
@@ -1250,6 +1357,27 @@ class ReservationWorkflow(ConversationalWorkflow):
                 f"I can no longer reach TableCheck for {biz}, sir.",
                 slots_update={"watchlist_state": None})
 
+        tick_started = now
+        while True:
+            outcome = await self._watch_cycle(session, ws, channel, active, biz)
+            if isinstance(outcome, TurnResult):
+                return outcome
+            any_open = outcome
+            now = time.time()
+            if not (self._watch_in_burst(ws, now)
+                    and now - tick_started < self._tc_burst_inner_s):
+                break
+            await asyncio.sleep(self._tc_burst_s + random.uniform(0, 3))
+
+        return TurnResult.background(
+            "", wake_at=self._watch_next_wake(ws, now, any_open),
+            slots_update={"watchlist_state": ws})
+
+    async def _watch_cycle(self, session, ws, channel, active, biz):
+        """Fetch → diff → deliver → (auto-book). Returns any_open (bool), or a
+        TurnResult when the cycle ends the tick early (backoff, drift pause,
+        booked)."""
+        now = time.time()
         slug = ws["slug"]
         snapshots = session.scratch.setdefault("tc_snapshots", {})
         cycle = []   # (party, state, events) per fetch unit
@@ -1288,6 +1416,12 @@ class ReservationWorkflow(ConversationalWorkflow):
         await self._watch_deliver_events(session, ws, channel, cycle, active, now)
 
         any_open = any(open_dates(s) for _, s, _ in cycle)
+        if any_open and (ws.get("autobook") or {}).get("plan") \
+                and not (ws["autobook"].get("paused") or ws["autobook"].get("booked")):
+            done = await self._watch_try_booking(session, ws, channel, cycle, active)
+            if done is not None:
+                return done
+
         if not any_open and not (ws.get("release") or {}).get("checked"):
             ws["release"] = await self._watch_research_release(session, ws, biz)
 
@@ -1296,10 +1430,157 @@ class ReservationWorkflow(ConversationalWorkflow):
                   if not str(k).startswith("cal|")
                   and isinstance(ts, (int, float)) and now - ts > 86400]:
             notified.pop(k)
+        return any_open
 
-        return TurnResult.background(
-            "", wake_at=self._watch_next_wake(ws, now, any_open),
-            slots_update={"watchlist_state": ws})
+    def _watch_in_burst(self, ws: Dict[str, Any], now: float) -> bool:
+        rel = ws.get("release") or {}
+        fire, until = rel.get("fire_ts"), rel.get("burst_until")
+        return bool(fire and until and (fire - self._tc_burst_s) <= now <= until)
+
+    # ------------------------------------------------------ auto-book (M9)
+    async def _watch_try_booking(self, session, ws, channel, cycle, active
+                                 ) -> Optional[TurnResult]:
+        """Book the best open slot inside the approved envelope. Dates are
+        tried in the order the criteria were given (then by date), seatings
+        earliest first among the acceptable times. One success closes the
+        watch; a failure is reported and that date rests for a cooldown."""
+        ab = ws["autobook"]
+        plan = CommitPlan.from_dict(ab["plan"])
+        biz = ws.get("business_name") or "the venue"
+        slug = ws["slug"]
+        now = time.time()
+        attempts: Dict[str, Any] = ab.setdefault("attempts", {})
+
+        targets = []   # (order, date, party, criterion)
+        for order, c in enumerate(active):
+            for party, state, _ in cycle:
+                if party != c.party_size:
+                    continue
+                for d in open_dates(state):
+                    if c.date_start <= d <= c.date_end:
+                        targets.append((c.priority, order, d, party, c))
+        targets.sort()
+        for _, _, d, party, c in targets:
+            att = attempts.get(d) or {}
+            if now - float(att.get("last_ts", 0)) < self._tc_book_cooldown_s:
+                continue
+            if int(ab.get("count", 0)) >= self._tc_book_max_attempts:
+                ab["paused"] = "attempt_budget"
+                await self._watch_notify(
+                    session, f"⚠️ I've used up my booking attempts for {biz}, sir — I'll "
+                             f"keep alerting you but won't try to book again.")
+                return None
+
+            await self._watch_notify(
+                session, f"🎯 {biz}: {display_date(d)} is OPEN for {party} — booking now…")
+            try:
+                slots = await channel.fetch_day_slots(slug, party, d)
+            except TableCheckError as exc:
+                attempts[d] = {"last_ts": now, "count": int(att.get("count", 0)) + 1,
+                               "error": f"slots:{exc}"}
+                await self._watch_notify(
+                    session, f"⚠️ Couldn't read {biz}'s seatings for {display_date(d)} "
+                             f"({exc}); I'll retry shortly.")
+                continue
+            times = [t for t, st in sorted(slots.items()) if st == "available"]
+            if c.times:
+                times = [t for t in times if t in c.times]
+            if not times:
+                attempts[d] = {"last_ts": now, "count": int(att.get("count", 0)) + 1,
+                               "error": "no_matching_time"}
+                link = channel.booking_url(slug, d, None, party)
+                await self._watch_notify(
+                    session, f"↩️ {biz}: {display_date(d)} shows open but no "
+                             f"{'acceptable ' if c.times else ''}seating is free right now "
+                             f"({', '.join(display_time(t) for t in sorted(slots)) or 'none listed'}). "
+                             f"Watching on. {link}")
+                continue
+
+            # One card per process; a fresh mint (new idempotency attempt) only
+            # after a restart. The manual/single-use card is the same either way.
+            payment = self._watch_card
+            mint_error = None
+            if payment is None:
+                ab["count"] = int(ab.get("count", 0)) + 1
+                payment, mint_error = await self._execute_mint(session, plan,
+                                                               attempt=int(ab["count"]))
+                self._watch_card = payment
+            if mint_error is not None:
+                ab["paused"] = "card"
+                await self._watch_notify(
+                    session, f"⚠️ {biz}: {display_date(d)} is open but I couldn't set up the "
+                             f"card, sir — book it yourself: "
+                             f"{channel.booking_url(slug, d, times[0], party)}")
+                return None
+
+            for t in times:
+                ab["count"] = int(ab.get("count", 0)) + 1
+                slot_plan = CommitPlan.from_dict({**plan.to_dict()})
+                slot_plan.details = {**plan.details, "date": d, "time": t, "party_size": party,
+                                     "url": channel.booking_url(slug, d, t, party)}
+                book_action = self._action(ActionKind.BOOK, session, plan,
+                                           attempt=int(ab["count"]))
+                if self.session_store is not None:
+                    # Persist the attempt counter before acting, so a crash
+                    # mid-booking can't replay the same attempt key.
+                    try:
+                        self.session_store.save(session)
+                    except Exception:
+                        logger.debug("Pre-commit save failed", exc_info=True)
+                outcome = await self.gate.execute(
+                    book_action, session, lambda: channel.commit(slot_plan, payment=payment))
+                if not outcome.ok:
+                    ab["paused"] = "refused"
+                    msg = self._refusal_message(outcome.refusal)
+                    await self._watch_notify(
+                        session, f"⛔ I stopped short of booking {biz}, sir — {msg} "
+                                 f"Link: {channel.booking_url(slug, d, t, party)}")
+                    return None
+                result = outcome.result
+                if result.success:
+                    for x in ws["criteria"]:
+                        x["status"] = "fulfilled"
+                    ab["booked"] = {"date": d, "time": t, "party": party,
+                                    "confirmation": result.confirmation, "ts": time.time()}
+                    note = await self._on_confirmed(session, slot_plan, result.confirmation)
+                    await self._watch_notify(
+                        session, f"🍸 Done — {biz} on {display_date(d)} at {display_time(t)} "
+                                 f"for {party} is booked"
+                                 f"{' (confirmation ' + str(result.confirmation) + ')' if result.confirmation else ''}."
+                                 f" Show the card ending •{getattr(payment, 'last_four', '????')} "
+                                 f"at the door; late cancellation is on their policy.")
+                    return TurnResult.complete(
+                        f"Booked {biz} on {display_date(d)} at {display_time(t)} for {party}, "
+                        f"sir.{note}",
+                        slots_update={"watchlist_state": ws,
+                                      "booking_result": {"success": True,
+                                                         "confirmation": result.confirmation}})
+                # Failure on this seating.
+                if result.error == "3ds_pending":
+                    ab["paused"] = "3ds"
+                    await self._watch_notify(session, f"🔐 {result.message}")
+                    await self._watch_notify(
+                        session, "I've paused auto-booking so I don't fight your session; say "
+                                 "'resume booking' once it's done, or 'stop watching'.")
+                    return None
+                if result.error in ("slot_not_found", "not_open"):
+                    await self._watch_notify(
+                        session, f"↩️ {biz}: {display_date(d)} {display_time(t)} slipped away "
+                                 f"({result.message}). Trying the next seating…")
+                    continue
+                # Anything else (validation, card declined, unsupported gateway,
+                # crash): don't hammer — report with the link and pause auto-book.
+                ab["paused"] = result.error or "failed"
+                await self._watch_notify(
+                    session, f"⚠️ Couldn't book {biz} for {display_date(d)} "
+                             f"{display_time(t)}: {result.message}")
+                await self._watch_notify(
+                    session, "I've paused auto-booking (I'll still alert you on openings). "
+                             "Say 'resume booking' after fixing it, or 'stop watching'.")
+                return None
+            attempts[d] = {"last_ts": time.time(), "count": int(att.get("count", 0)) + 1,
+                           "error": "seatings_gone"}
+        return None
 
     async def _watch_deliver_events(self, session, ws, channel, cycle, active, now) -> None:
         """Turn one cycle's diff events into Telegram notifications (deduped)."""
@@ -1352,6 +1633,16 @@ class ReservationWorkflow(ConversationalWorkflow):
                         f"📅 {biz}: the {state.get('month')} calendar is live "
                         f"for {party} — open on your dates: {days}. Book: "
                         f"{channel.booking_url(slug, relevant[0], None, party)}")
+                else:
+                    others = open_dates(state)
+                    tail = (" Open elsewhere that month: "
+                            + ", ".join(display_date(d) for d in others[:8]) + "."
+                            if others else " Nothing is open for that party size yet.")
+                    await self._watch_notify(
+                        session,
+                        f"📅 {biz}: the {state.get('month')} calendar is live for "
+                        f"{party}, but none of your dates are open right now.{tail} "
+                        f"I'll keep watching for a cancellation.")
                 continue
 
             for ev, best in opened_matched:
@@ -1415,7 +1706,8 @@ class ReservationWorkflow(ConversationalWorkflow):
             interval = self._tc_watch_idle_s + random.uniform(-60, 60)
         else:
             interval = self._tc_watch_interval_s + random.uniform(-30, 30)
-        return now + max(60.0, interval)
+        floor = float(self._tc_burst_s) if self._watch_in_burst(ws, now) else 60.0
+        return now + max(floor, interval)
 
     async def _watch_notify(self, session: Session, message: str) -> None:
         """Best-effort Telegram note — the watch's only notification path while
@@ -1472,6 +1764,23 @@ class ReservationWorkflow(ConversationalWorkflow):
         names = ", ".join(s.slots["watchlist_state"].get("business_name", "a venue")
                           for s in targets)
         return TurnResult.complete(f"Very good, sir — I've called off the watch on {names}.")
+
+    def _watch_resume(self, session: Session) -> TurnResult:
+        """'resume booking': lift an auto-book pause (card fixed, 3-DS done…)."""
+        watches = [s for s in self._watch_sessions(session.user_id)
+                   if (s.slots["watchlist_state"].get("autobook") or {}).get("plan")]
+        if not watches:
+            return TurnResult.complete("I have no auto-booking watch to resume, sir.")
+        names = []
+        for s in watches:
+            ab = s.slots["watchlist_state"]["autobook"]
+            ab["paused"] = None
+            ab["attempts"] = {}
+            s.wake_at = time.time()
+            self.session_store.save(s)
+            names.append(s.slots["watchlist_state"].get("business_name", "a venue"))
+        return TurnResult.complete(
+            f"Very good, sir — auto-booking is back on for {', '.join(names)}.")
 
     def _watch_fulfilled(self, text: str, session: Session) -> TurnResult:
         watches = self._watch_sessions(session.user_id)
@@ -1532,6 +1841,14 @@ class ReservationWorkflow(ConversationalWorkflow):
             rel = ws.get("release") or {}
             if rel.get("fire_ts") and now < rel["fire_ts"]:
                 bits.append(f"expecting the drop {rel.get('display')}")
+            ab = ws.get("autobook") or {}
+            if ab.get("plan"):
+                if ab.get("booked"):
+                    bits.append("booked")
+                elif ab.get("paused"):
+                    bits.append(f"auto-booking paused ({ab['paused']}) — say 'resume booking'")
+                else:
+                    bits.append(f"will auto-book ({int(ab.get('count', 0))} attempts so far)")
             lines.append(f"{ws.get('business_name', 'A venue')}: " + " — ".join(bits))
         return TurnResult.complete("Here's where we stand, sir. " + " | ".join(lines))
 
@@ -1541,10 +1858,10 @@ class ReservationWorkflow(ConversationalWorkflow):
         return Action(kind=kind, session_id=session.session_id, workflow=self.name,
                       plan=plan.to_dict(), scope=scope, attempt=attempt)
 
-    def _mint_action(self, session: Session, plan: CommitPlan) -> Action:
+    def _mint_action(self, session: Session, plan: CommitPlan, attempt: int = 0) -> Action:
         amount = getattr(self.payment, "limit_usd", HARD_CAP_USD) if self.payment else None
         return Action(kind=ActionKind.MINT_CARD, session_id=session.session_id,
-                      workflow=self.name, amount_usd=amount,
+                      workflow=self.name, amount_usd=amount, attempt=attempt,
                       plan={"purpose": "single_use_card",
                             "business_name": plan.details.get("business_name"),
                             "amount_usd": amount})

@@ -85,7 +85,7 @@ class ElevenLabsTTS(TTSProvider):
             }
         }
         
-        response = requests.post(url, json=data, headers=headers)
+        response = requests.post(url, json=data, headers=headers, timeout=30)
         response.raise_for_status()
         
         return response.content

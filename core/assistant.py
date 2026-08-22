@@ -4,6 +4,7 @@ Orchestrates STT, LLM, TTS, wake word detection, and workflows.
 """
 
 import asyncio
+import logging
 import os
 from typing import Optional, Callable
 from enum import Enum
@@ -296,6 +297,9 @@ class VoiceAssistant:
             self.player.play_bytes(audio_bytes, format=self.tts.audio_format)
             
         except Exception as e:
+            # Warning (not debug): a broken TTS otherwise fails in total
+            # silence — every channel just goes mute with nothing in the logs.
+            logging.getLogger(__name__).warning("TTS failed, reply not spoken: %s", e)
             self._log(f"TTS error: {e}")
             if self.on_error:
                 self.on_error(f"Speech synthesis failed: {e}")
