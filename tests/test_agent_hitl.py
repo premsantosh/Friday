@@ -9,7 +9,6 @@ from agent.store import SqliteAgentStore
 from agent.tools import GATE_SPECS, GateSpec
 from core.harness import EXEC_OK, GATE_DENY, ActionGate, ActionKind, AuditLog
 from tests.agent_fakes import (
-    EchoTimeWorkflow,
     FakeLockWorkflow,
     ScriptedChatModel,
     make_assistant,

@@ -29,7 +29,7 @@ import asyncio
 import logging
 import threading
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from langchain_core.messages import (
     AIMessage,
@@ -43,7 +43,7 @@ from langchain_core.messages import (
 from llm.providers import generate_personality_prompt
 
 from .tracing import CONTEXT_CLOSE, CONTEXT_OPEN
-from .tools import FAILURE_PREFIXES, START_TASK, ToolSet
+from .tools import FAILURE_PREFIXES, ToolSet
 
 logger = logging.getLogger(__name__)
 

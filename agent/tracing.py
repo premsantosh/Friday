@@ -27,7 +27,7 @@ import hashlib
 import logging
 import os
 import re
-from typing import Any, Optional
+from typing import Any
 
 from config import AgentConfig
 from core.harness import redact_text
