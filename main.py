@@ -31,6 +31,9 @@ Environment Variables:
     COFFEE_MACHINE_AUTO_ON    - true/false, enable scheduled auto-on (default: true)
     COFFEE_MACHINE_IDLE_ALERT_MIN - minutes idle before alert (default: 45)
     COFFEE_MACHINE_WARMUP_MINUTES - warm-up time in minutes (default: 20)
+    FRIDAY_AGENT_ENGINE   - Optional, "langgraph" to route free-form requests through
+                            the checkpointed LangGraph agent (default: legacy router)
+    FRIDAY_LANGSMITH_TRACING - Optional, "true" + LANGSMITH_API_KEY to trace agent runs
 """
 
 import argparse
@@ -56,6 +59,7 @@ from config import (
     LLMConfig,
     WakeWordConfig,
     IntentCacheConfig,
+    AgentConfig,
     SarcasmLevel,
     FormalityLevel,
     WarmthLevel,
@@ -174,6 +178,8 @@ def create_custom_config(args) -> AssistantConfig:
             porcupine_sensitivity=0.5,
         ),
         intent_cache=IntentCacheConfig(enabled=not is_ephemeral),
+        # FRIDAY_AGENT_ENGINE / FRIDAY_LANGSMITH_TRACING / LANGSMITH_* (see .env.example)
+        agent=AgentConfig.from_env(),
         debug_mode=args.debug,
     )
 
@@ -298,6 +304,7 @@ def run_text_chat(config: AssistantConfig):
     print(f"{'='*50}")
     print(f"  TTS: {assistant.tts.get_name()}")
     print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  Engine: {assistant.engine_label}")
     print(f"{'='*50}")
     print(f"Type your messages below. Commands:")
     print(f"  'quit' or 'exit' - End the conversation")
@@ -335,14 +342,15 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
 
     notify_owner = (lambda msg: channel.send(msg, owner)) if owner else (lambda msg: None)
 
-    # Re-point session notifications at the channel, since there's no speaker
-    # in this mode (the assistant built its runner wired to speak()).
+    # Re-point session (and agent wake-up) notifications at the channel, since
+    # there's no speaker in this mode (the assistant built its runner wired to speak()).
     if assistant.sessions is not None:
         from core.conversation import BackgroundTaskRunner
         assistant.background_runner = BackgroundTaskRunner(
             assistant.sessions,
             notify_owner,
             tick_seconds=config.conversation.background_tick_seconds,
+            agent_engine=assistant.agent_engine,
         )
         assistant.background_runner.start()
 
@@ -358,6 +366,7 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
     print(f"  {name} - {label} Mode")
     print(f"{'='*50}")
     print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  Engine: {assistant.engine_label}")
     print(f"  {summary}")
     print(f"{'='*50}")
     print("  Text Friday from your phone. (Press Ctrl+C to quit)\n")
@@ -415,6 +424,7 @@ def run_all(config: AssistantConfig, debug: bool = False):
     print(f"{'='*50}")
     print(f"  TTS: {assistant.tts.get_name()}")
     print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  Engine: {assistant.engine_label}")
 
     # Coffee-machine alerts speak aloud (mic/speaker present in this mode).
     coffee_workflow = workflow_manager.get_workflow("coffee_machine")

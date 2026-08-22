@@ -33,6 +33,12 @@ _EXTERNAL_SERVICE_ENV = (
     # TableCheck watcher: a developer's endpoint override would change the URLs
     # the fixture-driven channel tests assert on.
     "TABLECHECK_AVAILABILITY_URL",
+    # LangGraph agent engine: the suite must behave identically whatever the
+    # developer's shell says, and must never upload a trace (LangSmith free-tier
+    # quota) or trip the gated-action kill switch by accident.
+    "FRIDAY_AGENT_ENGINE", "FRIDAY_LANGSMITH_TRACING", "FRIDAY_KILL_SWITCH",
+    "LANGSMITH_API_KEY", "LANGSMITH_TRACING", "LANGSMITH_PROJECT",
+    "LANGSMITH_TRACING_SAMPLING_RATE", "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2",
 )
 
 

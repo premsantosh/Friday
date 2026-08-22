@@ -52,6 +52,17 @@ tavily-python>=0.5.0
 # Semantic intent cache
 chromadb>=0.5.0
 
+# LangGraph agent engine (opt-in: FRIDAY_AGENT_ENGINE=langgraph). Open-source
+# libraries only, checkpoints in a local SQLite file; imports are guarded so
+# Friday runs on the legacy router without them. LangSmith tracing is optional
+# (langsmith is already a transitive dep of langchain-core).
+langgraph>=0.2.60
+langgraph-checkpoint-sqlite>=2.0.0
+langchain-core>=0.3.0
+langchain-anthropic>=0.3.0
+# langchain-openai>=0.2.0   # if LLM provider is openai
+# langchain-ollama>=0.2.0   # if LLM provider is ollama
+
 # Multi-turn conversational context register (Layer A), pinned by commit SHA
 turnstile-ctx @ git+https://github.com/premsantosh/turnstile-ctx.git@e1778258f01f4252ffdd048d80805db67c95f499
 

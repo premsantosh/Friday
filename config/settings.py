@@ -224,6 +224,41 @@ class ConversationConfig:
 
 
 @dataclass
+class AgentConfig:
+    """LangGraph agent engine (see docs/langgraph-integration.md). Opt-in via
+    FRIDAY_AGENT_ENGINE=langgraph; the default keeps the legacy router."""
+    engine: str = "legacy"                  # "legacy" | "langgraph"
+    checkpoint_path: str = "~/.friday/agent_checkpoints.db"
+    max_tokens: int = 1024                  # tool calling needs headroom; LLMConfig.max_tokens stays legacy-only
+    max_tool_iterations: int = 6
+    history_max_messages: int = 24
+    model: Optional[str] = None             # override; defaults to LLMConfig's per-provider model
+    # Optional LangSmith tracing (free tier: 5k traces/month, 14-day retention).
+    # Off unless FRIDAY_LANGSMITH_TRACING=true *and* LANGSMITH_API_KEY is set.
+    tracing: bool = False
+    tracing_project: str = "friday-agent"
+    tracing_sampling_rate: float = 1.0
+    # Kill switch for gated (confirmation-required) agent actions; checked at
+    # execution time by the harness, so flipping it blocks even an approved plan.
+    kill_switch_env: str = "FRIDAY_KILL_SWITCH"
+
+    @classmethod
+    def from_env(cls) -> "AgentConfig":
+        import os
+        rate = os.getenv("LANGSMITH_TRACING_SAMPLING_RATE", "1.0")
+        try:
+            rate_f = min(1.0, max(0.0, float(rate)))
+        except ValueError:
+            rate_f = 1.0
+        return cls(
+            engine=os.getenv("FRIDAY_AGENT_ENGINE", "legacy").strip().lower() or "legacy",
+            tracing=os.getenv("FRIDAY_LANGSMITH_TRACING", "").strip().lower() in ("1", "true", "yes"),
+            tracing_project=os.getenv("LANGSMITH_PROJECT", "friday-agent"),
+            tracing_sampling_rate=rate_f,
+        )
+
+
+@dataclass
 class AssistantConfig:
     """Master configuration combining all settings."""
     personality: PersonalityConfig = field(default_factory=PersonalityConfig)
@@ -234,6 +269,7 @@ class AssistantConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     intent_cache: IntentCacheConfig = field(default_factory=IntentCacheConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
 
     # General settings
     debug_mode: bool = False
