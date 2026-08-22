@@ -15,12 +15,14 @@ No per-workflow code:
     VERBATIM. Subsequent turns route into the legacy session at Step 0; the
     graph is not involved until that session closes.
 
-  * Gated tools (Phase 3) for irreversible actions — see `gated_workflow_tool`.
-    INVARIANTS: the model only ever holds gated wrappers, never a raw
-    side-effecting callable; everything before `interrupt()` is pure (LangGraph
-    re-executes the tool function on resume); the post-resume execution goes
-    through ActionGate (kill switch, approval hash, idempotency via the audit
-    log) so a replay can never double-fire.
+  * Gated tools (Phase 3) for actions that need a confirmation — see
+    `gated_workflow_tool` and GATE_SPECS (today: `hass_locks` unlock; other
+    workflows are bound ungated, exactly as the legacy router executes them).
+    INVARIANTS: the model never holds a raw callable — every tool is a wrapper
+    around a registered Workflow; everything before `interrupt()` is pure
+    (LangGraph re-executes the tool function on resume); the post-resume
+    execution goes through ActionGate (kill switch, idempotency via the audit
+    log keyed by the tool call id) so a replay can never double-fire.
 
   * `schedule_wakeup(delay_minutes, note)` (Phase 4) — writes an agent_wakes row
     that BackgroundTaskRunner services by re-invoking this user's thread.
@@ -185,7 +187,10 @@ def gated_workflow_tool(workflow, spec: GateSpec, gate: ActionGate,
             return f"{DECLINED_PREFIX} the user declined; do not retry and do not ask again."
 
         # ---- post-resume: the user said yes to exactly `plan` (same dict, same
-        # hash). The gate still applies kill switch + idempotency + audit.
+        # hash). Note the approval is recorded and consumed right here, so
+        # ApprovalPolicy is satisfied by construction on this path — the real
+        # protection is interrupt() + the deterministic yes, the kill switch
+        # (checked now, at execution time) and IdempotencyPolicy + audit trail.
         session = _GateSession(f"agent:{tool_call_id or hash_plan(plan)[:12]}")
         action = Action(kind=spec.kind, session_id=session.session_id,
                         workflow=workflow.name, plan=plan)

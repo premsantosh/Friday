@@ -52,6 +52,55 @@ def test_scrub_redacts_pii_and_hides_context_block():
     assert run["inputs"]["context_block"] == "tea: Earl Grey"
 
 
+def test_scrub_handles_live_message_objects_as_langsmith_passes_them():
+    """LangSmith hands hide_inputs the raw run inputs: state dicts holding
+    LangChain message objects, not dicts. Those must be scrubbed too."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+    raw = {"messages": [
+        SystemMessage(content=f"You are Jarvis.\n{CONTEXT_OPEN}\ntea: Earl Grey\n{CONTEXT_CLOSE}"),
+        HumanMessage(content="my email is prem@example.com and my card is 4111 1111 1111 1111"),
+    ], "user_id": "default", "context_block": "tea: Earl Grey"}
+    out = scrub(raw)
+    flat = repr(out)
+    assert "prem@example.com" not in flat and "4111 1111 1111 1111" not in flat
+    assert "Earl Grey" not in flat
+    assert "my email is" in flat                       # user text otherwise kept
+    assert out["user_id"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_real_tracer_pipeline_uploads_only_redacted_payloads(monkeypatch):
+    """Drive engine.handle() through a real LangChainTracer + langsmith Client
+    whose network layer is replaced by a recorder; everything the client would
+    send must already be scrubbed."""
+    from langchain_core.tracers import LangChainTracer
+    from langsmith import Client
+
+    sent = []
+
+    class RecordingClient(Client):
+        def create_run(self, name, inputs, run_type, **kwargs):   # what the tracer calls
+            sent.append(("create", name, self._hide_run_inputs(inputs)))
+
+        def update_run(self, run_id, **kwargs):
+            if kwargs.get("inputs") is not None:
+                sent.append(("update-in", str(run_id), self._hide_run_inputs(kwargs["inputs"])))
+            if kwargs.get("outputs") is not None:
+                sent.append(("update-out", str(run_id), self._hide_run_outputs(kwargs["outputs"])))
+
+    client = RecordingClient(api_key="lsv2_test_not_a_real_key", hide_inputs=scrub, hide_outputs=scrub)
+    tracer = LangChainTracer(project_name="friday-test", client=client)
+    model = ScriptedChatModel().push(AIMessage(content="Your card ends in 1111, prem@example.com."))
+    engine = make_engine(model=model, tracer=tracer)
+    await engine.handle("my email is prem@example.com and my card is 4111 1111 1111 1111")
+    assert sent, "tracer never reached the client"
+    flat = repr(sent)
+    assert "prem@example.com" not in flat
+    assert "4111 1111 1111 1111" not in flat and "4111" not in flat
+    assert "my email is" in flat                       # redacted, not dropped
+    assert any(kind == "create" for kind, *_ in sent)
+
+
 def test_trace_config_is_empty_without_a_tracer():
     assert trace_config(None, user_id="u", thread_id="t", run_kind="fresh") == {}
 

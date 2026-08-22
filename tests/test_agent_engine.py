@@ -240,6 +240,98 @@ async def test_empty_model_reply_gets_a_fallback_line():
     assert reply.startswith("I'm afraid I have nothing useful to say")
 
 
+@pytest.mark.asyncio
+async def test_orphaned_tool_call_is_repaired_on_the_next_turn():
+    """A cancelled/killed tool step leaves an AI tool_call with no result; the
+    next turn must close it or the provider rejects the whole thread."""
+    wf = EchoTimeWorkflow()
+    model = ScriptedChatModel().push(AIMessage(content="Good evening, sir."))
+    engine = make_engine(workflows=[wf], model=model)
+    tid = engine.thread_id("default")
+    async with engine._checkpoints.open() as saver:
+        app = engine._graph.compile(checkpointer=saver)
+        await app.aupdate_state(
+            {"configurable": {"thread_id": tid}},
+            {"messages": [HumanMessage(content="do the slow thing"),
+                          tool_call("time_check", {"intent": "slow", "entities": {}}, "orphan1")],
+             "user_id": "default", "handoff_message": "", "tool_iterations": 1},
+            as_node="agent")
+    assert await engine.handle("hello again") == "Good evening, sir."
+    seen = model.calls[0][1:]
+    assert [type(m).__name__ for m in seen] == ["HumanMessage", "AIMessage", "ToolMessage", "HumanMessage"]
+    assert seen[2].tool_call_id == "orphan1" and seen[2].content.startswith("ERROR:")
+    assert wf.calls == []                                 # never re-executed
+
+
+@pytest.mark.asyncio
+async def test_error_after_a_tool_ran_does_not_fall_back_to_legacy():
+    """Provider dies after the graph already executed a workflow: the legacy
+    router must not run the request a second time."""
+    wf = EchoTimeWorkflow()
+    model = ScriptedChatModel().push(tool_call("time_check", {"intent": "brew", "entities": {}}),
+                                     RuntimeError("provider overloaded"))
+    engine = make_engine(workflows=[wf], model=model)
+    a = make_assistant(engine=engine)
+    reply = await a.process_input("brew the thing")
+    assert "something went wrong partway through" in reply and "time_check" in reply
+    assert wf.calls == [("brew", {})]                    # executed exactly once
+    assert a.intent_router.calls == []                    # legacy router NOT consulted
+    # Thread is healthy afterwards.
+    model.push(AIMessage(content="Still here, sir."))
+    assert await a.process_input("you there?") == "Still here, sir."
+
+
+@pytest.mark.asyncio
+async def test_error_before_any_tool_still_falls_back_to_legacy():
+    model = ScriptedChatModel().push(RuntimeError("provider down"))
+    engine = make_engine(workflows=[EchoTimeWorkflow()], model=model)
+    a = make_assistant(engine=engine)
+    assert await a.process_input("hello") == "router reply: hello"
+
+
+def test_ephemeral_engine_does_not_offer_schedule_wakeup():
+    """--chat/--test have no BackgroundTaskRunner, so the tool must not exist
+    there (it would promise a wake-up that can never fire)."""
+    from agent import AgentEngine, EngineDeps
+    from agent.checkpoint import CheckpointerProvider
+    from agent.store import AgentStore
+    from agent.tools import SCHEDULE_WAKEUP
+    from config import AgentConfig
+    from workflows.base import WorkflowManager
+
+    def build(path):
+        deps = EngineDeps(llm=FakeLLM(), workflows=WorkflowManager(), model=ScriptedChatModel(),
+                          agent_config=AgentConfig(engine="langgraph"), store=AgentStore())
+        return AgentEngine(deps, checkpoints=CheckpointerProvider(path))
+
+    assert SCHEDULE_WAKEUP not in [t.name for t in build(None).tool_set.tools]
+
+
+def test_durable_engine_offers_schedule_wakeup(tmp_path):
+    from agent import AgentEngine, EngineDeps
+    from agent.checkpoint import CheckpointerProvider
+    from agent.tools import SCHEDULE_WAKEUP
+    from config import AgentConfig
+    from workflows.base import WorkflowManager
+
+    path = str(tmp_path / "ckpt.db")
+    deps = EngineDeps(llm=FakeLLM(), workflows=WorkflowManager(), model=ScriptedChatModel(),
+                      agent_config=AgentConfig(engine="langgraph"), store=SqliteAgentStore(path))
+    engine = AgentEngine(deps, checkpoints=CheckpointerProvider(path))
+    assert SCHEDULE_WAKEUP in [t.name for t in engine.tool_set.tools]
+
+
+@pytest.mark.asyncio
+async def test_response_cache_hit_still_runs_sarcasm_check_and_counts():
+    llm = FakeLLM(ephemeral=False)
+    model = ScriptedChatModel().push(AIMessage(content="Quite, sir."))
+    engine = make_engine(model=model, llm=llm)
+    await engine.handle("be more sarcastic please")
+    await engine.handle("be more sarcastic please")    # cache hit
+    assert llm.sarcasm_checks == ["be more sarcastic please"] * 2
+    assert llm.stats["total_requests"] == 2 and llm.stats["cache_hits"] == 1
+
+
 # ------------------------------------------------------ assistant seam
 
 @pytest.mark.asyncio

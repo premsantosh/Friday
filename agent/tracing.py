@@ -51,7 +51,12 @@ def hide_context_spans(text: str) -> str:
 def scrub(obj: Any, _depth: int = 0) -> Any:
     """Recursively redact PII and hide the context block in a trace payload.
     Returns a new structure; never mutates the original (LangSmith passes us
-    the live run dict)."""
+    the live run dict).
+
+    LangSmith calls the hide hooks on the *raw* run inputs/outputs, which for
+    graph runs are state dicts holding live LangChain message objects (not
+    dicts) — those are dumped to plain dicts here so their content is scrubbed
+    like everything else."""
     if _depth > 30:
         return "<truncated>"
     if isinstance(obj, str):
@@ -66,9 +71,16 @@ def scrub(obj: Any, _depth: int = 0) -> Any:
         return out
     if isinstance(obj, (list, tuple)):
         return [scrub(v, _depth + 1) for v in obj]
-    # Message objects etc. — LangSmith serialises them before calling the hide
-    # hooks, so we normally see plain dicts. Anything else passes through.
-    return obj
+    dump = getattr(obj, "model_dump", None)     # pydantic objects: messages, generations…
+    if callable(dump):
+        try:
+            return scrub(dump(), _depth + 1)
+        except Exception:
+            return "<unserialisable>"
+    if isinstance(obj, (int, float, bool)) or obj is None:
+        return obj
+    # Anything else we can't inspect is dropped rather than risk leaking it.
+    return f"<{type(obj).__name__} hidden>"
 
 
 def hash_user_id(user_id: str) -> str:

@@ -28,6 +28,13 @@ handle():
      on un-enriched input, preserving the cache-poisoning guard in
      core/assistant.py. Gated tools are never cached: a cache hit at Step 2
      would execute the workflow directly and bypass the confirmation.
+
+Failure containment: if a run raises *after* a tool already executed, the
+engine does not re-raise (the legacy fallback would re-execute the request);
+it closes any orphaned tool call, records an apology on the thread and returns
+it. A raise only reaches VoiceAssistant when nothing side-effecting happened.
+Orphaned tool calls left by a cancelled run are repaired at the start of the
+next turn so the history stays acceptable to the provider.
 """
 
 from __future__ import annotations
@@ -45,7 +52,7 @@ from core.harness import ConfirmDecision, parse_confirmation
 
 from .checkpoint import CheckpointerProvider
 from .graph import build_graph
-from .nodes import last_ai_text, succeeded, turn_tool_calls
+from .nodes import last_ai_text, last_human_text, succeeded, turn_tool_calls
 from .store import AgentStore, Wake
 from .tools import DECLINED_PREFIX, ToolSet, build_tools
 from .tracing import trace_config
@@ -68,6 +75,25 @@ class EngineDeps:
     gate: Any = None              # ActionGate for gated tools
     store: Optional[AgentStore] = None   # epochs + wakes
     confirmation_timeout_s: float = 600.0
+
+
+def _orphaned_tool_call_ids(messages) -> List[str]:
+    """tool_call ids since the last HumanMessage that have no ToolMessage —
+    left behind when a tool step was cancelled (Ctrl+C, channel shutdown) or
+    the process died mid-tool. Anthropic rejects such a history outright."""
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            start = i
+            break
+    called: List[str] = []
+    answered = set()
+    for m in messages[start:]:
+        if isinstance(m, AIMessage):
+            called.extend(c["id"] for c in (getattr(m, "tool_calls", None) or []))
+        elif isinstance(m, ToolMessage):
+            answered.add(m.tool_call_id)
+    return [cid for cid in called if cid not in answered]
 
 
 def _pending_interrupt(state) -> Optional[Dict[str, Any]]:
@@ -98,7 +124,11 @@ class AgentEngine:
         self._clock = clock
         self.tool_set = tools or build_tools(
             deps.workflows, sessions=deps.sessions, context=deps.context,
-            gate=deps.gate, store=self.store, clock=clock)
+            gate=deps.gate,
+            # schedule_wakeup only where a BackgroundTaskRunner can fire it:
+            # ephemeral (--chat/--test) has no runner, so don't offer the tool.
+            store=None if checkpoints.ephemeral else self.store,
+            clock=clock)
         self._graph = build_graph(deps, self.tool_set)
 
     # ------------------------------------------------------------ factory
@@ -170,10 +200,17 @@ class AgentEngine:
                     prefix = f"That confirmation lapsed, {self._title}, so I set it aside. "
                 else:
                     return await self._answer_pending(app, thread_id, state, pending, text, user_id)
+            else:
+                await self._repair_orphans(app, thread_id, state)
 
+            # Mirrors LLMProvider._prepare_request: sarcasm sliders and the request
+            # counter move even on a response-cache hit.
+            llm = self.deps.llm
+            llm._check_sarcasm_command(text)
+            llm.stats["total_requests"] += 1
             cached = self._cached_response(text)
             if cached is not None:
-                self.deps.llm.stats["cache_hits"] += 1
+                llm.stats["cache_hits"] += 1
                 try:
                     await app.aupdate_state(
                         self._cfg(thread_id),
@@ -184,10 +221,16 @@ class AgentEngine:
                     logger.debug("could not append cached exchange to thread", exc_info=True)
                 return prefix + cached
 
-            out = await app.ainvoke(
-                {"messages": [HumanMessage(content=text)], "user_id": user_id,
-                 "handoff_message": "", "tool_iterations": 0, "cacheable": cacheable},
-                self._cfg(thread_id, user_id=user_id, run_kind="fresh"))
+            try:
+                out = await app.ainvoke(
+                    {"messages": [HumanMessage(content=text)], "user_id": user_id,
+                     "handoff_message": "", "tool_iterations": 0},
+                    self._cfg(thread_id, user_id=user_id, run_kind="fresh"))
+            except Exception:
+                recovered = await self._recover_after_error(app, thread_id, text)
+                if recovered is None:
+                    raise
+                return prefix + recovered
             reply = self._reply_from(out)
             self._post_run(out, text, cacheable=cacheable)
             return prefix + reply
@@ -242,13 +285,20 @@ class AgentEngine:
             state = await app.aget_state(self._cfg(thread_id))
             if _pending_interrupt(state) is not None:
                 return None
+            await self._repair_orphans(app, thread_id, state)
             note = str(wake.payload.get("note", "")).strip()
             text = ("(Scheduled wake-up you set earlier; the user is not speaking. "
                     f"Do what you planned and report briefly: {note})")
-            out = await app.ainvoke(
-                {"messages": [HumanMessage(content=text)], "user_id": wake.user_id,
-                 "handoff_message": "", "tool_iterations": 0, "cacheable": False},
-                self._cfg(thread_id, user_id=wake.user_id, run_kind="wake"))
+            try:
+                out = await app.ainvoke(
+                    {"messages": [HumanMessage(content=text)], "user_id": wake.user_id,
+                     "handoff_message": "", "tool_iterations": 0},
+                    self._cfg(thread_id, user_id=wake.user_id, run_kind="wake"))
+            except Exception:
+                recovered = await self._recover_after_error(app, thread_id, text)
+                if recovered is None:
+                    raise
+                return recovered
             reply = self._reply_from(out)
             self._post_run(out, text, cacheable=False)
             return reply
@@ -265,8 +315,14 @@ class AgentEngine:
         question = str(pending.get("question") or "Shall I proceed?")
         decision = parse_confirmation(text)   # strict gate: UNCLEAR never approves
         if decision == ConfirmDecision.YES:
-            out = await app.ainvoke(Command(resume={"decision": "yes"}),
-                                    self._cfg(thread_id, user_id=user_id, run_kind="resume"))
+            try:
+                out = await app.ainvoke(Command(resume={"decision": "yes"}),
+                                        self._cfg(thread_id, user_id=user_id, run_kind="resume"))
+            except Exception:
+                recovered = await self._recover_after_error(app, thread_id, None)
+                if recovered is None:
+                    raise
+                return recovered
             reply = self._reply_from(out)
             self._post_run(out, text, cacheable=False)
             return reply
@@ -298,6 +354,50 @@ class AgentEngine:
             "messages": [AIMessage(content=SET_ASIDE_LINE.format(title=self._title))],
             "handoff_message": "",
         }, as_node="finalize")
+
+    async def _repair_orphans(self, app, thread_id: str, state) -> bool:
+        """Close tool calls that never got a result (cancelled/killed mid-tool)
+        with an ERROR ToolMessage so the thread's history is valid again.
+        Returns True when something was repaired."""
+        messages = (getattr(state, "values", None) or {}).get("messages", []) if state is not None else []
+        orphans = _orphaned_tool_call_ids(messages)
+        if not orphans:
+            return False
+        logger.warning("Repairing %d orphaned tool call(s) on %s", len(orphans), thread_id)
+        await app.aupdate_state(self._cfg(thread_id), {"messages": [
+            ToolMessage(content="ERROR: that step was interrupted before it finished; "
+                                "do not assume it ran.", tool_call_id=cid)
+            for cid in orphans]}, as_node="tools")
+        return True
+
+    async def _recover_after_error(self, app, thread_id: str, text: Optional[str]) -> Optional[str]:
+        """A run blew up (provider error, timeout…). If nothing side-effecting
+        happened this turn, return None so the caller re-raises and
+        VoiceAssistant falls back to the legacy router. If a tool already ran,
+        the legacy path must NOT re-execute the request: close any orphaned
+        call, record an in-character apology on the thread, and return it."""
+        try:
+            state = await app.aget_state(self._cfg(thread_id))
+        except Exception:
+            logger.debug("could not read thread state after an error", exc_info=True)
+            return None
+        messages = (getattr(state, "values", None) or {}).get("messages", [])
+        if text is not None and last_human_text(messages) != text:
+            return None                      # the failed turn never reached the thread
+        executed = [c for c in turn_tool_calls(messages) if c[2]]
+        if not executed and not _orphaned_tool_call_ids(messages):
+            return None
+        await self._repair_orphans(app, thread_id, state)
+        done = ", ".join(sorted({n for n, _, _ in executed})) or "the first step"
+        apology = (f"I'm afraid something went wrong partway through, {self._title}: "
+                   f"I completed {done} but could not finish. Do check before asking again.")
+        try:
+            await app.aupdate_state(self._cfg(thread_id),
+                                    {"messages": [AIMessage(content=apology)], "handoff_message": ""},
+                                    as_node="finalize")
+        except Exception:
+            logger.debug("could not record the apology on the thread", exc_info=True)
+        return apology
 
     def _cached_response(self, text: str) -> Optional[str]:
         llm = self.deps.llm

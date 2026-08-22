@@ -8,9 +8,9 @@ Graph nodes. Closures over `EngineDeps` (live objects never enter state).
       agent --(plain text)-----------------------------------------------------> finalize
     finalize -> END
 
-prepare_context  deterministic: sarcasm-command check (shared LLMProvider, so
-                 personality sliders stay unified across engines), memory
-                 context via ContextBuilder, search context via SearchEnhancer
+prepare_context  deterministic: memory context via ContextBuilder, search context via
+                 SearchEnhancer (the sarcasm-command check runs in the engine, on the
+                 shared LLMProvider, so personality sliders stay unified across engines)
                  — replicating LLMProvider._prepare_request.
 agent            model.bind_tools(tools).ainvoke([system] + messages). The system
                  prompt is rebuilt every turn (date/time stay accurate, mirrors
@@ -179,9 +179,9 @@ def make_nodes(deps, tool_set: ToolSet) -> SimpleNamespace:
         return found or ""
 
     async def prepare_context(state) -> Dict[str, Any]:
+        # (sarcasm-command check + request counter happen in AgentEngine.handle,
+        # before the response-cache fast path, mirroring _prepare_request.)
         text = last_human_text(state["messages"])
-        llm._check_sarcasm_command(text)
-        llm.stats["total_requests"] += 1
         parts: List[str] = []
         pending_keys: List[str] = []
         if llm.context_builder is not None:

@@ -37,5 +37,3 @@ class AgentState(TypedDict):
     # which this turn's user text either confirms or corrects.
     pending_fact_keys: NotRequired[List[str]]
     retrieved_fact_keys: NotRequired[List[str]]
-    # Whether the intent cache may learn from this turn (raw, un-enriched input).
-    cacheable: NotRequired[bool]
