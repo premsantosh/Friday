@@ -84,3 +84,10 @@ An arm beats base when ALL of:
   returned the intent router's draft reply and never reached the LLM provider,
   so no exchange was ever recorded with a context snapshot and no shadow,
   replay or eval could run. All data collection begins after this date.
+- 2026-08-22: before any eval run, six of the seven FILL-IN probes (pref-01..04,
+  routine-01..02) were annotated with the user's real preferences, and ten
+  style/behaviour probes (style-06..15) were added from a written voice spec
+  (even-toned bad news and corrections, anticipation over permission-asking,
+  composure, information density, one-question handling of ambiguity). The
+  curated split is now 32 probes; correct-01 remains FILL-IN until the user
+  names a real correction, so the curated split still refuses to run.
