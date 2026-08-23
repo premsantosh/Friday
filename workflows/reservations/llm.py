@@ -60,13 +60,21 @@ class ReservationLLM(JsonLLMClient):
 
 # --------------------------------------------------------------------- slot extraction
 
-_EXTRACT_SYSTEM = """You extract reservation details from a request to a voice assistant.
+_EXTRACT_SYSTEM = """You extract booking details from a request to a voice assistant.
 Reply with ONLY a JSON object — no prose. Keys (use null when not stated; never guess):
   business_name: the establishment's name (NOT generic words like "a table" or "a reservation")
+  booking_kind: one of
+    "dining"      — a table at a restaurant/bar (needs a party size and a time)
+    "appointment" — a service booked for a time: clinic, therapist, salon, spa,
+                    dentist, tattoo, repair, test drive, tour
+    "inquiry"     — reaching out to a business with no specific time offered
+  target_url: a URL the user gave for the business, copied exactly from their
+    message (null if they gave none)
   date: the requested date, verbatim as said (e.g. "next Friday", "tomorrow", "6/14")
   time: the requested time, verbatim (e.g. "7pm", "half past seven")
-  party_size: integer number of people
-  service_type: e.g. "dinner", "haircut", "60-minute massage" (null if not stated)
+  party_size: integer number of people (dining only; null for an appointment)
+  service_type: what the booking is FOR, e.g. "dinner", "haircut",
+    "60-minute massage", "physical therapy consultation" (null if not stated)
   special_requests: any notes (window seat, allergies, stylist preference...)
   location: city/neighbourhood if the user states one
   release_days_ahead: integer, ONLY if the user says how many days in advance
@@ -95,6 +103,12 @@ EXTRACT_TASK = LLMTask(
     max_tokens=300,
     fields=(
         FieldSpec("business_name", str, max_len=120, reject_if=_filler_business),
+        FieldSpec("booking_kind", str, max_len=20,
+                  valid=lambda k: k in ("dining", "appointment", "inquiry")),
+        # Grounded: a URL we'd navigate to must have come from the user, not
+        # from the model's imagination.
+        FieldSpec("target_url", str, grounded=True, max_len=300,
+                  valid=lambda u: u.startswith(("http://", "https://"))),
         FieldSpec("date", str, max_len=120),
         FieldSpec("time", str, max_len=120),
         FieldSpec("service_type", str, max_len=120),
@@ -111,8 +125,11 @@ EXTRACT_TASK = LLMTask(
 
 
 def extract_slots(llm: Optional[ReservationLLM], text: str) -> Optional[Dict[str, Any]]:
-    """LLM slot extraction. Returns a validated dict, or None (→ caller's regex fallback)."""
-    result = run_task(llm, EXTRACT_TASK, text)
+    """LLM slot extraction. Returns a validated dict, or None (→ caller's regex fallback).
+
+    The utterance is also the evidence, so `target_url` is only accepted when
+    the user actually said it."""
+    result = run_task(llm, EXTRACT_TASK, text, evidence=text)
     return result.values if result.from_llm else None
 
 

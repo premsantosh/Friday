@@ -31,6 +31,7 @@ _TZ_ALIASES = {
     "PT": "America/Los_Angeles", "PST": "America/Los_Angeles",
     "PDT": "America/Los_Angeles", "PACIFIC": "America/Los_Angeles",
     "UTC": "UTC", "GMT": "UTC",
+    "JST": "Asia/Tokyo", "JAPAN": "Asia/Tokyo",
 }
 
 
@@ -79,6 +80,10 @@ _CITY_TZ = {
     "san francisco": "America/Los_Angeles", "los angeles": "America/Los_Angeles",
     "seattle": "America/Los_Angeles", "portland": "America/Los_Angeles",
     "san diego": "America/Los_Angeles", "las vegas": "America/Los_Angeles",
+    # A few international cities the TableCheck watcher cares about (venue
+    # slugs like "benfiddich-tokyo" hit these via substring match).
+    "tokyo": "Asia/Tokyo", "osaka": "Asia/Tokyo", "kyoto": "Asia/Tokyo",
+    "london": "Europe/London", "paris": "Europe/Paris",
 }
 
 

@@ -31,6 +31,9 @@ Environment Variables:
     COFFEE_MACHINE_AUTO_ON    - true/false, enable scheduled auto-on (default: true)
     COFFEE_MACHINE_IDLE_ALERT_MIN - minutes idle before alert (default: 45)
     COFFEE_MACHINE_WARMUP_MINUTES - warm-up time in minutes (default: 20)
+    FRIDAY_AGENT_ENGINE   - Optional, "langgraph" to route free-form requests through
+                            the checkpointed LangGraph agent (default: legacy router)
+    FRIDAY_LANGSMITH_TRACING - Optional, "true" + LANGSMITH_API_KEY to trace agent runs
 """
 
 import argparse
@@ -57,11 +60,12 @@ from config import (
     WakeWordConfig,
     IntentCacheConfig,
     ResearchConfig,
+    AgentConfig,
     SarcasmLevel,
     FormalityLevel,
     WarmthLevel,
 )
-from core import VoiceAssistant, create_assistant, TelegramChannel
+from core import VoiceAssistant, create_assistant, TelegramChannel, VoicePEChannel
 from workflows import (
     WorkflowManager,
     create_default_workflow_manager,
@@ -183,6 +187,8 @@ def create_custom_config(args) -> AssistantConfig:
         ),
         intent_cache=IntentCacheConfig(enabled=not is_ephemeral),
         research=ResearchConfig(enabled=research_enabled),
+        # FRIDAY_AGENT_ENGINE / FRIDAY_LANGSMITH_TRACING / LANGSMITH_* (see .env.example)
+        agent=AgentConfig.from_env(),
         debug_mode=args.debug,
     )
 
@@ -307,6 +313,7 @@ def run_text_chat(config: AssistantConfig):
     print(f"{'='*50}")
     print(f"  TTS: {assistant.tts.get_name()}")
     print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  Engine: {assistant.engine_label}")
     print(f"{'='*50}")
     print(f"Type your messages below. Commands:")
     print(f"  'quit' or 'exit' - End the conversation")
@@ -401,14 +408,15 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
 
     notify_owner = (lambda msg: channel.send(msg, owner)) if owner else (lambda msg: None)
 
-    # Re-point session notifications at the channel, since there's no speaker
-    # in this mode (the assistant built its runner wired to speak()).
+    # Re-point session (and agent wake-up) notifications at the channel, since
+    # there's no speaker in this mode (the assistant built its runner wired to speak()).
     if assistant.sessions is not None:
         from core.conversation import BackgroundTaskRunner
         assistant.background_runner = BackgroundTaskRunner(
             assistant.sessions,
             notify_owner,
             tick_seconds=config.conversation.background_tick_seconds,
+            agent_engine=assistant.agent_engine,
         )
         assistant.background_runner.start()
 
@@ -425,6 +433,7 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
     print(f"  {name} - {label} Mode")
     print(f"{'='*50}")
     print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  Engine: {assistant.engine_label}")
     print(f"  {summary}")
     print(f"{'='*50}")
     print("  Text Friday from your phone. (Press Ctrl+C to quit)\n")
@@ -482,6 +491,7 @@ def run_all(config: AssistantConfig, debug: bool = False):
     print(f"{'='*50}")
     print(f"  TTS: {assistant.tts.get_name()}")
     print(f"  LLM: {assistant.llm.get_name()}")
+    print(f"  Engine: {assistant.engine_label}")
 
     # Coffee-machine alerts speak aloud (mic/speaker present in this mode).
     coffee_workflow = workflow_manager.get_workflow("coffee_machine")
@@ -494,6 +504,17 @@ def run_all(config: AssistantConfig, debug: bool = False):
         _attach_listener(assistant, telegram_channel)
     _setup_research(assistant, config, channel=telegram_channel)
 
+    # Voice PE satellites — automatically on whenever configured. Each room's
+    # puck streams mic audio in; replies come out of this Mac's speakers.
+    voice_pe_channel = VoicePEChannel.from_env()
+    if voice_pe_channel is not None:
+        voice_pe_channel.bind(
+            stt=assistant.stt,
+            speak=assistant.speak,
+            has_active=assistant.sessions.has_active if assistant.sessions is not None else None,
+        )
+        _attach_listener(assistant, voice_pe_channel)
+
     # Voice — start in the background; don't grab stdin (the text loop owns it),
     # so a mic-less machine just runs text + Telegram instead of hijacking input.
     voice_active = assistant.start_listening(allow_keyboard_fallback=False)
@@ -504,6 +525,9 @@ def run_all(config: AssistantConfig, debug: bool = False):
     channels.append("text (type below)")
     if telegram_channel is not None:
         channels.append("Telegram")
+    if voice_pe_channel is not None:
+        names = ", ".join(d.name for d in voice_pe_channel.devices)
+        channels.append(f"Voice PE ({names})")
     print(f"  Channels: {' · '.join(channels)}")
     print(f"{'='*50}")
     print("  Talk, type, or text Friday. (Ctrl+C to quit)\n")
@@ -511,7 +535,8 @@ def run_all(config: AssistantConfig, debug: bool = False):
     try:
         reason = _text_chat_loop(assistant, config)
         # Ctrl+D / closed stdin shouldn't kill voice + Telegram — keep them alive.
-        if reason == "eof" and (voice_active or telegram_channel is not None):
+        if reason == "eof" and (voice_active or telegram_channel is not None
+                                or voice_pe_channel is not None):
             print("[text input closed — voice/Telegram still listening; Ctrl+C to quit]")
             while assistant._running:
                 time.sleep(0.1)
@@ -523,6 +548,8 @@ def run_all(config: AssistantConfig, debug: bool = False):
             coffee_workflow.stop_monitor()
         if telegram_channel is not None:
             telegram_channel.stop()
+        if voice_pe_channel is not None:
+            voice_pe_channel.stop()
 
 
 def main():
@@ -624,12 +651,25 @@ def main():
             print("ℹ️  Telegram two-way channel enabled")
         _setup_research(assistant, config, channel=telegram_channel)
 
+        voice_pe_channel = VoicePEChannel.from_env()
+        if voice_pe_channel is not None:
+            voice_pe_channel.bind(
+                stt=assistant.stt,
+                speak=assistant.speak,
+                has_active=assistant.sessions.has_active if assistant.sessions is not None else None,
+            )
+            _attach_listener(assistant, voice_pe_channel)
+            names = ", ".join(d.name for d in voice_pe_channel.devices)
+            print(f"ℹ️  Voice PE satellites enabled ({names})")
+
         assistant.run()
 
         if coffee_workflow is not None:
             coffee_workflow.stop_monitor()
         if telegram_channel is not None:
             telegram_channel.stop()
+        if voice_pe_channel is not None:
+            voice_pe_channel.stop()
         return
 
     # Default: listen on voice + text + Telegram together.

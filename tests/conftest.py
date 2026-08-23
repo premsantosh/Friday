@@ -21,6 +21,8 @@ import pytest
 _EXTERNAL_SERVICE_ENV = (
     # Telegram bot channel + reservation notifier
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_IDS", "TELEGRAM_NOTIFY_CHAT_ID",
+    # Voice PE satellite devices (ESPHome native API connections)
+    "VOICE_PE_DEVICES", "VOICE_PE_NOISE_PSK",
     # Google Calendar service-account inserter
     "GOOGLE_APPLICATION_CREDENTIALS",
     # Bland.ai autonomous phone calls
@@ -31,6 +33,15 @@ _EXTERNAL_SERVICE_ENV = (
     # Research substrate (research/): writes ~/.friday/research.db and calls
     # local Ollama when enabled — must never turn on implicitly in tests.
     "FRIDAY_RESEARCH",
+    # TableCheck watcher: a developer's endpoint override would change the URLs
+    # the fixture-driven channel tests assert on.
+    "TABLECHECK_AVAILABILITY_URL",
+    # LangGraph agent engine: the suite must behave identically whatever the
+    # developer's shell says, and must never upload a trace (LangSmith free-tier
+    # quota) or trip the gated-action kill switch by accident.
+    "FRIDAY_AGENT_ENGINE", "FRIDAY_LANGSMITH_TRACING", "FRIDAY_KILL_SWITCH",
+    "LANGSMITH_API_KEY", "LANGSMITH_TRACING", "LANGSMITH_PROJECT",
+    "LANGSMITH_TRACING_SAMPLING_RATE", "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2",
 )
 
 
@@ -54,4 +65,18 @@ def no_results_writes_into_the_repo(tmp_path, monkeypatch):
     from research import report
 
     monkeypatch.setattr(report, "RESULTS_DIR", tmp_path / "repo-results")
+
+
+@pytest.fixture(autouse=True)
+def isolate_profile_store(monkeypatch, tmp_path):
+    """Point the durable user profile at a throwaway database.
+
+    `UserProfile()` otherwise opens the developer's real ~/.friday/memory.db,
+    and the form tests write to it — a test run would quietly edit the facts
+    Friday uses to fill live booking forms.
+    """
+    monkeypatch.setenv("FRIDAY_PROFILE_DB", str(tmp_path / "profile.db"))
+    # The form agent dumps a screenshot when a submission can't be confirmed;
+    # keep those out of the developer's real ~/.friday/browser-debug.
+    monkeypatch.setenv("RESERVATION_BROWSER_DEBUG_DIR", str(tmp_path / "browser-debug"))
     yield

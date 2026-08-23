@@ -14,6 +14,11 @@ long-running work for the SessionManager:
 
 Notifications are suppressed for results that simply keep waiting (BACKGROUND)
 or carry no message.
+
+  4. agent wake-ups (optional `agent_engine`) — the LangGraph engine's
+     self-scheduled follow-ups ("re-check at 6pm"): due `agent_wakes` rows are
+     serviced by re-invoking that user's thread and the reply goes out through
+     the same notifier. Without an engine the runner behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -37,10 +42,12 @@ class BackgroundTaskRunner:
         session_manager,
         notify: Callable[[str], None],
         tick_seconds: int = 30,
+        agent_engine=None,
     ):
         self.sessions = session_manager
         self._notify = notify
         self.tick_seconds = max(1, int(tick_seconds))
+        self.agent_engine = agent_engine   # optional agent.AgentEngine (run_due_wakes)
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -81,10 +88,23 @@ class BackgroundTaskRunner:
                 await asyncio.sleep(1)
 
     async def _tick(self) -> None:
-        self.sessions.sweep_expired()
-        for session, result in await self.sessions.tick_waiting():
-            if result.message and result.control in _NOTIFY_CONTROLS:
+        if self.sessions is not None:
+            self.sessions.sweep_expired()
+            for session, result in await self.sessions.tick_waiting():
+                if result.message and result.control in _NOTIFY_CONTROLS:
+                    try:
+                        self._notify(result.message)
+                    except Exception:
+                        logger.exception("Notifier failed for session %s", session.session_id)
+
+        if self.agent_engine is not None:
+            try:
+                replies = await self.agent_engine.run_due_wakes()
+            except Exception:
+                logger.exception("Agent wake-ups failed — will retry next interval.")
+                replies = []
+            for message in replies:
                 try:
-                    self._notify(result.message)
+                    self._notify(message)
                 except Exception:
-                    logger.exception("Notifier failed for session %s", session.session_id)
+                    logger.exception("Notifier failed for an agent wake-up")

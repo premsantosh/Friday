@@ -21,6 +21,7 @@ from .phone import (
 )
 from .resy import ResyChannel
 from .sandbox_bot import BotCandidate, DockerSandbox, GitHubBotFinder, SandboxBotChannel, SandboxResult
+from .tablecheck import SchemaDrift, TableCheckChannel, TableCheckError, slug_from_url
 from .yelp import YelpChannel
 
 __all__ = [
@@ -34,6 +35,10 @@ __all__ = [
     "GenericWebChannel",
     "OpenTableChannel",
     "ResyChannel",
+    "TableCheckChannel",
+    "TableCheckError",
+    "SchemaDrift",
+    "slug_from_url",
     "YelpChannel",
     "PhoneChannel",
     "DialAndBridgeChannel",

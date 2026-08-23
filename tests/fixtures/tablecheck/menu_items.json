@@ -1,0 +1,269 @@
+{
+ "menu_items": [
+  {
+   "id": "660f9c4dc85bdf029bbb6a2f",
+   "slug": null,
+   "position": 0,
+   "name_translations": [
+    {
+     "translation": "お席のみのご予約",
+     "locale": "ja"
+    }
+   ],
+   "tagline_translations": [
+    {
+     "translation": "当店はメニューがございません。バーテンダーと会話をしながらあなたの好みをお伝えください。",
+     "locale": "ja"
+    }
+   ],
+   "description_translations": [
+    {
+     "translation": "お会計の10%別途サービス料をいただいております。",
+     "locale": "ja"
+    }
+   ],
+   "fine_print_translations": [],
+   "how_to_redeem_translations": [],
+   "image_urls": {
+    "original": "https://cdn2.tablecheck.com/menu_items/660f9c4dc85bdf029bbb6a2f/images/xl/8c466d30.jpg?1713234665",
+    "xs": "https://cdn3.tablecheck.com/menu_items/660f9c4dc85bdf029bbb6a2f/images/xs/8c466d30.jpg?1713234665",
+    "sm": "https://cdn2.tablecheck.com/menu_items/660f9c4dc85bdf029bbb6a2f/images/sm/8c466d30.jpg?1713234665",
+    "md": "https://cdn0.tablecheck.com/menu_items/660f9c4dc85bdf029bbb6a2f/images/md/8c466d30.jpg?1713234665",
+    "lg": "https://cdn0.tablecheck.com/menu_items/660f9c4dc85bdf029bbb6a2f/images/lg/8c466d30.jpg?1713234665",
+    "xl": "https://cdn2.tablecheck.com/menu_items/660f9c4dc85bdf029bbb6a2f/images/xl/8c466d30.jpg?1713234665"
+   },
+   "menu_type": "main",
+   "is_group_order": true,
+   "is_coupon": false,
+   "price": null,
+   "prev_price": null,
+   "price_mode": "fixed",
+   "service_fee_type": "percent",
+   "tax_type": "included",
+   "calculated_tax_rate": 0,
+   "min_order_qty": null,
+   "max_order_qty": null,
+   "availability_status": "available",
+   "qty_remaining": null,
+   "days": [
+    "m",
+    "tu",
+    "w",
+    "th",
+    "f",
+    "sa",
+    "su"
+   ],
+   "is_active": true,
+   "is_hidden": false,
+   "is_holiday": true,
+   "is_before_holiday": false,
+   "meals": [
+    "breakfast",
+    "lunch",
+    "tea",
+    "dinner",
+    "night"
+   ],
+   "duration": null,
+   "tc_min_manual_duration": null,
+   "tc_max_manual_duration": null,
+   "available_times": [
+    [
+     "2026-08-24T12:00:00Z",
+     75600
+    ],
+    [
+     "2026-08-24T12:15:00Z",
+     76500
+    ]
+   ],
+   "valid_time_ranges": [
+    {
+     "start_time": 75600,
+     "end_time": 82800
+    }
+   ],
+   "valid_start_time": null,
+   "valid_end_time": null,
+   "min_time_cutoff_at": null,
+   "max_time_cutoff_at": null,
+   "payment_type": "postpay_required",
+   "payment_internal_require_intl": "default",
+   "payment_require_intl": false,
+   "payment_require_group_size": null,
+   "show_locales": [
+    "ja"
+   ],
+   "online_menu_category_id": "660f9a1fb63c14000ac2da5a",
+   "payment_partial_order_unit_amt": null,
+   "payment_partial_order_pct": null,
+   "payment_partial_group_fee": null,
+   "payment_partial_person_fee": "5000.0",
+   "use_experience_page": false,
+   "tablecheck_promo": "",
+   "bin_promotion_id": null,
+   "tc_points_rate": null,
+   "tc_points_earnable": null,
+   "is_variable_rate": false,
+   "max_point_amount": null,
+   "max_point_amount_per_pax": null,
+   "service_category_ids": [],
+   "valid_date_ranges": [],
+   "questions": [],
+   "cancel_fee_rules": [
+    {
+     "id": "68f503ec127ebca749b834f1",
+     "advance_time": 86400,
+     "percent": null,
+     "amt_group": null,
+     "amt_pax": "5000.0"
+    }
+   ],
+   "pax_prices": []
+  },
+  {
+   "id": "661e3ba9c1cc2201eb5bbaee",
+   "slug": null,
+   "position": 1,
+   "name_translations": [
+    {
+     "translation": "Seat only reservation",
+     "locale": "en"
+    }
+   ],
+   "tagline_translations": [
+    {
+     "translation": "We don't have a menu, so please talk to the bartender and let us know your preferences.",
+     "locale": "en"
+    }
+   ],
+   "description_translations": [
+    {
+     "translation": "A 10% service charge will be added to your bill.",
+     "locale": "en"
+    }
+   ],
+   "fine_print_translations": [],
+   "how_to_redeem_translations": [],
+   "image_urls": {
+    "original": "https://cdn1.tablecheck.com/menu_items/661e3ba9c1cc2201eb5bbaee/images/xl/c72fb42c.jpg?1713257385",
+    "xs": "https://cdn3.tablecheck.com/menu_items/661e3ba9c1cc2201eb5bbaee/images/xs/c72fb42c.jpg?1713257385",
+    "sm": "https://cdn1.tablecheck.com/menu_items/661e3ba9c1cc2201eb5bbaee/images/sm/c72fb42c.jpg?1713257385",
+    "md": "https://cdn2.tablecheck.com/menu_items/661e3ba9c1cc2201eb5bbaee/images/md/c72fb42c.jpg?1713257385",
+    "lg": "https://cdn2.tablecheck.com/menu_items/661e3ba9c1cc2201eb5bbaee/images/lg/c72fb42c.jpg?1713257385",
+    "xl": "https://cdn1.tablecheck.com/menu_items/661e3ba9c1cc2201eb5bbaee/images/xl/c72fb42c.jpg?1713257385"
+   },
+   "menu_type": "main",
+   "is_group_order": true,
+   "is_coupon": false,
+   "price": null,
+   "prev_price": null,
+   "price_mode": "fixed",
+   "service_fee_type": "percent",
+   "tax_type": "included",
+   "calculated_tax_rate": 0,
+   "min_order_qty": null,
+   "max_order_qty": null,
+   "availability_status": "available",
+   "qty_remaining": null,
+   "days": [
+    "m",
+    "tu",
+    "w",
+    "th",
+    "f",
+    "sa",
+    "su"
+   ],
+   "is_active": true,
+   "is_hidden": false,
+   "is_holiday": true,
+   "is_before_holiday": false,
+   "meals": [
+    "breakfast",
+    "lunch",
+    "tea",
+    "dinner",
+    "night"
+   ],
+   "duration": null,
+   "tc_min_manual_duration": null,
+   "tc_max_manual_duration": null,
+   "available_times": [
+    [
+     "2026-08-24T12:00:00Z",
+     75600
+    ],
+    [
+     "2026-08-24T12:15:00Z",
+     76500
+    ]
+   ],
+   "valid_time_ranges": [
+    {
+     "start_time": 75600,
+     "end_time": 82800
+    }
+   ],
+   "valid_start_time": null,
+   "valid_end_time": null,
+   "min_time_cutoff_at": null,
+   "max_time_cutoff_at": null,
+   "payment_type": "postpay_required",
+   "payment_internal_require_intl": "default",
+   "payment_require_intl": false,
+   "payment_require_group_size": null,
+   "show_locales": [
+    "en",
+    "ko",
+    "zh-CN",
+    "zh-TW",
+    "de",
+    "es",
+    "fr",
+    "it",
+    "pt",
+    "ru",
+    "id",
+    "ms",
+    "tl",
+    "th",
+    "lo",
+    "vi",
+    "ar",
+    "he",
+    "hi",
+    "km",
+    "nl",
+    "tr"
+   ],
+   "online_menu_category_id": "660f9a1fb63c14000ac2da5a",
+   "payment_partial_order_unit_amt": null,
+   "payment_partial_order_pct": null,
+   "payment_partial_group_fee": null,
+   "payment_partial_person_fee": "5000.0",
+   "use_experience_page": false,
+   "tablecheck_promo": "",
+   "bin_promotion_id": null,
+   "tc_points_rate": null,
+   "tc_points_earnable": null,
+   "is_variable_rate": false,
+   "max_point_amount": null,
+   "max_point_amount_per_pax": null,
+   "service_category_ids": [],
+   "valid_date_ranges": [],
+   "questions": [],
+   "cancel_fee_rules": [
+    {
+     "id": "661f33cca7dbec31d970099f",
+     "advance_time": 86400,
+     "percent": null,
+     "amt_group": null,
+     "amt_pax": "5000.0"
+    }
+   ],
+   "pax_prices": []
+  }
+ ]
+}

@@ -39,6 +39,7 @@ SEARCH_SINK = Sink("search", SinkMode.ALLOWLIST,
 _PLATFORM_DOMAINS = [
     ("opentable.", ReservationMethod.OPENTABLE),
     ("resy.com", ReservationMethod.RESY),
+    ("tablecheck.com", ReservationMethod.TABLECHECK),
     ("vagaro.", ReservationMethod.GENERIC_WEB),
     ("booksy.", ReservationMethod.GENERIC_WEB),
     ("squareup.", ReservationMethod.GENERIC_WEB),
@@ -56,6 +57,7 @@ _PLATFORM_DOMAINS = [
 _PLATFORM_VENUE = {
     ReservationMethod.OPENTABLE: ("opentable.", ("/r/", "/restaurant/", "/booking/")),
     ReservationMethod.RESY: ("resy.com", ("/cities/", "/venues/")),
+    ReservationMethod.TABLECHECK: ("tablecheck.com", ("/reserve",)),
 }
 
 _CARD_HINT_WORDS = ("credit card", "deposit", "card to hold", "card on file", "prepay")
@@ -215,7 +217,23 @@ class BusinessDiscovery:
                    llm=ReservationLLM.from_env())
 
     # ------------------------------------------------------------------ discover
-    def discover(self, business_name: str, location: Optional[str] = None) -> ChannelDecision:
+    def discover(self, business_name: str, location: Optional[str] = None,
+                 target_url: Optional[str] = None,
+                 kind: str = "dining") -> ChannelDecision:
+        # The user pointed us at a page: that beats anything a search would
+        # turn up, and skips two API round trips for a business that isn't in
+        # a restaurant directory anyway.
+        if target_url:
+            # A pasted TableCheck page routes to its dedicated channel (pure
+            # HTTP availability); anything else goes through the generic form.
+            method = (ReservationMethod.TABLECHECK
+                      if "tablecheck.com" in target_url.lower()
+                      else ReservationMethod.GENERIC_WEB)
+            return ChannelDecision(
+                method=method, business_name=business_name,
+                url=target_url, confidence=0.95, source="user_url",
+                notes="Booking page supplied by the user.")
+
         # Both lookups (Yelp + web search) are built from exactly these fields.
         guard(SEARCH_SINK, {"business_name": business_name, "location": location or ""})
         decision = ChannelDecision(business_name=business_name)
@@ -237,8 +255,10 @@ class BusinessDiscovery:
         #    location (e.g. "Flores" returns a New York venue instead of SF).
         results = []
         if self.search is not None:
-            query = f"{business_name} {location} reservations booking".replace("  ", " ").strip() \
-                if location else f"{business_name} reservations booking"
+            # A clinic doesn't call it a "reservation" — searching for the wrong
+            # word buries the booking page under review-site noise.
+            intent = "reservations booking" if kind == "dining" else "book appointment online"
+            query = f"{business_name} {location or ''} {intent}".replace("  ", " ").strip()
             try:
                 results = self.search.search(query, max_results=5)
             except Exception:
@@ -401,8 +421,9 @@ class BusinessDiscovery:
             url = (getattr(r, "url", "") or "").lower()
             for fragment, method in _PLATFORM_DOMAINS:
                 if fragment in url:
-                    # OpenTable/Resy (dedicated reservation platforms) win over generic web.
-                    if method in (ReservationMethod.OPENTABLE, ReservationMethod.RESY):
+                    # Dedicated reservation platforms win over generic web.
+                    if method in (ReservationMethod.OPENTABLE, ReservationMethod.RESY,
+                                  ReservationMethod.TABLECHECK):
                         return getattr(r, "url", url), method
                     if best is None:
                         best = (getattr(r, "url", url), method)

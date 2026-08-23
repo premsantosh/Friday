@@ -1,0 +1,15 @@
+<!-- A booking form that also takes payment. The generic filler must refuse the
+     whole form: card handling belongs to the single-use-card path in
+     payment.py, which this one has none of. -->
+<h1>Book and Pay</h1>
+<form>
+  <label for="n">Name</label>
+  <input type="text" id="n" name="name" required>
+  <label for="e">Email</label>
+  <input type="email" id="e" name="email" required>
+  <label for="cc">Card Number</label>
+  <input type="text" id="cc" name="card_number" autocomplete="cc-number" required>
+  <label for="cvv">CVV</label>
+  <input type="text" id="cvv" name="cvv" required>
+  <button type="submit">Pay and Book</button>
+</form>

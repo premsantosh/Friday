@@ -1,0 +1,376 @@
+{
+ "shop": {
+  "slug": "benfiddich-tokyo",
+  "name_translations": [
+   {
+    "translation": "BenFiddich",
+    "locale": "ja"
+   },
+   {
+    "translation": "BenFiddich",
+    "locale": "en"
+   }
+  ],
+  "alt_name": "ベンフィディック",
+  "location_name_translations": [],
+  "alt_location_name": "",
+  "address_translations": [
+   {
+    "translation": "東京都新宿区西新宿1-13-7\n大和家ビル9F",
+    "locale": "ja"
+   },
+   {
+    "translation": "1-13-7 Nishishinjuku\nYamatoya Bldg. 9F\nShinjuku, Tokyo",
+    "locale": "en"
+   }
+  ],
+  "latitude": 35.6894804,
+  "longitude": 139.6966516,
+  "map_link_url": "https://www.google.com/maps/search/?api=1&query=none&query_place_id=ChIJZUTGW9GMGGAROJ7G4sU221Q",
+  "google_place_ref": "ChIJZUTGW9GMGGAROJ7G4sU221Q",
+  "default_locale": "ja",
+  "country": "JP",
+  "currency": "JPY",
+  "time_zone": "Asia/Tokyo",
+  "tz_utc_offset": 32400,
+  "phone": "+81362580309",
+  "phone_natl": "03-6258-0309",
+  "homepage_url": "https://www.instagram.com/benfiddich_tokyo/",
+  "inquiry_url": null,
+  "tags": [
+   "groups",
+   "quiet"
+  ],
+  "cuisines": [
+   "bar"
+  ],
+  "budget_lunch": null,
+  "budget_dinner": "5000.0",
+  "content_title_translations": [
+   {
+    "translation": "自家栽培ハーブと古酒の奥深い世界を楽しむバー",
+    "locale": "ja"
+   }
+  ],
+  "content_body_translations": [
+   {
+    "translation": "新宿駅からすぐの隠れ家バーで、完全予約制の特別な時間をお過ごしください。店主が自家栽培するフレッシュハーブで作るカクテルは、香り高く爽やか。古酒や薬草酒、アブサンなど、深い味わいのドリンクも豊富に取り揃えております。ぜひリラックスしたひとときをお楽しみください。",
+    "locale": "ja"
+   }
+  ],
+  "enable_ims": false,
+  "enable_ims_intl": false,
+  "enable_sms": false,
+  "enable_sms_intl": false,
+  "selectable_locales": null,
+  "booking_page_mode": "v2",
+  "enable_payments": true,
+  "smartpay_mode": "none",
+  "use_payments_v2": true,
+  "payment_gateways": [
+   "gmo"
+  ],
+  "payment_postpay_advance_days": null,
+  "apply_tax_to_service_fee": true,
+  "payment_cancel_protection_mode": "store_if_payment",
+  "tablecheck_branding": "full",
+  "whitelabel_domain": null,
+  "web_tracker_events": null,
+  "id": "660f9a1eb63c14000ac2da15",
+  "chain_shops": [],
+  "social_links": [],
+  "service_categories": [
+   {
+    "id": "661e2ceaeefe0c01f9b2c054",
+    "name_translations": [
+     {
+      "translation": "カウンター",
+      "locale": "ja"
+     },
+     {
+      "translation": "counter",
+      "locale": "en"
+     }
+    ],
+    "description_translations": [
+     {
+      "translation": "1~2名様でご予約いただけます。",
+      "locale": "ja"
+     },
+     {
+      "translation": "Reservations can be made for 1-2 people.",
+      "locale": "en"
+     }
+    ],
+    "image_url": null,
+    "position": 0
+   },
+   {
+    "id": "661e2cf31ec3ef01ef82a0b9",
+    "name_translations": [
+     {
+      "translation": "テーブル",
+      "locale": "ja"
+     },
+     {
+      "translation": "table",
+      "locale": "en"
+     }
+    ],
+    "description_translations": [
+     {
+      "translation": "2~4名様でご予約いただけます。",
+      "locale": "ja"
+     },
+     {
+      "translation": "Reservations can be made for 2 to 4 people.",
+      "locale": "en"
+     }
+    ],
+    "image_url": null,
+    "position": 1
+   }
+  ],
+  "membership_providers": [],
+  "menu_categories": [
+   {
+    "id": "660f9a1fb63c14000ac2da5a",
+    "name_translations": [
+     {
+      "translation": "Course",
+      "locale": "en"
+     },
+     {
+      "translation": "コース",
+      "locale": "ja"
+     }
+    ],
+    "position": 0
+   }
+  ],
+  "web_trackers": [],
+  "pax_categories": []
+ },
+ "booking_page": {
+  "shop_slug": "benfiddich-tokyo",
+  "franchise_id": "660f9a1eb63c14000ac2da14",
+  "page_slug": null,
+  "is_active": true,
+  "is_robots_noindex": false,
+  "tablecheck_login": "optional",
+  "request_tablecheck_login": "required",
+  "show_social_login": true,
+  "show_shop_select": false,
+  "show_special_request": true,
+  "seat_types": [],
+  "show_menu_rules": [],
+  "show_smoking": false,
+  "show_phone_flag": true,
+  "sms_default_opted_in": false,
+  "input_marketing": "show_local",
+  "reservation_auto_accept": true,
+  "require_email_confirmation": false,
+  "require_waitlist_email_confirmation": false,
+  "legacy_theme": "",
+  "legacy_logo_image_url": null,
+  "legacy_header_image_url": "https://cdn0.tablecheck.com/images/660f9d3f512b960297edc236/images/md/712c22ab.jpg?1712299327",
+  "offers_checkbox_use_location_name": false,
+  "merchant_message_placement": "start",
+  "light_booking_theme_id": "661d0466d642f4026a2f680f",
+  "dark_booking_theme_id": null,
+  "booking_services": [
+   {
+    "id": "660f9a1eb63c14000ac2da15",
+    "service_mode": "dining",
+    "show_promo_code": false,
+    "merchant_message_translations": [
+     {
+      "translation": "<b>当店はメニューがございません。バーテンダーと会話をしながらあなたの好みをお伝えください。素敵なカクテルをおつくりします。</b>\r\n\r\n●予約は毎月20日に翌月までの予約が開始されます。\r\n●15席のとても小さなBARです。予約を強くお勧めします。ウォークインでの御来店は予約のお客様を優先する為対応が難しくなります。\r\n●BenFiddichの営業日は店主の鹿山が不在だと店を閉めている不定休スタイルです。毎月20日にInstagramに翌月の営業カレンダーをポストしています。\r\n●お席のご指定につきましては、ご要望に添えない場合もございますので、予めご了承ください。\r\n●ご予約のお時間15分を過ぎた場合はキャンセルとさせていただきます。\r\n●<b>5名様以上のご予約はお断りしております。</b>\r\n●同じグループで複数人に別けてのご予約はご遠慮ください。\r\n●営業時間は営業に専念するためお電話が繋がりません。あらかじめご了承ください。\r\n【ご予約可能なお時間】\r\n  19:00～\r\n  21:00～\r\n  23:00～\r\n の3部制となっております。",
+      "locale": "ja"
+     },
+     {
+      "translation": "<b>We do not have a menu. Please talk to the bartender and tell us your preferences. We will make a wonderful cocktail for you.</b> \r\n\r\n*BenFiddich schedule is announced on the 20th of each month and can be booked up until the next month.\r\n*BenFiddich is a very small bar with only 15 seats. We highly recommend making a reservation in advance. As we prioritize reserved guests, we may not be able to accommodate walk-ins.\r\n*BenFiddich operates on an irregular schedule, closing when owner-bartender Hiroyasu Kayama is unavailable. The next month’s schedule is posted on our Instagram on the 20th of each month.\r\n*Please note that we may not be able to accommodate your request for a specific seat. \r\n*Reservations will be canceled if 15 minutes have passed since the reservation time.\r\n * <b>We do not accept reservations for more than 5 people.</b> \r\n*Our bar is very small with 15 seats, so please refrain from making reservations for multiple people from the same group.\r\n *During business hours, we are dedicated to business, so the phone will not be answered. Thank you for your understanding.\r\n [Reservation times] \r\nWe have three times: \r\n19:00～\r\n21:00～\r\n23:00～.",
+      "locale": "en"
+     }
+    ],
+    "booking_policy_translations": [
+     {
+      "translation": "<b>当店はメニューがございません。バーテンダーと会話をしながらあなたの好みをお伝えください。素敵なカクテルをおつくりします。</b>\r\n\r\n●予約は毎月20日に翌月までの予約が開始されます。\r\n●15席のとても小さなBARです。予約を強くお勧めします。ウォークインでの御来店は予約のお客様を優先する為対応が難しくなります。\r\n●BenFiddichの営業日は店主の鹿山が不在だと店を閉めている不定休スタイルです。毎月20日にInstagramに翌月の営業カレンダーをポストしています。\r\n●お席のご指定につきましては、ご要望に添えない場合もございますので、予めご了承ください。\r\n●ご予約のお時間15分を過ぎた場合はキャンセルとさせていただきます。\r\n●<b>5名様以上のご予約はお断りしております。</b>\r\n●同じグループで複数人に別けてのご予約はご遠慮ください。\r\n●営業時間は営業に専念するためお電話が繋がりません。あらかじめご了承ください。\r\n【ご予約可能なお時間】\r\n  19:00～\r\n  21:00～\r\n  23:00～\r\n の3部制となっております。",
+      "locale": "ja"
+     },
+     {
+      "translation": "<b>We do not have a menu. Please talk to the bartender and tell us your preferences. We will make a wonderful cocktail for you.</b> \r\n\r\n*BenFiddich schedule is announced on the 20th of each month and can be booked up until the next month.\r\n*BenFiddich is a very small bar with only 15 seats. We highly recommend making a reservation in advance. As we prioritize reserved guests, we may not be able to accommodate walk-ins.\r\n*BenFiddich operates on an irregular schedule, closing when owner-bartender Hiroyasu Kayama is unavailable. The next month’s schedule is posted on our Instagram on the 20th of each month.\r\n*Please note that we may not be able to accommodate your request for a specific seat. \r\n*Reservations will be canceled if 15 minutes have passed since the reservation time.\r\n * <b>We do not accept reservations for more than 5 people.</b> \r\n*Our bar is very small with 15 seats, so please refrain from making reservations for multiple people from the same group.\r\n *During business hours, we are dedicated to business, so the phone will not be answered. Thank you for your understanding.\r\n [Reservation times] \r\nWe have three times: \r\n19:00～\r\n21:00～\r\n23:00～.",
+      "locale": "en"
+     }
+    ],
+    "booking_policy_placement": "popup",
+    "booking_policy_require_confirm": true,
+    "cancel_policy_translations": [
+     {
+      "translation": "キャンセル・変更につきましては、来店時間より起算して下記の通りキャンセル料を頂戴いたします。\r\n24時間前：おひとり様5,000円",
+      "locale": "ja"
+     },
+     {
+      "translation": "For cancellations and changes, the following cancellation fees will be charged, counting from the time of arrival: \r\n24 hours in advance: 5,000 yen per person",
+      "locale": "en"
+     }
+    ],
+    "prompt_cancel_reason": true,
+    "request_policy_translations": [],
+    "request_policy_placement": "popup",
+    "request_policy_require_confirm": true,
+    "waitlist_policy_translations": [],
+    "waitlist_policy_placement": "popup",
+    "waitlist_policy_require_confirm": true,
+    "voucher_cancel_policy_translations": [
+     {
+      "translation": "If the voucher is used for the reservation and a cancellation fee is applied, cancellation fee will be offset in priority to vouchers. The voucher status will be used at the time of cancellation and no refunds will be made for the remaining amount.",
+      "locale": "en"
+     },
+     {
+      "translation": "バウチャーを利用して予約し、キャンセル料が発生する場合、バウチャーより優先的に相殺します。キャンセル発生時点で本バウチャーは利用済み扱いとなり、残額の返金は行いません。あらかじめご了承ください。",
+      "locale": "ja"
+     }
+    ],
+    "landing_page_experience_mode": "none",
+    "questions": [
+     {
+      "id": "660f9a8b24fdd6000a96e271",
+      "is_required": false,
+      "question_translations": [
+       {
+        "translation": "アレルギーがございましたら、ご記入ください。 ",
+        "locale": "ja"
+       },
+       {
+        "translation": "If you have any allergies, please write them down.",
+        "locale": "en"
+       }
+      ],
+      "ui_type": "textarea",
+      "is_option_other": false,
+      "question_options": []
+     },
+     {
+      "id": "68e9e28bf96afb2961e68c7b",
+      "is_required": true,
+      "question_translations": [
+       {
+        "translation": "<b><red>大変恐縮ではございますが、予約枠の転売が多発しているため、\r\nご来店時にはご予約時にご入力いただいたクレジットカードのご提示をお願いしております。</red></b>",
+        "locale": "ja"
+       },
+       {
+        "translation": "<b><red>We apologize for the inconvenience, but due to the frequent resale of reservation slots,\r\nwe ask that you present the credit card information you entered when making your reservation when you visit the store.</red></b>",
+        "locale": "en"
+       }
+      ],
+      "ui_type": "radio",
+      "is_option_other": false,
+      "question_options": [
+       {
+        "id": "68e9e28bf96afb2961e68c7e",
+        "label_translations": [
+         {
+          "translation": "同意しました。",
+          "locale": "ja"
+         },
+         {
+          "translation": "I agree.",
+          "locale": "en"
+         }
+        ]
+       }
+      ]
+     }
+    ],
+    "cancel_fee_rules": [
+     {
+      "id": "661e3d325a39ac02fabebb48",
+      "advance_time": 86400,
+      "percent": null,
+      "amt_group": null,
+      "amt_pax": "5000.0"
+     }
+    ]
+   }
+  ],
+  "use_menu_show_locales": true,
+  "return_url_translations": [
+   {
+    "translation": "https://www.instagram.com/benfiddich_tokyo/",
+    "locale": "ja"
+   }
+  ],
+  "offers_checkbox_text_translations": [],
+  "booking_fee_policy_html": null,
+  "payment_maintenance_alert_html": null,
+  "enable_texts_tc_otp": false,
+  "enable_request_any_datetime": false,
+  "request_reservation_enabled": false,
+  "purpose_options": [
+   "birthday",
+   "birthday_self",
+   "birthday_friends"
+  ],
+  "calendar_availability_mode": "strict",
+  "enable_optional_prepay": true,
+  "show_debit_card_warning": true,
+  "input_customer_phone": "required",
+  "input_customer_email": "required",
+  "require_email_unless_sms": true,
+  "input_customer_birthday": "hide",
+  "input_customer_birthday_year": "optional",
+  "input_customer_birthday_min_age": null,
+  "show_availability": true,
+  "show_timetable": false,
+  "show_experience_availability": false,
+  "availability_suggestion_priority": "other_shops",
+  "min_num_people": 1,
+  "max_num_people": 4,
+  "min_manual_duration": null,
+  "max_manual_duration": null,
+  "max_orders": 1,
+  "input_duration": "hide",
+  "input_service_category": "required",
+  "input_customer_gender": "hide",
+  "input_purpose": "optional",
+  "input_purpose_mode": "long",
+  "input_room_name": "hide",
+  "show_visit_history": true,
+  "show_menu_categories": false,
+  "show_menu_item_sold_out": false,
+  "show_baby": false,
+  "show_child": false,
+  "show_senior": false,
+  "age_baby": 5,
+  "age_child": 12,
+  "age_senior": 60,
+  "reservation_timeout": 600,
+  "include_in_sitemap": true,
+  "iframe_domains": [],
+  "time_interval": 1800,
+  "timetable_interval": 1800,
+  "waitlist_cta_button_text": null,
+  "waitlist_cta_link_url": null,
+  "input_waitlist_customer_email": "optional",
+  "input_waitlist_customer_phone": "required",
+  "input_waitlist_customer_gender": "hide",
+  "input_waitlist_customer_birthday": "hide",
+  "input_waitlist_customer_birthday_year": "optional",
+  "input_waitlist_customer_birthday_min_age": null,
+  "require_waitlist_email_unless_sms": false,
+  "waitlist_status_modes": [
+   "position"
+  ],
+  "show_request_text_preference": false,
+  "show_menu_on_landing_page": false,
+  "enable_waitlist_location_restriction": false,
+  "waitlist_location_restriction_radius_m": 500,
+  "footer_translations": [],
+  "terms_url_translations": [],
+  "privacy_url_translations": [],
+  "waitlist_cta_button_text_translations": [],
+  "waitlist_cta_link_url_translations": [],
+  "booking_affirmations": []
+ }
+}

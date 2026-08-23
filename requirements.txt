@@ -21,8 +21,10 @@ requests>=2.28.0
 # piper-tts>=1.0.0
 # TTS>=0.17.0  # Coqui TTS
 
-# For MP3 playback
+# For MP3 playback. pydub needs stdlib audioop, removed in Python 3.13 —
+# audioop-lts is the drop-in backport (without it, MP3 replies fail silently).
 pydub>=0.25.1
+audioop-lts>=0.2; python_version >= "3.13"
 
 # LLM Providers
 anthropic>=0.18.0
@@ -35,6 +37,10 @@ pvporcupine>=3.0.0
 # Home Assistant Integration (optional)
 aiohttp>=3.9.0
 
+# Voice PE satellites — ESPHome native API client (core/voice_pe_channel.py).
+# Needs Python >= 3.11. Imports are guarded, so Friday runs without it.
+aioesphomeapi>=45.6.2,<46
+
 # Utilities
 python-dotenv>=1.0.0
 # Harness slot normalization (deterministic date parsing; core/harness/normalize.py)
@@ -45,6 +51,17 @@ tavily-python>=0.5.0
 
 # Semantic intent cache
 chromadb>=0.5.0
+
+# LangGraph agent engine (opt-in: FRIDAY_AGENT_ENGINE=langgraph). Open-source
+# libraries only, checkpoints in a local SQLite file; imports are guarded so
+# Friday runs on the legacy router without them. LangSmith tracing is optional
+# (langsmith is already a transitive dep of langchain-core).
+langgraph>=0.2.60
+langgraph-checkpoint-sqlite>=2.0.0
+langchain-core>=0.3.0
+langchain-anthropic>=0.3.0
+# langchain-openai>=0.2.0   # if LLM provider is openai
+# langchain-ollama>=0.2.0   # if LLM provider is ollama
 
 # Multi-turn conversational context register (Layer A), pinned by commit SHA
 turnstile-ctx @ git+https://github.com/premsantosh/turnstile-ctx.git@e1778258f01f4252ffdd048d80805db67c95f499
