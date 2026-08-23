@@ -27,6 +27,7 @@ MIN_N = 30
 MIN_CONTROL_WIN_RATE = 0.45
 MAX_STYLE_REGRESSION = 0.05
 CONSECUTIVE_EVALS = 2
+EXCLUDED_JUDGES = frozenset({"fake"})  # dry-run rows, not evidence
 MIN_DAYS_BETWEEN_EVALS = 5  # "weekly", with slack for a run that slipped a day
 
 
@@ -145,8 +146,11 @@ def evaluate_bar(rows: list[dict], *, arm: str,
     additionally requires the previous eval at least MIN_DAYS_BETWEEN_EVALS
     earlier to have met 1-5 as well.
     """
+    # `--dry-run` nightlies write FakeJudge rows so the end-to-end harness is
+    # exercised; they are not evidence and must never count toward the bar.
     matching = [r for r in rows
-                if r.get("arm") == arm and r.get("split") == split]
+                if r.get("arm") == arm and r.get("split") == split
+                and r.get("judge") not in EXCLUDED_JUDGES]
     matching.sort(key=lambda r: (_date(r) or datetime.min))
 
     if not matching:

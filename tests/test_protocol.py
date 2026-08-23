@@ -146,3 +146,21 @@ def test_load_rows_reads_the_csv(tmp_path):
     rows = load_rows(path)
     assert rows[0]["arm"] == "lora"
     assert rows[0]["win_rate"] == "0.6"
+
+
+# ------------------------------------------------------------ judge filter
+def test_fake_judge_rows_never_count_toward_the_bar():
+    """A --dry-run nightly appends judge=fake rows to results/eval.csv so the
+    harness runs end to end; they must read as 'no eval rows yet', not as a
+    pass (or a fail) of the pre-registered bar."""
+    rows = [_row(date="2026-08-07", judge="fake"), _row(date="2026-08-14", judge="fake")]
+    bar = evaluate_bar(rows, arm="lora")
+    assert not bar.improved
+    assert all(c.passed is None for c in bar.conditions)
+
+    # A real judge row still counts, and the fake ones do not sneak in as the
+    # 'previous eval' for condition 6.
+    rows.append(_row(date="2026-08-21"))
+    bar = evaluate_bar(rows, arm="lora")
+    assert [_cond(bar, n).passed for n in (1, 2, 3, 4, 5)] == [True] * 5
+    assert _cond(bar, 6).passed is not True
