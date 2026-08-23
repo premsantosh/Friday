@@ -433,6 +433,14 @@ def cmd_revert(args: argparse.Namespace) -> int:
 
 
 def main(argv=None) -> int:
+    # Same as main.py: ANTHROPIC_API_KEY lives in ./.env, and launchd (the
+    # nightly job) sources no shell profile, so the evolver and the Sonnet
+    # judge would otherwise run unauthenticated at 03:30.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     parser = argparse.ArgumentParser(prog="python -m research")
     parser.add_argument("--db", default="~/.friday/research.db")
     parser.add_argument("--artifacts-dir", default=None,
