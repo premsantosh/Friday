@@ -122,17 +122,25 @@ class VoiceAssistant:
             for wf in self.workflows.workflows.values():
                 if hasattr(wf, "session_store") and wf.session_store is None:
                     wf.session_store = session_store
-            # Drives WAITING sessions + expiry sweep; started in run(), stopped in stop().
-            # Not started for ephemeral one-shot interactions (--test / --chat).
-            self.background_runner: Optional[BackgroundTaskRunner] = (
-                None if self.config.llm.ephemeral
-                else BackgroundTaskRunner(
-                    self.sessions, self.speak, tick_seconds=conv_cfg.background_tick_seconds
-                )
-            )
         else:
             self.sessions = None
-            self.background_runner = None
+
+        # LangGraph agent engine (opt-in via FRIDAY_AGENT_ENGINE=langgraph). Built
+        # after the LLM, workflows, sessions, context and cache so it can reuse
+        # them; None means Step 3 of process_input uses the legacy router.
+        self.agent_engine = self._build_agent_engine()
+
+        # Drives WAITING sessions + expiry sweep (+ agent wake-ups); started in
+        # run(), stopped in stop(). Not started for ephemeral one-shot
+        # interactions (--test / --chat).
+        self.background_runner: Optional[BackgroundTaskRunner] = (
+            BackgroundTaskRunner(
+                self.sessions, self.speak, tick_seconds=conv_cfg.background_tick_seconds,
+                agent_engine=self.agent_engine,
+            )
+            if self.sessions is not None and not self.config.llm.ephemeral
+            else None
+        )
 
         # Audio components
         self.recorder = AudioRecorder(AudioConfig(
@@ -171,6 +179,32 @@ class VoiceAssistant:
         if self.config.debug_mode:
             from core.harness import redact_text
             print(f"[Debug] {redact_text(message)}")
+
+    def _build_agent_engine(self):
+        """Construct the LangGraph AgentEngine when the config asks for it and
+        the libraries are installed; otherwise None (legacy router). Any failure
+        here is a warning, never a crash — Friday always boots."""
+        agent_cfg = getattr(self.config, "agent", None)
+        if agent_cfg is None or agent_cfg.engine != "langgraph":
+            return None
+        try:
+            import agent as agent_pkg
+            if not agent_pkg.is_available():
+                print(f"⚠️  FRIDAY_AGENT_ENGINE=langgraph but the engine is unavailable "
+                      f"({agent_pkg.unavailable_reason()}); using the legacy router.")
+                return None
+            engine = agent_pkg.AgentEngine.from_assistant(self)
+            self._log(f"Agent engine: {engine.describe()}")
+            return engine
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Agent engine failed to start; using the legacy router: %s", e, exc_info=True)
+            print(f"⚠️  Agent engine failed to start ({e}); using the legacy router.")
+            return None
+
+    @property
+    def engine_label(self) -> str:
+        return "langgraph" if self.agent_engine is not None else "legacy router"
     
     async def _maybe_start_session(self, workflow, text: str, entities: dict, user_id: str):
         """If `workflow` is conversational, open a multi-turn session and return its
@@ -195,10 +229,13 @@ class VoiceAssistant:
 
         Pipeline:
         0. Active multi-turn session   → route the turn into it (global "cancel" aborts)
+           Pending agent confirmation → this turn answers it (global "cancel" abandons)
         1. Fast keyword/pattern match  → conversational? open session, else execute
         2. Semantic intent cache       → conversational? open session, else execute
-        3. Claude routing prompt       → classify (context-enriched), open/execute workflow
-           └ no workflow found         → Claude generates a conversational response
+        3. Agent engine (LangGraph)    → tool-calling loop over the workflow registry
+           └ on any error, or when the engine is off: legacy Claude routing prompt
+              → classify (context-enriched), open/execute workflow
+              └ no workflow found      → Claude generates a conversational response
         """
         self._log(f"Processing: {text}")
 
@@ -210,6 +247,25 @@ class VoiceAssistant:
             self._log("Routing to active session")
             result = await self.sessions.handle(user_id, text)
             return result.message
+
+        # Step 0b: a pending agent confirmation ("Shall I unlock the back door?")
+        # owns the turn, exactly like an active session — otherwise "yes please"
+        # could keyword-match a workflow instead of answering the question. At
+        # most one of (legacy session, graph interrupt) is pending per user:
+        # the start_task handoff ends the graph turn without an interrupt.
+        if self.agent_engine is not None:
+            try:
+                if await self.agent_engine.has_pending_interrupt(user_id):
+                    if SessionManager.is_global_escape(text):
+                        await self.agent_engine.cancel(user_id)
+                        return "Very well, sir. I've set that aside."
+                    self._log("Routing to pending agent confirmation")
+                    return await self.agent_engine.handle(text, user_id, cacheable=False)
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "Agent engine failed on a pending confirmation; continuing with the "
+                    "legacy pipeline: %s", e, exc_info=True)
+                self._log(f"Agent engine error (pending turn): {e}")
 
         # Layer A: enrich for routing continuity (raw text is kept for keyword/cache
         # matching so an injected context prefix can't cause false keyword hits).
@@ -251,7 +307,18 @@ class VoiceAssistant:
                         return self._handle_workflow_failure(text, workflow_name, result)
                     return result.message
 
-        # Step 3: Claude routing (enhanced fallback, uses context-enriched text)
+        # Step 3: agent engine (LangGraph). Any exception falls through to the
+        # legacy router below, so Friday keeps working if the engine misbehaves.
+        if self.agent_engine is not None:
+            try:
+                self._log("Routing via agent engine")
+                return await self.agent_engine.handle(text, user_id, cacheable=(enriched == text))
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "Agent engine failed; falling back to the legacy router: %s", e, exc_info=True)
+                self._log(f"Agent engine error: {e}")
+
+        # Step 3 (legacy): Claude routing (enhanced fallback, uses context-enriched text)
         self._log("Routing via Claude")
         route = self.intent_router.route(enriched, self.workflows)
 
@@ -490,8 +557,10 @@ class VoiceAssistant:
         self._log(f"Personality updated: {kwargs}")
 
     def clear_history(self):
-        """Clear the conversation history."""
+        """Clear the conversation history (legacy list and, when on, the agent thread)."""
         self.llm.clear_history()
+        if self.agent_engine is not None:
+            self.agent_engine.reset()
 
 
 def create_assistant(
