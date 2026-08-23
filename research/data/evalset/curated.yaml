@@ -106,8 +106,8 @@ prompts:
   # ------------------------------------------- correction_persistence (FILL-IN)
   - id: correct-01
     category: correction_persistence
-    prompt: "Remind me what milk to buy."
-    annotations: "FILL-IN: a preference you have explicitly corrected Friday about; the corrected value must win."
+    prompt: "Hey dude, tell me a joke."
+    annotations: "User explicitly corrected Friday after it replied that it could not tell jokes and could only help with things like lights and the weather. The corrected behaviour must win: Friday tells one short joke in persona (dry, deadpan). Declining, or listing capabilities instead of a joke, is wrong."
 
   # -------------------------------------------------- generic_control (regression canary)
   - id: control-01

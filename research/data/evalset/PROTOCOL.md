@@ -91,3 +91,7 @@ An arm beats base when ALL of:
   composure, information density, one-question handling of ambiguity). The
   curated split is now 32 probes; correct-01 remains FILL-IN until the user
   names a real correction, so the curated split still refuses to run.
+- 2026-08-22 (later): correct-01 filled from a real correction made the same
+  day (Friday said it could not tell jokes; the user said it should). Prompt
+  changed from the milk placeholder to the joke request. The curated split now
+  has no FILL-IN probes and runs from the first Sunday eval (2026-08-23).
