@@ -80,9 +80,11 @@ def _default_llm(prompt: str) -> str:
     resp = client.messages.create(
         model=EVOLVER_MODEL,
         max_tokens=1500,
+        thinking={"type": "disabled"},
         messages=[{"role": "user", "content": prompt}],
     )
-    return resp.content[0].text
+    from research.judge import first_text
+    return first_text(resp)
 
 
 def load_current_block(artifacts_dir: Path = artifacts.DEFAULT_ARTIFACTS_DIR) -> str:

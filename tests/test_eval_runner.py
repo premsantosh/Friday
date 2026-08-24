@@ -148,3 +148,26 @@ def test_csv_and_markdown_report(tmp_path):
     text = md_path.read_text()
     assert "| lora | base |" in text
     assert "100.0%" in text
+
+
+# ------------------------------------------------------------ response parsing
+class _Block:
+    def __init__(self, type_, **kw):
+        self.type = type_
+        self.__dict__.update(kw)
+
+
+class _Resp:
+    def __init__(self, *blocks):
+        self.content = list(blocks)
+
+
+def test_first_text_skips_thinking_blocks():
+    """Sonnet 5 thinks adaptively by default: content[0] can be a ThinkingBlock
+    (the 2026-08-23 nightly's evolve stage died on .content[0].text)."""
+    from research.judge import first_text
+
+    resp = _Resp(_Block("thinking", thinking="…"), _Block("text", text="the answer"))
+    assert first_text(resp) == "the answer"
+    assert first_text(_Resp(_Block("thinking", thinking="…"))) == ""
+    assert first_text(_Resp()) == ""

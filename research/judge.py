@@ -71,6 +71,17 @@ def _parse_verdict(text: str, judge_name: str) -> Verdict:
         return Verdict("error", f"unparseable: {text[:80]!r}", judge_name)
 
 
+def first_text(resp) -> str:
+    """Text of the first text block in an Anthropic response.
+
+    Sonnet 5 runs adaptive thinking by default, so content[0] can be a
+    ThinkingBlock — indexing .content[0].text raised AttributeError on the
+    2026-08-23 nightly. We also pass thinking={"type": "disabled"} on these
+    small fixed-format calls, but parse defensively either way.
+    """
+    return next((b.text for b in resp.content if b.type == "text"), "")
+
+
 class SonnetJudge:
     """Primary judge (paid API call per comparison)."""
 
@@ -86,9 +97,10 @@ class SonnetJudge:
             resp = self._client.messages.create(
                 model=self.model,
                 max_tokens=200,
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": content}],
             )
-            return _parse_verdict(resp.content[0].text, self.name)
+            return _parse_verdict(first_text(resp), self.name)
         except Exception as e:
             logger.warning("Sonnet judge failed: %s", e)
             return Verdict("error", str(e)[:120], self.name)

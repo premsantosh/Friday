@@ -136,11 +136,13 @@ def stage_train(ctx: NightlyContext) -> str:
 
     def sonnet(prompt: str) -> str:
         import anthropic
+        from research.judge import first_text
         resp = anthropic.Anthropic().messages.create(
             model="claude-sonnet-5", max_tokens=400,
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
-        return resp.content[0].text
+        return first_text(resp)
 
     return train_nightly(ctx.store, ctx.date_str, artifacts_dir=ctx.artifacts_dir,
                          correction_llm_fn=sonnet)
