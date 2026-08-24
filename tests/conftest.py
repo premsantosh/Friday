@@ -30,6 +30,9 @@ _EXTERNAL_SERVICE_ENV = (
     # Outbound email (SMTP) + reply polling (IMAP)
     "SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "RESERVATION_EMAIL_FROM",
     "IMAP_HOST", "IMAP_USER", "IMAP_PASSWORD",
+    # Research substrate (research/): writes ~/.friday/research.db and calls
+    # local Ollama when enabled — must never turn on implicitly in tests.
+    "FRIDAY_RESEARCH",
     # TableCheck watcher: a developer's endpoint override would change the URLs
     # the fixture-driven channel tests assert on.
     "TABLECHECK_AVAILABILITY_URL",
@@ -48,6 +51,20 @@ def isolate_external_services(monkeypatch):
     for var in _EXTERNAL_SERVICE_ENV:
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def no_results_writes_into_the_repo(tmp_path, monkeypatch):
+    """Point research/report.py's default output at tmp_path.
+
+    The eval CSV is the study's longitudinal record. A test that forgets to pass
+    results_dir would otherwise append synthetic FakeJudge rows to the real
+    results/eval.csv, which is a quietly corrupted dataset rather than a visible
+    failure. Tests that assert on output pass results_dir explicitly.
+    """
+    from research import report
+
+    monkeypatch.setattr(report, "RESULTS_DIR", tmp_path / "repo-results")
 
 
 @pytest.fixture(autouse=True)

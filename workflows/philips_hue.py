@@ -15,6 +15,7 @@ Configuration:
 """
 
 import os
+import re
 import ssl
 import logging
 from typing import Optional, Dict, Any, List
@@ -289,6 +290,8 @@ class PhilipsHueLightsWorkflow(Workflow):
                 "Turn on the living room lights",
                 "Dim the bedroom lights to 50%",
                 "Turn off all the lights",
+                "Are the lights on?",
+                "Check if the bedroom lights are off",
                 "I am in a romantic mood",
                 "Set the lights to party mode",
                 "I'm going to bed",
@@ -296,6 +299,23 @@ class PhilipsHueLightsWorkflow(Workflow):
                 "Good morning",
             ],
         )
+
+    # A state QUESTION must never mutate. The router or agent can call this
+    # workflow without an "action" entity, and the default action is toggle —
+    # without this guard "check if the lights are on" once flipped every
+    # light in the house.
+    _STATE_QUERY_RE = re.compile(
+        r"(^\s*(are|is|which|what|how many)\b)"
+        r"|(\bcheck\b)"
+        r"|(\btell me (if|whether)\b)"
+        r"|(\bstatus\b)"
+        r"|(\?\s*$)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_state_query(cls, text: str) -> bool:
+        return bool(cls._STATE_QUERY_RE.search(text or ""))
 
     async def execute(self, intent: str, entities: Dict[str, Any]) -> WorkflowResult:
         if self.client is None:
@@ -320,6 +340,13 @@ class PhilipsHueLightsWorkflow(Workflow):
         room = entities.get("room", "all").lower()
         brightness = entities.get("brightness")
         mood = entities.get("mood")
+
+        # No explicit action extracted and the utterance reads as a question:
+        # report state instead of falling through to the mutating toggle.
+        if "action" not in entities and self._is_state_query(intent):
+            action = "status"
+        if action == "status":
+            return await self._light_status(room)
 
         try:
             # Build the state/action payload (API v2 nested format)
@@ -386,6 +413,65 @@ class PhilipsHueLightsWorkflow(Workflow):
             return WorkflowResult(
                 status=WorkflowStatus.FAILURE,
                 message=f"I encountered difficulty with the lights, sir. The error was: {e}",
+                error=str(e),
+            )
+
+    async def _light_status(self, room: str) -> WorkflowResult:
+        """Read-only state report. Fetches fresh state (no cached toggles)."""
+        try:
+            if room in ("all", "everywhere", "everything", "every room"):
+                lights = await self.client.get_lights()
+                named = [(l.get("metadata", {}).get("name", "?"),
+                          bool(l.get("on", {}).get("on"))) for l in lights]
+                on_names = [name for name, is_on in named if is_on]
+                if not named:
+                    message = "I could not find any lights on the bridge, sir."
+                elif not on_names:
+                    message = f"All {len(named)} lights are off, sir."
+                elif len(on_names) == len(named):
+                    message = f"All {len(named)} lights are on, sir."
+                else:
+                    listing = ", ".join(on_names[:5])
+                    more = "" if len(on_names) <= 5 else f" and {len(on_names) - 5} more"
+                    message = (f"{len(on_names)} of {len(named)} lights are on, sir: "
+                               f"{listing}{more}.")
+                return WorkflowResult(
+                    status=WorkflowStatus.SUCCESS,
+                    message=message,
+                    data={"action": "status", "room": room,
+                          "lights_on": on_names, "lights_total": len(named)},
+                )
+
+            group_id = self.client.find_group_id(room)
+            if group_id is not None:
+                grouped = await self.client.get_grouped_lights()
+                for gl in grouped:
+                    if gl.get("id") == group_id:
+                        is_on = bool(gl.get("on", {}).get("on"))
+                        return WorkflowResult(
+                            status=WorkflowStatus.SUCCESS,
+                            message=f"The {room} lights are {'on' if is_on else 'off'}, sir.",
+                            data={"action": "status", "room": room, "on": is_on},
+                        )
+            light_id = self.client.find_light_id(room)
+            if light_id is not None:
+                for light in await self.client.get_lights():
+                    if light.get("id") == light_id:
+                        is_on = bool(light.get("on", {}).get("on"))
+                        return WorkflowResult(
+                            status=WorkflowStatus.SUCCESS,
+                            message=f"The {room} light is {'on' if is_on else 'off'}, sir.",
+                            data={"action": "status", "room": room, "on": is_on},
+                        )
+            return WorkflowResult(
+                status=WorkflowStatus.FAILURE,
+                message=f"I could not find a light or room called '{room}', sir.",
+                error=f"Unknown light/group: {room}",
+            )
+        except Exception as e:
+            return WorkflowResult(
+                status=WorkflowStatus.FAILURE,
+                message=f"I could not read the light state, sir. The error was: {e}",
                 error=str(e),
             )
 

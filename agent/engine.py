@@ -52,7 +52,8 @@ from core.harness import ConfirmDecision, parse_confirmation
 
 from .checkpoint import CheckpointerProvider
 from .graph import build_graph
-from .nodes import last_ai_text, last_human_text, succeeded, turn_tool_calls
+from .nodes import (build_system_prompt, last_ai_text, last_human_text,
+                    succeeded, turn_tool_calls)
 from .store import AgentStore, Wake
 from .tools import DECLINED_PREFIX, ToolSet, build_tools
 from .tracing import trace_config
@@ -112,7 +113,40 @@ def _pending_interrupt(state) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else {"type": "confirmation", "question": str(value)}
 
 
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+    return str(content or "")
+
+
+def _snapshot_messages(messages) -> List[Dict[str, str]]:
+    """History as role dicts, replay-input shaped: everything up to and
+    including the current user message. The trailing assistant reply is
+    dropped and tool-calling turns are skipped, matching what
+    LLMProvider._record_exchange snapshots on the legacy path."""
+    out: List[Dict[str, str]] = []
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            out.append({"role": "user", "content": _message_text(m.content)})
+        elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+            t = _message_text(m.content)
+            if t:
+                out.append({"role": "assistant", "content": t})
+    while out and out[-1]["role"] == "assistant":
+        out.pop()
+    return out
+
+
 class AgentEngine:
+    # What the last handle() turn was: "chat" | "tools" | "interrupt" |
+    # "handoff" | "cached" | "confirm" | "error". VoiceAssistant maps this to
+    # the research route; turns are serialized by its _turn_lock, so a plain
+    # attribute is safe.
+    last_turn_kind: Optional[str] = None
+
     def __init__(self, deps: EngineDeps, *, checkpoints: CheckpointerProvider,
                  tracer=None, tools: Optional[ToolSet] = None,
                  clock: Callable[[], float] = time.time) -> None:
@@ -199,6 +233,7 @@ class AgentEngine:
                     await self._close_pending(app, thread_id, state, pending, "let it lapse")
                     prefix = f"That confirmation lapsed, {self._title}, so I set it aside. "
                 else:
+                    self.last_turn_kind = "confirm"
                     return await self._answer_pending(app, thread_id, state, pending, text, user_id)
             else:
                 await self._repair_orphans(app, thread_id, state)
@@ -219,6 +254,7 @@ class AgentEngine:
                         as_node="finalize")
                 except Exception:
                     logger.debug("could not append cached exchange to thread", exc_info=True)
+                self.last_turn_kind = "cached"
                 return prefix + cached
 
             try:
@@ -230,9 +266,19 @@ class AgentEngine:
                 recovered = await self._recover_after_error(app, thread_id, text)
                 if recovered is None:
                     raise
+                self.last_turn_kind = "error"
                 return prefix + recovered
             reply = self._reply_from(out)
             self._post_run(out, text, cacheable=cacheable)
+            if out.get("__interrupt__"):
+                self.last_turn_kind = "interrupt"
+            elif out.get("handoff_message"):
+                self.last_turn_kind = "handoff"
+            elif turn_tool_calls(out.get("messages", [])):
+                self.last_turn_kind = "tools"
+            else:
+                self.last_turn_kind = "chat"
+                self._record_research(out, text, reply)
             return prefix + reply
 
     async def has_pending_interrupt(self, user_id: str = "default") -> bool:
@@ -398,6 +444,30 @@ class AgentEngine:
         except Exception:
             logger.debug("could not record the apology on the thread", exc_info=True)
         return apology
+
+    def _record_research(self, out: Dict[str, Any], text: str, reply: str) -> None:
+        """Mirror LLMProvider._record_exchange for pure-chat engine turns.
+
+        The learning loop's shadow/replay pipeline feeds on route="chat"
+        exchanges carrying a context snapshot; without this, enabling the
+        engine starves the study exactly like the pre-237e9c5 ingress bug.
+        Never affects the reply.
+        """
+        recorder = getattr(self.deps.llm, "research_recorder", None)
+        if recorder is None or not reply:
+            return
+        try:
+            system_prompt = build_system_prompt(
+                self.deps.llm.personality, out.get("context_block", ""),
+                bool(self.tool_set.tools))
+            recorder.record_chat(
+                text, reply,
+                model=self.deps.llm.get_name(),
+                context_snapshot={"system_prompt": system_prompt,
+                                  "messages": _snapshot_messages(out.get("messages", []))},
+            )
+        except Exception:
+            logger.debug("research recorder failed for engine turn", exc_info=True)
 
     def _cached_response(self, text: str) -> Optional[str]:
         llm = self.deps.llm

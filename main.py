@@ -37,10 +37,12 @@ Environment Variables:
 """
 
 import argparse
+import logging
 import os
 import sys
+import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -59,6 +61,7 @@ from config import (
     LLMConfig,
     WakeWordConfig,
     IntentCacheConfig,
+    ResearchConfig,
     AgentConfig,
     SarcasmLevel,
     FormalityLevel,
@@ -146,6 +149,13 @@ def create_custom_config(args) -> AssistantConfig:
 
     is_ephemeral = bool(args.chat or args.test)
 
+    # Research substrate (see research/): explicit opt-in, never in ephemeral
+    # modes — those must stay free of any persistence.
+    research_enabled = (
+        os.getenv("FRIDAY_RESEARCH", "").lower() in ("1", "true")
+        and not is_ephemeral
+    )
+
     return AssistantConfig(
         personality=PersonalityConfig(
             name="Jarvis",
@@ -178,6 +188,7 @@ def create_custom_config(args) -> AssistantConfig:
             porcupine_sensitivity=0.5,
         ),
         intent_cache=IntentCacheConfig(enabled=not is_ephemeral),
+        research=ResearchConfig(enabled=research_enabled),
         # FRIDAY_AGENT_ENGINE / FRIDAY_LANGSMITH_TRACING / LANGSMITH_* (see .env.example)
         agent=AgentConfig.from_env(),
         debug_mode=args.debug,
@@ -314,18 +325,93 @@ def run_text_chat(config: AssistantConfig):
     _text_chat_loop(assistant, config)
 
 
-def _attach_listener(assistant: VoiceAssistant, channel) -> None:
+def _attach_listener(assistant: VoiceAssistant, channel, *,
+                     channel_label: str,
+                     mirror: Optional[Callable[[str, str, str], None]] = None) -> None:
     """Wire a messaging channel's inbound messages to the assistant brain.
 
     Works for any channel exposing start(handler) where handler is
     `async (text, sender) -> reply`. Each sender gets their own multi-turn
     session via user_id, so a chat tracks reservations/dialogues independently
-    of the voice path. (Telegram keys by chat ID.)
+    of the voice path. (Telegram keys by chat ID; Voice PE by "voice:<room>".)
+
+    `channel_label` is recorded on the research exchange, so the study can tell
+    a Telegram turn from a puck turn. `mirror(text, reply, sender)` is the
+    cross-channel fan-out hook (speak a Telegram reply aloud, send a Telegram
+    feedback prompt for a voice reply); it runs on a daemon thread after the
+    reply is computed and must never affect the reply itself.
     """
     async def handle(text: str, sender: str) -> Optional[str]:
-        return await assistant.process_input(text, user_id=sender)
+        reply = await assistant.process_input(text, user_id=sender, channel=channel_label)
+        if reply and mirror is not None:
+            def _mirror():
+                try:
+                    mirror(text, reply, sender)
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "Cross-channel mirror failed for %s.", channel_label, exc_info=True)
+            threading.Thread(target=_mirror, daemon=True,
+                             name=f"mirror-{channel_label}").start()
+        return reply
 
     channel.start(handle)
+
+
+def _setup_research(assistant: VoiceAssistant, config: AssistantConfig,
+                    channel=None):
+    """Wire the learn-from-every-conversation substrate (see research/).
+
+    Off unless FRIDAY_RESEARCH=1 (never in ephemeral modes). Attaches the
+    conversation recorder to the assistant and LLM provider, starts the shadow
+    runner, and hooks Telegram feedback buttons when a channel is given.
+    Returns the recorder (or None when disabled).
+    """
+    rc = config.research
+    if not rc.enabled:
+        return None
+    import logging
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    from research.db import ResearchStore
+    from research.recorder import ConversationRecorder
+    from research.shadow import ShadowRunner
+
+    # Give the research tree a log file of its own. Without this its loggers have
+    # no handler in-process, so shadow/recorder failures went nowhere and the
+    # loop could starve invisibly. Scoped to the `research` logger so production
+    # logging is untouched; same directory the launchd nightly job writes to.
+    log_dir = Path(rc.artifacts_dir).expanduser() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    research_logger = logging.getLogger("research")
+    if not any(isinstance(h, RotatingFileHandler) for h in research_logger.handlers):
+        handler = RotatingFileHandler(log_dir / "live.log", maxBytes=2_000_000,
+                                      backupCount=3)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+        research_logger.setLevel(logging.INFO)
+        research_logger.addHandler(handler)
+        research_logger.propagate = False
+
+    store = ResearchStore(rc.db_path)
+    shadow = None
+    if rc.shadow_enabled:
+        shadow = ShadowRunner(
+            store,
+            model_tag=rc.shadow_model,
+            base_url=config.llm.ollama_base_url,
+        )
+        shadow.start()
+    recorder = ConversationRecorder(store, shadow=shadow,
+                                    feedback_buttons=rc.feedback_buttons)
+    assistant.research_recorder = recorder
+    assistant.llm.research_recorder = recorder
+    if channel is not None:
+        channel.on_callback = recorder.handle_callback
+        channel.feedback_provider = recorder.feedback_markup
+    print("  Research substrate: ON (recording to "
+          f"{rc.db_path}, shadow={'on' if shadow else 'off'})")
+    return recorder
 
 
 def _run_headless_channel(config: AssistantConfig, channel, label: str,
@@ -359,7 +445,8 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
     if coffee_workflow is not None and owner:
         coffee_workflow.start_monitor(notify_owner)
 
-    _attach_listener(assistant, channel)
+    _attach_listener(assistant, channel, channel_label="telegram")
+    _setup_research(assistant, config, channel=channel)
 
     name = config.personality.name
     print(f"\n{'='*50}")
@@ -431,13 +518,23 @@ def run_all(config: AssistantConfig, debug: bool = False):
     if coffee_workflow is not None:
         coffee_workflow.start_monitor(assistant.speak)
 
-    # Telegram — automatically on whenever it's configured.
+    # Telegram — automatically on whenever it's configured. Replies are also
+    # spoken aloud on this Mac (duplex mode: type in the chat, hear the answer).
     telegram_channel = TelegramChannel.from_env()
+    owner = next(iter(telegram_channel.allowed_chat_ids), None) if telegram_channel else None
     if telegram_channel is not None:
-        _attach_listener(assistant, telegram_channel)
+        def speak_telegram_reply(text: str, reply: str, sender: str) -> None:
+            assistant.speak(reply)
+
+        _attach_listener(assistant, telegram_channel, channel_label="telegram",
+                         mirror=speak_telegram_reply)
+    _setup_research(assistant, config, channel=telegram_channel)
 
     # Voice PE satellites — automatically on whenever configured. Each room's
-    # puck streams mic audio in; replies come out of this Mac's speakers.
+    # puck streams mic audio in; replies come out of this Mac's speakers, and
+    # every voice exchange is mirrored to Telegram as a feedback prompt so the
+    # learning loop gets 👍/👎 on voice turns too (buttons appear on chat-route
+    # exchanges — the only ones the study learns from).
     voice_pe_channel = VoicePEChannel.from_env()
     if voice_pe_channel is not None:
         voice_pe_channel.bind(
@@ -445,7 +542,20 @@ def run_all(config: AssistantConfig, debug: bool = False):
             speak=assistant.speak,
             has_active=assistant.sessions.has_active if assistant.sessions is not None else None,
         )
-        _attach_listener(assistant, voice_pe_channel)
+
+        def telegram_feedback_prompt(text: str, reply: str, sender: str) -> None:
+            if telegram_channel is None or owner is None:
+                return
+            recorder = assistant.research_recorder
+            markup = recorder.feedback_markup(sender, reply) if recorder is not None else None
+            room = sender.split(":", 1)[-1]
+            prompt = f"🎙 ({room}) You: {text}\n{config.personality.name}: {reply}"
+            if markup is not None:
+                prompt += "\n\nHow did I do?"
+            telegram_channel.send(prompt, owner, reply_markup=markup)
+
+        _attach_listener(assistant, voice_pe_channel, channel_label="voice_pe",
+                         mirror=telegram_feedback_prompt)
 
     # Voice — start in the background; don't grab stdin (the text loop owns it),
     # so a mic-less machine just runs text + Telegram instead of hijacking input.
@@ -579,8 +689,9 @@ def main():
 
         telegram_channel = TelegramChannel.from_env()
         if telegram_channel is not None:
-            _attach_listener(assistant, telegram_channel)
+            _attach_listener(assistant, telegram_channel, channel_label="telegram")
             print("ℹ️  Telegram two-way channel enabled")
+        _setup_research(assistant, config, channel=telegram_channel)
 
         voice_pe_channel = VoicePEChannel.from_env()
         if voice_pe_channel is not None:
@@ -589,7 +700,7 @@ def main():
                 speak=assistant.speak,
                 has_active=assistant.sessions.has_active if assistant.sessions is not None else None,
             )
-            _attach_listener(assistant, voice_pe_channel)
+            _attach_listener(assistant, voice_pe_channel, channel_label="voice_pe")
             names = ", ".join(d.name for d in voice_pe_channel.devices)
             print(f"ℹ️  Voice PE satellites enabled ({names})")
 

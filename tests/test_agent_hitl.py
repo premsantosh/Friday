@@ -131,8 +131,9 @@ async def test_global_escape_cancels_pending_confirmation_via_process_input():
 
 
 @pytest.mark.asyncio
-async def test_pending_answer_takes_priority_over_keyword_match():
-    """'yes please' must answer the question, not fall into Step 1/2/3."""
+async def test_pending_answer_takes_priority_over_routing():
+    """'yes please' must answer the pending confirmation, not be routed as a
+    fresh request (cache/agent/router). KeywordYes proves no workflow runs."""
     class KeywordYes(Workflow):
         def __init__(self):
             self.calls = 0

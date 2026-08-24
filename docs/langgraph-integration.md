@@ -11,13 +11,13 @@ Opt-in orchestration core for Friday: `FRIDAY_AGENT_ENGINE=langgraph`. Default s
 | Confirmations: only inside legacy sessions | `interrupt()`-based confirmations that survive restarts and channel switches; answered by the next turn (deterministic yes/no parsing) |
 | No self-scheduling | `schedule_wakeup` tool + `agent_wakes` table serviced by `BackgroundTaskRunner` |
 
-Unchanged: active legacy sessions (Step 0), keyword match (Step 1), intent cache (Step 2), the reservations workflow (stays a legacy `ConversationalWorkflow`, reachable via the `start_task` handoff tool), the harness (`ActionGate`, egress sinks, audit log).
+Unchanged: active legacy sessions (Step 0), intent cache (Step 1), the reservations workflow (stays a legacy `ConversationalWorkflow`, reachable via the `start_task` handoff tool), the harness (`ActionGate`, egress sinks, audit log).
 
 ## Turn priority (`VoiceAssistant.process_input`)
 
 1. Active legacy session owns the turn (global escape cancels it).
-2. Pending agent confirmation owns the turn (global escape abandons it). This sits before keyword matching on purpose: "yes please" must answer the question, not match a workflow.
-3. Keyword match → 4. intent cache → 5. agent engine → on error, legacy router.
+2. Pending agent confirmation owns the turn (global escape abandons it). This sits before routing on purpose: "yes please" must answer the question, not be routed as a new request.
+3. Intent cache → 4. agent engine → on error, legacy router.
 
 ## Module map (`agent/`)
 
@@ -39,7 +39,7 @@ Unchanged: active legacy sessions (Step 0), keyword match (Step 1), intent cache
 `GateSpec.requires_confirmation(intent, entities)` decides per call; the tool builds the plan dict, calls `interrupt()` with the question, and after a "yes" executes through `ActionGate` (kill switch `FRIDAY_KILL_SWITCH`, approval hash of the exact plan shown, idempotency via the audit log keyed by the tool call id). Everything before `interrupt()` is pure because LangGraph re-runs the tool function on resume. Proving ground: `hass_locks` unlock (`ActionKind.DEVICE_CONTROL`).
 
 Caveats to know about:
-- Keyword matching (Step 1) runs before the engine, so a plainly phrased "unlock the back door" still executes `hass_locks` directly as it always has. The gate protects agent-initiated calls (multi-step chains, paraphrases the keywords miss). Moving the gate in front of Step 1 is a separate decision.
+- The keyword fast-path (old Step 1) was removed after it misrouted real traffic ("Good night my friend" toggled the lights). With the engine ON, a plainly phrased "unlock the back door" now reaches `hass_locks` through the gated agent tool and asks for confirmation — intended hardening. With the engine OFF, the legacy router executes it directly, as before.
 - Only `hass_locks` has a `GateSpec` today; every other workflow is bound ungated, exactly as the legacy router executes it. Add entries to `GATE_SPECS` to gate more.
 - Gated successes are never written to the intent cache (a cache hit would bypass the confirmation).
 - Tool calls run one at a time (`parallel_tool_calls=False`) so an interrupt can't replay a side-effecting sibling.
@@ -49,7 +49,7 @@ Caveats to know about:
 - A run that raises *after* a tool executed is not re-raised (the legacy fallback would re-execute the request): the engine closes any orphaned tool call, records an in-character apology on the thread and returns it. Only failures before any side effect reach `VoiceAssistant`'s legacy fallback.
 - Orphaned `tool_use` blocks (a tool step cancelled by Ctrl+C / channel shutdown) are repaired at the start of the next turn with an `ERROR:` tool result, so the provider never rejects the thread.
 - `schedule_wakeup` is only offered when a `BackgroundTaskRunner` can fire it (not in `--chat`/`--test`). A wake whose thread has a pending confirmation is postponed each tick until the confirmation is answered or lapses.
-- Step 0b (`has_pending_interrupt`) costs one SQLite read per turn before keyword matching; measured well under 10 ms locally.
+- Step 0b (`has_pending_interrupt`) costs one SQLite read per turn before any routing; measured well under 10 ms locally.
 
 ## Event loops and SQLite
 

@@ -64,7 +64,7 @@ Internally holds a `turnstile.ContextRegister(persistence_path=…)`. turnstile 
 ### 3.2 Integration into the assistant pipeline
 
 Two additive calls in `process_input` (full revised pipeline in §6):
-1. **Before routing:** `text = self.context.enrich(raw_text)` — the router/keyword matcher now
+1. **Before routing:** `text = self.context.enrich(raw_text)` — the router now
    sees `"[context: domain=hvac, device=living room] turn it down"`.
 2. **After a successful route:** `self.context.update(route, raw_text)` so the next turn
    inherits this domain/device/action.
@@ -164,7 +164,7 @@ class ConversationalWorkflow(Workflow):
 
 Backward compatible: a `ConversationalWorkflow` still satisfies the `Workflow` ABC. `execute()`
 on the base can default to "call `start()` with a fresh session" so the existing
-keyword/router pipeline can launch it.
+router pipeline can launch it.
 
 ### 4.4 Storage
 
@@ -252,7 +252,8 @@ async def process_input(self, raw_text: str) -> str:
         return result.message
 
     # ----- existing single-turn pipeline, now on enriched `text` -----
-    wf = self.workflows.find_matching_workflow(text)          # keyword/pattern
+    # (historical sketch: the keyword/pattern fast-path shown here was later
+    # removed; routing is intent cache -> agent engine / Claude router)
     ... intent cache ... Claude router ...                    # unchanged
 
     # When the selected workflow is conversational and isn't done in one shot:
@@ -334,8 +335,8 @@ confirmation gate, background wait, async call results).
 
 1. **MT1 — Layer A.** ✅ **Done.** `ConversationContext` (`core/conversation/context.py`) +
    turnstile-ctx pinned in `requirements.txt` + enrich-before-router / update-after-route in
-   `process_input`. Enriched text feeds the LLM router only; keyword/cache matching stays on raw
-   text so an injected context prefix can't trigger false keyword hits.
+   `process_input`. Enriched text feeds the LLM router only; cache matching stays on raw
+   text so an injected context prefix can't trigger false cache hits.
 2. **MT2 — Layer B core.** ✅ **Done.** `Session`/`TurnControl`/`TurnResult` (`session.py`),
    `SessionStore` + `SqliteSessionStore` + `InMemorySessionStore` (`store.py`), `SessionManager`
    (`manager.py`), the `ConversationalWorkflow` ABC (`workflows/base.py`), and the active-session

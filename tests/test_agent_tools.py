@@ -108,8 +108,7 @@ async def test_handoff_then_next_turn_routes_into_the_legacy_session():
     engine = make_engine(workflows=wm, model=model, sessions=sessions)
     a = make_assistant(engine=engine, workflows=wm, sessions=sessions)
 
-    # Phrased so Step 1 keyword matching ("remind") doesn't catch it: the graph
-    # must pick start_task itself.
+    # Free-form phrasing: the graph must pick start_task itself.
     assert await a.process_input("I need a nudge about something") == "What should I remind you about, sir?"
     assert await a.process_input("buy milk") == "And when?"               # Step 0: session owns the turn
     assert await a.process_input("six") == "Remind you to buy milk at six?"

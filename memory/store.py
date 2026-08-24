@@ -88,13 +88,14 @@ class FridayStore:
     
     # --- Conversation history ---
     
-    def log_turn(self, role: str, content: str):
+    def log_turn(self, role: str, content: str) -> int:
         tokens_est = len(content) // 4  # rough estimate
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO conversation_turns (role, content, tokens_estimated) VALUES (?, ?, ?)",
             (role, content, tokens_est)
         )
         self.conn.commit()
+        return int(cur.lastrowid)
     
     def get_recent_turns(self, n: int = 10) -> list[dict]:
         rows = self.conn.execute(

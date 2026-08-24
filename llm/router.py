@@ -1,6 +1,7 @@
 """
 Intent router: uses the configured LLM to classify user input into a workflow
-when keyword matching fails. Returns structured routing + a natural response.
+when the intent cache misses. Classification only — the user-facing reply
+always comes from a workflow or the LLM provider, never from this prompt.
 """
 
 import json
@@ -13,24 +14,25 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are an intent classifier for a smart home voice assistant.
-Determine if the user's request maps to one of the available workflows, extract
-relevant entities, and draft a natural spoken response.
+Determine if the user's request maps to one of the available workflows and
+extract relevant entities.
 
 Respond ONLY with valid JSON, no markdown, no explanation:
 {
   "workflow": "<workflow_name or null>",
-  "entities": {},
-  "response": "<one sentence spoken response>"
+  "entities": {}
 }
 
-Set "workflow" to null when no workflow fits — provide a conversational response."""
+Set "workflow" to null when no workflow fits."""
 
 
 @dataclass
 class RouteResult:
+    """Classification only. The router never drafts the user-facing reply: it
+    has no personality, history, memory or search, so a conversational answer
+    goes through the LLM provider instead."""
     workflow_name: Optional[str]
     entities: dict = field(default_factory=dict)
-    response: str = ""
 
 
 class IntentRouter:
@@ -137,9 +139,8 @@ class IntentRouter:
             return RouteResult(
                 workflow_name=data.get("workflow") or None,
                 entities=data.get("entities") or {},
-                response=data.get("response", ""),
             )
         except (json.JSONDecodeError, AttributeError):
-            # Don't speak raw JSON/text — return empty so caller falls back to LLM
+            # Unparseable classification: fall through to a conversational reply.
             logger.warning("Router returned unparseable response: %s", raw[:200])
-            return RouteResult(workflow_name=None, response="")
+            return RouteResult(workflow_name=None)

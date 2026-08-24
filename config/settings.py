@@ -224,6 +224,24 @@ class ConversationConfig:
 
 
 @dataclass
+class ResearchConfig:
+    """Learn-from-every-conversation research substrate (see research/).
+
+    Everything is off unless `enabled` is True (set via FRIDAY_RESEARCH=1 in
+    main.py, never in ephemeral --chat/--test modes). Production behavior is
+    bit-identical when disabled.
+    """
+    enabled: bool = False
+    db_path: str = "~/.friday/research.db"
+    artifacts_dir: str = "~/.friday/research"
+    feedback_buttons: bool = True   # 👍/👎 inline buttons on Telegram chat replies
+    shadow_enabled: bool = True     # local model answers silently in parallel
+    # Must stay the same family as research/generate.py BASE_MODEL (the study's
+    # trained/evaluated base) or the comparison is confounded.
+    shadow_model: str = "qwen3:8b"
+
+
+@dataclass
 class AgentConfig:
     """LangGraph agent engine (see docs/langgraph-integration.md). Opt-in via
     FRIDAY_AGENT_ENGINE=langgraph; the default keeps the legacy router."""
@@ -269,6 +287,7 @@ class AssistantConfig:
     search: SearchConfig = field(default_factory=SearchConfig)
     intent_cache: IntentCacheConfig = field(default_factory=IntentCacheConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
+    research: ResearchConfig = field(default_factory=ResearchConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
 
     # General settings

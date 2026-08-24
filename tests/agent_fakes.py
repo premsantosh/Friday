@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -162,6 +163,9 @@ class FakeLLM:
         self.generate_calls.append(text)
         return f"legacy: {text}"
 
+    def get_name(self) -> str:
+        return "FakeLLM"
+
     def clear_history(self) -> None:
         self.conversation_history = []
 
@@ -169,8 +173,9 @@ class FakeLLM:
 # ----------------------------------------------------------- workflows
 
 class EchoTimeWorkflow(Workflow):
-    """Simple single-shot workflow; keyword chosen so test phrasings never
-    hit the assistant's Step-1 keyword match by accident."""
+    """Simple single-shot workflow; obscure trigger vocabulary kept from the
+    era of Step-1 keyword matching (now removed) — harmless, and it keeps the
+    tool descriptions distinctive."""
 
     def __init__(self, message: str = "It is noon, sir."):
         self.calls: List[tuple] = []
@@ -306,13 +311,15 @@ class RecordingContext:
 
 
 class StubRouter:
-    def __init__(self, response: str = "router reply"):
+    """Legacy router stand-in. Classification only: RouteResult carries no reply
+    (llm/router.py), so a no-workflow turn falls through to FakeLLM.generate_response."""
+
+    def __init__(self):
         self.calls: List[str] = []
-        self.response = response
 
     def route(self, text, workflow_manager):
         self.calls.append(text)
-        return RouteResult(workflow_name=None, response=f"{self.response}: {text}")
+        return RouteResult(workflow_name=None)
 
 
 # ------------------------------------------------------------ builders
@@ -358,4 +365,10 @@ def make_assistant(*, engine=None, workflows=None, sessions=None, llm=None,
     a.sessions = sessions
     a.background_runner = None
     a.agent_engine = engine
+    # Research substrate hooks (core/assistant.py __init__): off, like production
+    # without FRIDAY_RESEARCH=1.
+    a.research_recorder = None
+    a.last_route = None
+    a.last_outcome = None
+    a._turn_lock = threading.Lock()
     return a

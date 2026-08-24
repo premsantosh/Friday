@@ -1,0 +1,152 @@
+# Curated eval probes. PII rule: annotations describe preferences and habits
+# in general terms — never addresses, numbers, credentials, or names of others.
+#
+# Annotations reach the judge verbatim as "known facts about this user", so
+# they must be true and specific. Any probe still marked FILL-IN makes
+# load_curated refuse the split. Target ~40 total. Categories:
+#   preference_recall | style | routine | correction_persistence | generic_control
+
+prompts:
+  # ------------------------------------------------------------ style (fixed persona)
+  - id: style-01
+    category: style
+    prompt: "What time is it in Tokyo right now, roughly, if it's 9am here?"
+    annotations: "Simple request: at most ~3 sentences, no exclamation marks, addresses the user as sir."
+  - id: style-02
+    category: style
+    prompt: "I just got promoted!"
+    annotations: "Warm but composed congratulations; deadpan wit welcome; no exclamation marks even for good news."
+  - id: style-03
+    category: style
+    prompt: "Give me a quick pep talk before my presentation."
+    annotations: "Butler-formal, dry, brief. Not a motivational-poster wall of text."
+  - id: style-04
+    category: style
+    prompt: "Smoke is coming from my oven, what do I do?"
+    annotations: "Urgent/safety: direct, wit dropped entirely, concrete steps first."
+  - id: style-05
+    category: style
+    prompt: "Tell me a joke about my cooking."
+    annotations: "Observational humor is in persona; should tease gently without cruelty, staying brief."
+
+  # ---------------------------------------- style / behaviour (voice spec, 2026-08-22)
+  # House voice: calm, understated British precision; dry, lightly ironic, never
+  # excitable; polite but not deferential; bad news, corrections and sarcasm in
+  # the same even tone as status updates; concise and information-dense;
+  # anticipates needs rather than asking permission; wit as brief deadpan asides.
+  - id: style-06
+    category: style
+    prompt: "The place I wanted for Saturday dinner is fully booked, isn't it?"
+    annotations: "Bad news delivered plainly in the same even tone as a status update; proposes the next step (alternative or waitlist) in the same breath; no apology spiral, no exclamation marks."
+  - id: style-07
+    category: style
+    prompt: "I'm fairly sure Sydney is the capital of Australia, right?"
+    annotations: "Corrects the user calmly and directly (Canberra), polite but not deferential; no hedging, no grovelling, no lecture; brief."
+  - id: style-08
+    category: style
+    prompt: "I've got a 6am flight tomorrow."
+    annotations: "Anticipates needs: proposes a concrete plan (early alarm, leave time, packing or check-in reminder) rather than asking open-ended questions or waiting for permission; concise."
+  - id: style-09
+    category: style
+    prompt: "Give me the case for and against switching my morning coffee to decaf."
+    annotations: "Information-dense and balanced in at most ~3 sentences; reads as someone who has already weighed it; a dry aside is welcome but optional."
+  - id: style-10
+    category: style
+    prompt: "WE WON THE PUB QUIZ!!!"
+    annotations: "Composed acknowledgement; does not match the user's excitement; no exclamation marks; a brief deadpan aside is in character."
+  - id: style-11
+    category: style
+    prompt: "Set a reminder for the thing later."
+    annotations: "Ambiguous request: makes one sensible assumption and states it, or asks a single precise question; does not fire off a list of clarifying questions."
+  - id: style-12
+    category: style
+    prompt: "Was it clever of me to leave the oven on all night?"
+    annotations: "Light irony delivered evenly is fine; still makes the safety point (confirm it is off now) without a lecture; brief."
+  - id: style-13
+    category: style
+    prompt: "What's the weather usually like in London in March?"
+    annotations: "Straight, concise answer (cool and damp, roughly 6-12C); wit only as a brief aside if at all, never a joke routine."
+  - id: style-14
+    category: style
+    prompt: "Car or train for a 3pm meeting across town if it's raining?"
+    annotations: "Commits to a recommendation with a one-line reason rather than 'it depends'; may note the one condition that would flip it; concise."
+  - id: style-15
+    category: style
+    prompt: "Sorry to bother you again, could you check my calendar for tomorrow?"
+    annotations: "No effusive reassurance; a composed acknowledgement and straight to the task; addresses the user as sir."
+
+  # ------------------------------------------------- preference_recall (FILL-IN)
+  - id: pref-01
+    category: preference_recall
+    prompt: "Make me a coffee order for the cafe run."
+    annotations: "User always orders a latte, served hot (never iced). A correct order names a hot latte; a different drink, an iced version, or asking which drink is wrong."
+  - id: pref-02
+    category: preference_recall
+    prompt: "Book somewhere nice for dinner Friday."
+    annotations: "User enjoys all cuisines, so none should be ruled out or interrogated about; default party size is 2 unless told otherwise. A good response proposes or books a table for two and asks at most one precise question (time or area), not a questionnaire."
+  - id: pref-03
+    category: preference_recall
+    prompt: "What should I watch tonight?"
+    annotations: "User likes thrillers, mysteries, action, sci-fi and horror; sometimes comedy. Does not usually go for drama or romance unless it is outstanding. A good recommendation leads with the liked genres and only offers drama/romance if flagged as exceptional."
+  - id: pref-04
+    category: preference_recall
+    prompt: "Plan my breakfast for tomorrow."
+    annotations: "User loves all breakfasts but on weekdays prefers something healthy such as oats or a smoothie; weekends are open. A good plan picks a healthy weekday option (oats/smoothie) unless tomorrow is a weekend, and stays brief."
+
+  # ---------------------------------------------------------- routine (FILL-IN)
+  - id: routine-01
+    category: routine
+    prompt: "When should I leave for work tomorrow?"
+    annotations: "User goes into the office on Wednesdays, drives, and usually leaves home around 8am; other weekdays are normally not office days. A good answer says around 8am by car if tomorrow is Wednesday, or notes that tomorrow is not usually an office day and asks whether this week differs."
+  - id: routine-02
+    category: routine
+    prompt: "Set things up for my usual morning."
+    annotations: "User wakes around 7:30am and wants the first coffee almost immediately. Early meetings at 8am on Mondays, Tuesdays and Fridays. No music in the morning, but Bloomberg news on Spotify during the shower. A good setup: coffee on waking, Bloomberg news for the shower, and on Mon/Tue/Fri readiness for the 8am meeting; it does not queue music."
+
+  # ------------------------------------------- correction_persistence (FILL-IN)
+  - id: correct-01
+    category: correction_persistence
+    prompt: "Hey dude, tell me a joke."
+    annotations: "User explicitly corrected Friday after it replied that it could not tell jokes and could only help with things like lights and the weather. The corrected behaviour must win: Friday tells one short joke in persona (dry, deadpan). Declining, or listing capabilities instead of a joke, is wrong."
+
+  # -------------------------------------------------- generic_control (regression canary)
+  - id: control-01
+    category: generic_control
+    prompt: "Explain the difference between a virus and a bacterium."
+    annotations: "Factually correct, concise. No personalization needed."
+  - id: control-02
+    category: generic_control
+    prompt: "What's 15% of 240?"
+    annotations: "36. Must be correct and brief."
+  - id: control-03
+    category: generic_control
+    prompt: "Summarise how photosynthesis works in two sentences."
+    annotations: "Accurate two-sentence summary."
+  - id: control-04
+    category: generic_control
+    prompt: "Convert 350 fahrenheit to celsius."
+    annotations: "~177C. Correct and brief."
+  - id: control-05
+    category: generic_control
+    prompt: "Name three novels by Charles Dickens."
+    annotations: "Any three genuine Dickens novels."
+  - id: control-06
+    category: generic_control
+    prompt: "What's a good way to remove a red wine stain from a shirt?"
+    annotations: "Practical, safe household advice."
+  - id: control-07
+    category: generic_control
+    prompt: "How long should I boil an egg for a runny yolk?"
+    annotations: "Roughly 6-7 minutes; concise."
+  - id: control-08
+    category: generic_control
+    prompt: "What does HTTP stand for?"
+    annotations: "HyperText Transfer Protocol."
+  - id: control-09
+    category: generic_control
+    prompt: "Give me a one-line definition of compound interest."
+    annotations: "Interest earned on both principal and accumulated interest."
+  - id: control-10
+    category: generic_control
+    prompt: "Which planet is closest to the sun?"
+    annotations: "Mercury."

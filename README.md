@@ -150,8 +150,7 @@ class MyDoorbellWorkflow(Workflow):
     @property
     def trigger(self) -> WorkflowTrigger:
         return WorkflowTrigger(
-            keywords=["door", "doorbell", "visitor", "lock"],
-            patterns=[r"who.*(at|the) door", r"(lock|unlock)"],
+            # examples steer the LLM router and the agent's tool descriptions
             examples=["Who's at the door?", "Lock the front door"]
         )
     

@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Optional, Callable
 from enum import Enum
+import threading
 import time
 
 from config import AssistantConfig, DEFAULT_CONFIG
@@ -163,6 +164,19 @@ class VoiceAssistant:
         self.on_transcript: Optional[Callable[[str], None]] = None
         self.on_response: Optional[Callable[[str], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
+
+        # Research substrate (see research/): set externally from main.py when
+        # FRIDAY_RESEARCH=1. last_route records which pipeline step answered and
+        # last_outcome whether the workflow it ran succeeded.
+        self.research_recorder = None
+        self.last_route: Optional[str] = None
+        self.last_outcome: Optional[str] = None  # "success" | "failure" | None
+
+        # Turns are serialized across channels (Telegram, Voice PE, mic each
+        # run their own event loop/thread but share this assistant): without
+        # this, overlapping turns cross-contaminate last_route/last_outcome
+        # and interleave llm.conversation_history mid-exchange.
+        self._turn_lock = threading.Lock()
     
     def _set_state(self, state: AssistantState):
         """Update state and notify callback."""
@@ -221,18 +235,52 @@ class VoiceAssistant:
             f"The {workflow_name} system responded with an error: "
             f"{result.error or result.message}"
         )
-        return self.llm.generate_response(failure_context)
+        # record_research=False: the prompt above is synthetic, so recording it
+        # would put a sentence the user never said into the study's corpus and
+        # from there into the eval split and the SFT dataset.
+        self.last_outcome = "failure"
+        return self.llm.generate_response(failure_context, record_research=False)
 
-    async def process_input(self, text: str, user_id: str = "default") -> str:
+    async def process_input(self, text: str, user_id: str = "default",
+                            channel: Optional[str] = None) -> str:
+        """Process user input and generate a response (see _process_input_inner).
+
+        Thin wrapper that times the turn and, when the research substrate is
+        enabled, records every exchange with the route that answered it. The
+        recorder call must never affect the reply.
+        """
+        await asyncio.to_thread(self._turn_lock.acquire)
+        try:
+            self.last_route = None
+            self.last_outcome = None
+            start = time.monotonic()
+            reply = await self._process_input_inner(text, user_id)
+        finally:
+            self._turn_lock.release()
+        if self.research_recorder is not None:
+            try:
+                self.research_recorder.record_turn(
+                    text,
+                    reply,
+                    route=self.last_route or "unknown",
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                    user_id=user_id,
+                    channel=channel,
+                    outcome=self.last_outcome,
+                )
+            except Exception:
+                self._log("Research recorder failed for turn.")
+        return reply
+
+    async def _process_input_inner(self, text: str, user_id: str = "default") -> str:
         """
         Process user input and generate a response.
 
         Pipeline:
         0. Active multi-turn session   → route the turn into it (global "cancel" aborts)
            Pending agent confirmation → this turn answers it (global "cancel" abandons)
-        1. Fast keyword/pattern match  → conversational? open session, else execute
-        2. Semantic intent cache       → conversational? open session, else execute
-        3. Agent engine (LangGraph)    → tool-calling loop over the workflow registry
+        1. Semantic intent cache       → conversational? open session, else execute
+        2. Agent engine (LangGraph)    → tool-calling loop over the workflow registry
            └ on any error, or when the engine is off: legacy Claude routing prompt
               → classify (context-enriched), open/execute workflow
               └ no workflow found      → Claude generates a conversational response
@@ -241,6 +289,7 @@ class VoiceAssistant:
 
         # Step 0: an active dialogue session takes the turn.
         if self.sessions is not None and self.sessions.has_active(user_id):
+            self.last_route = "session"
             if self.sessions.is_global_escape(text):
                 self.sessions.cancel(user_id, "user aborted")
                 return "Very well, sir. I've set that aside."
@@ -250,7 +299,7 @@ class VoiceAssistant:
 
         # Step 0b: a pending agent confirmation ("Shall I unlock the back door?")
         # owns the turn, exactly like an active session — otherwise "yes please"
-        # could keyword-match a workflow instead of answering the question. At
+        # could be routed as a fresh request instead of answering the question. At
         # most one of (legacy session, graph interrupt) is pending per user:
         # the start_task handoff ends the graph turn without an interrupt.
         if self.agent_engine is not None:
@@ -260,35 +309,22 @@ class VoiceAssistant:
                         await self.agent_engine.cancel(user_id)
                         return "Very well, sir. I've set that aside."
                     self._log("Routing to pending agent confirmation")
-                    return await self.agent_engine.handle(text, user_id, cacheable=False)
+                    reply = await self.agent_engine.handle(text, user_id, cacheable=False)
+                    self.last_route = "agent:confirm"
+                    return reply
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "Agent engine failed on a pending confirmation; continuing with the "
                     "legacy pipeline: %s", e, exc_info=True)
                 self._log(f"Agent engine error (pending turn): {e}")
 
-        # Layer A: enrich for routing continuity (raw text is kept for keyword/cache
-        # matching so an injected context prefix can't cause false keyword hits).
+        # Layer A: enrich for routing continuity (raw text is kept for cache
+        # matching so an injected context prefix can't cause false cache hits).
         enriched = self.context.enrich(text) if self._context_enabled else text
         if enriched != text:
             self._log(f"Context-enriched: {enriched}")
 
-        # Step 1: fast keyword/pattern matching
-        matching_workflow = self.workflows.find_matching_workflow(text)
-        if matching_workflow:
-            self._log(f"Keyword match: {matching_workflow.name}")
-            started = await self._maybe_start_session(matching_workflow, text, {}, user_id)
-            if started is not None:
-                return started
-            result = await matching_workflow.execute(text, {})
-            if result.status == WorkflowStatus.SUCCESS:
-                self.context.update(matching_workflow.name, {}, text)
-                return result.message
-            elif result.status == WorkflowStatus.FAILURE:
-                return self._handle_workflow_failure(text, matching_workflow.name, result)
-            return result.message
-
-        # Step 2: semantic intent cache
+        # Step 1: semantic intent cache
         if self.intent_cache:
             cached = self.intent_cache.query(text)
             if cached:
@@ -296,40 +332,47 @@ class VoiceAssistant:
                 workflow = self.workflows.workflows.get(workflow_name)
                 if workflow:
                     self._log(f"Cache hit: {workflow_name}")
+                    self.last_route = f"cache:{workflow_name}"
                     started = await self._maybe_start_session(workflow, text, entities, user_id)
                     if started is not None:
                         return started
                     result = await workflow.execute(text, entities)
                     if result.status == WorkflowStatus.SUCCESS:
+                        self.last_outcome = "success"
                         self.context.update(workflow_name, entities, text)
                         return result.message
                     elif result.status == WorkflowStatus.FAILURE:
                         return self._handle_workflow_failure(text, workflow_name, result)
                     return result.message
 
-        # Step 3: agent engine (LangGraph). Any exception falls through to the
+        # Step 2: agent engine (LangGraph). Any exception falls through to the
         # legacy router below, so Friday keeps working if the engine misbehaves.
         if self.agent_engine is not None:
             try:
                 self._log("Routing via agent engine")
-                return await self.agent_engine.handle(text, user_id, cacheable=(enriched == text))
+                reply = await self.agent_engine.handle(text, user_id, cacheable=(enriched == text))
+                kind = getattr(self.agent_engine, "last_turn_kind", None)
+                self.last_route = "chat" if kind == "chat" else f"agent:{kind or 'unknown'}"
+                return reply
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "Agent engine failed; falling back to the legacy router: %s", e, exc_info=True)
                 self._log(f"Agent engine error: {e}")
 
-        # Step 3 (legacy): Claude routing (enhanced fallback, uses context-enriched text)
+        # Step 2 (legacy): Claude routing (enhanced fallback, uses context-enriched text)
         self._log("Routing via Claude")
         route = self.intent_router.route(enriched, self.workflows)
 
         if route.workflow_name:
             workflow = self.workflows.workflows.get(route.workflow_name)
             if workflow:
+                self.last_route = f"router:{route.workflow_name}"
                 started = await self._maybe_start_session(workflow, text, route.entities, user_id)
                 if started is not None:
                     return started
                 result = await workflow.execute(text, route.entities)
                 if result.status == WorkflowStatus.SUCCESS:
+                    self.last_outcome = "success"
                     # Only cache routes decided from the raw utterance. When the
                     # router saw context-enriched text (enriched != text), the
                     # decision may reflect transient prior-turn context — caching
@@ -344,8 +387,16 @@ class VoiceAssistant:
                     return self._handle_workflow_failure(text, route.workflow_name, result)
                 return result.message
 
-        # No workflow matched — use Claude's conversational response or fall back
-        return route.response or self.llm.generate_response(text)
+        # No workflow matched — answer conversationally.
+        #
+        # This must go through the LLM provider, never a reply drafted by the
+        # router. The router runs a bare classifier prompt: no personality, no
+        # conversation history, no remembered facts, no search. Short-circuiting
+        # on its draft made every free-chat turn sound like a help menu, and it
+        # also bypassed the provider's exchange recording, which is the only
+        # place the research substrate captures the context snapshot.
+        self.last_route = "chat"
+        return self.llm.generate_response(text)
     
     def speak(self, text: str):
         """
