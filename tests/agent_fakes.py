@@ -163,6 +163,9 @@ class FakeLLM:
         self.generate_calls.append(text)
         return f"legacy: {text}"
 
+    def get_name(self) -> str:
+        return "FakeLLM"
+
     def clear_history(self) -> None:
         self.conversation_history = []
 

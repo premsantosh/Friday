@@ -309,7 +309,9 @@ class VoiceAssistant:
                         await self.agent_engine.cancel(user_id)
                         return "Very well, sir. I've set that aside."
                     self._log("Routing to pending agent confirmation")
-                    return await self.agent_engine.handle(text, user_id, cacheable=False)
+                    reply = await self.agent_engine.handle(text, user_id, cacheable=False)
+                    self.last_route = "agent:confirm"
+                    return reply
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "Agent engine failed on a pending confirmation; continuing with the "
@@ -348,7 +350,10 @@ class VoiceAssistant:
         if self.agent_engine is not None:
             try:
                 self._log("Routing via agent engine")
-                return await self.agent_engine.handle(text, user_id, cacheable=(enriched == text))
+                reply = await self.agent_engine.handle(text, user_id, cacheable=(enriched == text))
+                kind = getattr(self.agent_engine, "last_turn_kind", None)
+                self.last_route = "chat" if kind == "chat" else f"agent:{kind or 'unknown'}"
+                return reply
             except Exception as e:
                 logging.getLogger(__name__).warning(
                     "Agent engine failed; falling back to the legacy router: %s", e, exc_info=True)

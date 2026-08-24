@@ -12,6 +12,7 @@ from agent.store import SqliteAgentStore
 from config import AgentConfig, AssistantConfig
 from tests.agent_fakes import (
     EchoTimeWorkflow,
+    make_workflow_manager,
     FakeLLM,
     ScriptedChatModel,
     make_assistant,
@@ -366,3 +367,55 @@ def test_clear_history_resets_engine_thread():
     before = engine.thread_id("default")
     a.clear_history()
     assert engine.thread_id("default") != before
+
+
+# ------------------------------------------------- research recording (learning loop)
+
+class RecordingRecorder:
+    def __init__(self):
+        self.chats = []
+
+    def record_chat(self, user_text, reply_text, *, model=None,
+                    context_snapshot=None, memory_turn_id=None):
+        self.chats.append((user_text, reply_text, model, context_snapshot))
+        return len(self.chats)
+
+
+@pytest.mark.asyncio
+async def test_chat_turn_records_a_research_exchange_with_snapshot():
+    """Pure-chat engine turns must feed the learning loop exactly like the
+    legacy provider: route "chat" plus a context snapshot for shadow/replay.
+    Without this, FRIDAY_AGENT_ENGINE=langgraph starves the study the same
+    way the pre-237e9c5 ingress bug did."""
+    llm = FakeLLM()
+    llm.research_recorder = RecordingRecorder()
+    model = ScriptedChatModel().push(AIMessage(content="Good evening, sir."))
+    engine = make_engine(model=model, llm=llm)
+    a = make_assistant(engine=engine, llm=llm)
+    assert await a.process_input("good evening") == "Good evening, sir."
+    assert engine.last_turn_kind == "chat"
+    assert a.last_route == "chat"
+    ((text, reply, _model, snap),) = llm.research_recorder.chats
+    assert (text, reply) == ("good evening", "Good evening, sir.")
+    assert "Jarvis" in snap["system_prompt"]
+    assert snap["messages"][-1] == {"role": "user", "content": "good evening"}
+    assert all(m["role"] in ("user", "assistant") for m in snap["messages"])
+
+
+@pytest.mark.asyncio
+async def test_tool_turn_is_not_recorded_as_chat():
+    """Tool-using turns have no replayable chat snapshot; they must be routed
+    as agent:tools and stay out of the study's chat corpus."""
+    llm = FakeLLM()
+    llm.research_recorder = RecordingRecorder()
+    wf = EchoTimeWorkflow()
+    model = ScriptedChatModel().push(
+        tool_call("time_check"), AIMessage(content="It is noon, sir."))
+    engine = make_engine(workflows=[wf], model=model, llm=llm)
+    a = make_assistant(engine=engine, llm=llm,
+                       workflows=make_workflow_manager(wf))
+    reply = await a.process_input("what does the chronometer say")
+    assert reply
+    assert engine.last_turn_kind == "tools"
+    assert a.last_route == "agent:tools"
+    assert llm.research_recorder.chats == []
