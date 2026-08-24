@@ -15,6 +15,8 @@ internally synthesized prompts stay out of the study's corpus.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from core.assistant import VoiceAssistant
@@ -70,6 +72,7 @@ def _assistant(llm, router, workflows=None) -> VoiceAssistant:
     a.research_recorder = None
     a.last_route = None
     a.last_outcome = None
+    a._turn_lock = threading.Lock()
     a.config = type("C", (), {"debug_mode": False})()
     return a
 

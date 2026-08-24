@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Optional, Callable
 from enum import Enum
+import threading
 import time
 
 from config import AssistantConfig, DEFAULT_CONFIG
@@ -170,6 +171,12 @@ class VoiceAssistant:
         self.research_recorder = None
         self.last_route: Optional[str] = None
         self.last_outcome: Optional[str] = None  # "success" | "failure" | None
+
+        # Turns are serialized across channels (Telegram, Voice PE, mic each
+        # run their own event loop/thread but share this assistant): without
+        # this, overlapping turns cross-contaminate last_route/last_outcome
+        # and interleave llm.conversation_history mid-exchange.
+        self._turn_lock = threading.Lock()
     
     def _set_state(self, state: AssistantState):
         """Update state and notify callback."""
@@ -242,10 +249,14 @@ class VoiceAssistant:
         enabled, records every exchange with the route that answered it. The
         recorder call must never affect the reply.
         """
-        self.last_route = None
-        self.last_outcome = None
-        start = time.monotonic()
-        reply = await self._process_input_inner(text, user_id)
+        await asyncio.to_thread(self._turn_lock.acquire)
+        try:
+            self.last_route = None
+            self.last_outcome = None
+            start = time.monotonic()
+            reply = await self._process_input_inner(text, user_id)
+        finally:
+            self._turn_lock.release()
         if self.research_recorder is not None:
             try:
                 self.research_recorder.record_turn(

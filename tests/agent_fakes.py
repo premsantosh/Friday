@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -366,4 +367,5 @@ def make_assistant(*, engine=None, workflows=None, sessions=None, llm=None,
     a.research_recorder = None
     a.last_route = None
     a.last_outcome = None
+    a._turn_lock = threading.Lock()
     return a
