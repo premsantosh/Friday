@@ -393,6 +393,18 @@ def _setup_research(assistant: VoiceAssistant, config: AssistantConfig,
         research_logger.addHandler(handler)
         research_logger.propagate = False
 
+    # Voice PE runs are invisible without this: the channel logs connects,
+    # wake-word enforcement, heard utterances and pipeline errors at INFO,
+    # and no root handler exists in headless mode.
+    vpe_logger = logging.getLogger("core.voice_pe_channel")
+    if not any(isinstance(h, RotatingFileHandler) for h in vpe_logger.handlers):
+        vh = RotatingFileHandler(log_dir / "voice_pe.log", maxBytes=2_000_000,
+                                 backupCount=3)
+        vh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        vpe_logger.addHandler(vh)
+        vpe_logger.propagate = False
+    vpe_logger.setLevel(logging.INFO)
+
     store = ResearchStore(rc.db_path)
     shadow = None
     if rc.shadow_enabled:
