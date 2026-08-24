@@ -268,9 +268,8 @@ class VoiceAssistant:
         Pipeline:
         0. Active multi-turn session   → route the turn into it (global "cancel" aborts)
            Pending agent confirmation → this turn answers it (global "cancel" abandons)
-        1. Fast keyword/pattern match  → conversational? open session, else execute
-        2. Semantic intent cache       → conversational? open session, else execute
-        3. Agent engine (LangGraph)    → tool-calling loop over the workflow registry
+        1. Semantic intent cache       → conversational? open session, else execute
+        2. Agent engine (LangGraph)    → tool-calling loop over the workflow registry
            └ on any error, or when the engine is off: legacy Claude routing prompt
               → classify (context-enriched), open/execute workflow
               └ no workflow found      → Claude generates a conversational response
@@ -289,7 +288,7 @@ class VoiceAssistant:
 
         # Step 0b: a pending agent confirmation ("Shall I unlock the back door?")
         # owns the turn, exactly like an active session — otherwise "yes please"
-        # could keyword-match a workflow instead of answering the question. At
+        # could be routed as a fresh request instead of answering the question. At
         # most one of (legacy session, graph interrupt) is pending per user:
         # the start_task handoff ends the graph turn without an interrupt.
         if self.agent_engine is not None:
@@ -306,30 +305,13 @@ class VoiceAssistant:
                     "legacy pipeline: %s", e, exc_info=True)
                 self._log(f"Agent engine error (pending turn): {e}")
 
-        # Layer A: enrich for routing continuity (raw text is kept for keyword/cache
-        # matching so an injected context prefix can't cause false keyword hits).
+        # Layer A: enrich for routing continuity (raw text is kept for cache
+        # matching so an injected context prefix can't cause false cache hits).
         enriched = self.context.enrich(text) if self._context_enabled else text
         if enriched != text:
             self._log(f"Context-enriched: {enriched}")
 
-        # Step 1: fast keyword/pattern matching
-        matching_workflow = self.workflows.find_matching_workflow(text)
-        if matching_workflow:
-            self._log(f"Keyword match: {matching_workflow.name}")
-            self.last_route = f"keyword:{matching_workflow.name}"
-            started = await self._maybe_start_session(matching_workflow, text, {}, user_id)
-            if started is not None:
-                return started
-            result = await matching_workflow.execute(text, {})
-            if result.status == WorkflowStatus.SUCCESS:
-                self.last_outcome = "success"
-                self.context.update(matching_workflow.name, {}, text)
-                return result.message
-            elif result.status == WorkflowStatus.FAILURE:
-                return self._handle_workflow_failure(text, matching_workflow.name, result)
-            return result.message
-
-        # Step 2: semantic intent cache
+        # Step 1: semantic intent cache
         if self.intent_cache:
             cached = self.intent_cache.query(text)
             if cached:
@@ -350,7 +332,7 @@ class VoiceAssistant:
                         return self._handle_workflow_failure(text, workflow_name, result)
                     return result.message
 
-        # Step 3: agent engine (LangGraph). Any exception falls through to the
+        # Step 2: agent engine (LangGraph). Any exception falls through to the
         # legacy router below, so Friday keeps working if the engine misbehaves.
         if self.agent_engine is not None:
             try:
@@ -361,7 +343,7 @@ class VoiceAssistant:
                     "Agent engine failed; falling back to the legacy router: %s", e, exc_info=True)
                 self._log(f"Agent engine error: {e}")
 
-        # Step 3 (legacy): Claude routing (enhanced fallback, uses context-enriched text)
+        # Step 2 (legacy): Claude routing (enhanced fallback, uses context-enriched text)
         self._log("Routing via Claude")
         route = self.intent_router.route(enriched, self.workflows)
 

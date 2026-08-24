@@ -41,7 +41,7 @@ def test_selection_partitions_by_feedback_and_age(store):
     store.add_feedback(disliked, kind="explicit", signal=-1, source="telegram_button")
     _chat(store, "old neutral message", "fine reply")                # included
     fresh = _chat(store, "fresh neutral message", "reply", ts=NOW)   # deferred
-    store.record_exchange("lights on", "Done.", route="keyword:hue", ts=OLD)  # not chat
+    store.record_exchange("lights on", "Done.", route="router:hue", ts=OLD)  # not chat
 
     sel = lora_pipeline.select_personal_examples(store, now=NOW)
     included_users = [ex["messages"][1]["content"] for ex in sel["included"]]

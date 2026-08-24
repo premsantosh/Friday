@@ -1,6 +1,7 @@
 """
 Intent router: uses the configured LLM to classify user input into a workflow
-when keyword matching fails. Returns structured routing + a natural response.
+when the intent cache misses. Classification only — the user-facing reply
+always comes from a workflow or the LLM provider, never from this prompt.
 """
 
 import json

@@ -1,0 +1,5 @@
+date,run_id,arm,opponent,artifact_version,judge,split,n_prompts,n_decisive,wins,losses,win_rate,p_value,n_control,control_win_rate,arm_style,opponent_style
+20260823,4,facts,base,,sonnet:claude-sonnet-5,replay,4,2,1,1,0.500,1.0000,0,,1.000,1.000
+20260823,4,memory,base,v20260823,sonnet:claude-sonnet-5,replay,4,3,1,2,0.375,1.0000,0,,1.000,1.000
+20260823,4,facts,base,,sonnet:claude-sonnet-5,curated,32,2,0,2,0.477,0.5000,10,0.500,1.000,1.000
+20260823,4,memory,base,v20260823,sonnet:claude-sonnet-5,curated,32,13,4,9,0.438,0.2668,10,0.375,0.969,1.000

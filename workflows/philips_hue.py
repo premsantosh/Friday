@@ -300,9 +300,9 @@ class PhilipsHueLightsWorkflow(Workflow):
             ],
         )
 
-    # A state QUESTION must never mutate. The fast keyword router executes
-    # workflows with empty entities, so without this guard "check if the
-    # lights are on" fell through to the default toggle and flipped every
+    # A state QUESTION must never mutate. The router or agent can call this
+    # workflow without an "action" entity, and the default action is toggle —
+    # without this guard "check if the lights are on" once flipped every
     # light in the house.
     _STATE_QUERY_RE = re.compile(
         r"(^\s*(are|is|which|what|how many)\b)"

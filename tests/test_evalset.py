@@ -76,7 +76,7 @@ def test_harvested_prompts_are_labelled_harvested(tmp_path):
     try:
         store.record_exchange("what's for dinner", "Chicken, sir.", route="chat",
                               ts=100.0)
-        store.record_exchange("lights on", "Done, sir.", route="keyword:hue",
+        store.record_exchange("lights on", "Done, sir.", route="router:hue",
                               ts=200.0)
 
         prompts = load_harvested(store, after_ts=0.0)

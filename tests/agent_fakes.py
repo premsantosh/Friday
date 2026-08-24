@@ -169,8 +169,9 @@ class FakeLLM:
 # ----------------------------------------------------------- workflows
 
 class EchoTimeWorkflow(Workflow):
-    """Simple single-shot workflow; keyword chosen so test phrasings never
-    hit the assistant's Step-1 keyword match by accident."""
+    """Simple single-shot workflow; obscure trigger vocabulary kept from the
+    era of Step-1 keyword matching (now removed) — harmless, and it keeps the
+    tool descriptions distinctive."""
 
     def __init__(self, message: str = "It is noon, sir."):
         self.calls: List[tuple] = []

@@ -357,10 +357,10 @@ class ReservationWorkflow(ConversationalWorkflow):
 
     @property
     def trigger(self) -> WorkflowTrigger:
-        # The vocabulary is shared with _APPOINTMENT_RE, so a word that makes
-        # this an appointment also gets the workflow invoked in the first place.
-        # Generalising the workflow without generalising its front door just
-        # means the router answers conversationally and never calls it.
+        # Keywords/patterns are vestigial (the keyword fast-path was removed;
+        # the LLM router / agent tools invoke this workflow). The vocabulary
+        # below still mirrors _APPOINTMENT_RE as documentation of what counts
+        # as an appointment here.
         verbs = r"(?:book|reserve|schedule|arrange|set up|get|make)"
         return WorkflowTrigger(
             keywords=[

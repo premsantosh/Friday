@@ -154,8 +154,8 @@ infrastructure of its own.
 
 **`ReservationWorkflow`** (`workflows/reservations/workflow.py`) — a **`ConversationalWorkflow`**
 (from the multi-turn framework)
-- Trigger: keywords (`reserve`, `reservation`, `book a table`, `make a booking`), patterns,
-  examples — same `WorkflowTrigger` mechanism as other workflows.
+- Trigger: `WorkflowTrigger.examples` steer the LLM router and the agent's tool
+  descriptions (the keyword/pattern fast-path was removed; routing is LLM-only).
 - `start(intent, entities, session)`: extracts initial slots from the utterance into
   `session.slots`, kicks off discovery, returns the first `TurnResult`.
 - `resume(text, session)`: drives the §6 state machine — slot-filling, then the confirmation

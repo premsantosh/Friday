@@ -1,12 +1,12 @@
 """
 LangGraph agent engine for Friday (opt-in via FRIDAY_AGENT_ENGINE=langgraph).
 
-Replaces the one-shot intent classifier (Step 3 of VoiceAssistant.process_input)
+Replaces the one-shot intent classifier (Step 2 of VoiceAssistant.process_input)
 with a checkpointed tool-calling loop: durable per-user chat history, native
 tool calling over the existing workflow registry, human-in-the-loop
 confirmations that survive restarts, and self-scheduled wake-ups. Everything in
-front of Step 3 (active sessions, keyword match, intent cache) and the
-reservations workflow stay on the legacy path.
+front of Step 2 (active sessions, intent cache) and the reservations
+workflow stay on the legacy path.
 
 Imports are guarded (same idiom as aioesphomeapi / playwright elsewhere): Friday
 boots and runs on the legacy router when langgraph isn't installed.

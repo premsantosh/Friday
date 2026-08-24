@@ -46,14 +46,21 @@ class WorkflowResult:
 
 @dataclass
 class WorkflowTrigger:
-    """Defines how a workflow is triggered."""
-    # Keywords that suggest this workflow
+    """Metadata describing when a workflow applies.
+
+    Routing is LLM-only: the legacy router prompt and the agent engine's tool
+    descriptions read `examples`. The old substring keyword/pattern fast-path
+    was removed after it misrouted real traffic ("Good night my friend"
+    toggled every light), so `keywords` and `patterns` are vestigial and kept
+    only as documentation of a workflow's vocabulary.
+    """
+    # Vestigial: not used for routing.
     keywords: List[str] = field(default_factory=list)
-    
-    # Regex patterns for more complex matching
+
+    # Vestigial: not used for routing.
     patterns: List[str] = field(default_factory=list)
-    
-    # Example phrases (used for LLM context)
+
+    # Load-bearing: included in the router prompt and agent tool descriptions.
     examples: List[str] = field(default_factory=list)
 
 
@@ -94,22 +101,6 @@ class Workflow(ABC):
             WorkflowResult with status and message
         """
         pass
-    
-    def matches(self, text: str) -> bool:
-        """Check if this workflow should handle the given text."""
-        text_lower = text.lower()
-        
-        # Check keywords
-        for keyword in self.trigger.keywords:
-            if keyword.lower() in text_lower:
-                return True
-        
-        # Check patterns
-        for pattern in self.trigger.patterns:
-            if re.search(pattern, text_lower):
-                return True
-        
-        return False
     
     def get_context_for_llm(self) -> str:
         """
@@ -529,19 +520,6 @@ class WorkflowManager:
         """Get a workflow by name."""
         return self.workflows.get(name)
     
-    def find_matching_workflow(self, text: str) -> Optional[Workflow]:
-        """Find a workflow that matches the given text.
-
-        When multiple workflows match, prefer the one registered later since
-        real integrations (Philips Hue, Home Assistant) are registered after
-        the default template workflows and should take priority.
-        """
-        matched = None
-        for workflow in self.workflows.values():
-            if workflow.matches(text):
-                matched = workflow
-        return matched
-    
     def get_all_context_for_llm(self) -> str:
         """Get context about all workflows for the LLM."""
         if not self.workflows:
@@ -569,9 +547,8 @@ def create_default_workflow_manager() -> WorkflowManager:
     manager.register(WeatherWorkflow())
     manager.register(TimerWorkflow())
 
-    # NOTE: MediaWorkflow is not registered by default because its trigger
-    # keywords ("movie", "play", "pause") overlap heavily with other workflows
-    # (e.g. Philips Hue mood "movie night"). Register it explicitly when you
-    # have a real media controller configured.
+    # NOTE: MediaWorkflow is not registered by default because there is no
+    # real media controller behind it. Register it explicitly when you have
+    # one configured.
 
     return manager

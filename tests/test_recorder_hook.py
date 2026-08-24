@@ -44,14 +44,14 @@ def test_record_chat_then_record_turn_backfills_not_duplicates(store, recorder):
 
 
 def test_record_turn_alone_inserts_workflow_exchange(store, recorder):
-    recorder.record_turn("turn on the lights", "Done, sir.", route="keyword:philips_hue",
+    recorder.record_turn("turn on the lights", "Done, sir.", route="router:philips_hue",
                          latency_ms=50, user_id="555", channel="telegram")
     assert store.counts()["exchanges"] == 1
 
 
 def test_workflow_failure_banks_an_implicit_negative(store, recorder):
     eid = recorder.record_turn("turn on the lights", "The bridge is offline, sir.",
-                               route="keyword:philips_hue", user_id="555",
+                               route="router:philips_hue", user_id="555",
                                outcome="failure")
     rows = store.feedback_for(eid)
     assert len(rows) == 1
@@ -62,7 +62,7 @@ def test_workflow_failure_banks_an_implicit_negative(store, recorder):
 def test_workflow_success_banks_nothing(store, recorder):
     """Successful routing says nothing about reply quality — not a +1."""
     eid = recorder.record_turn("turn on the lights", "Done, sir.",
-                               route="keyword:philips_hue", user_id="555",
+                               route="router:philips_hue", user_id="555",
                                outcome="success")
     assert store.feedback_for(eid) == []
 
@@ -93,7 +93,7 @@ def test_feedback_markup_only_for_fresh_chat_exchange(store, recorder):
 
 
 def test_feedback_markup_absent_for_workflow_reply(store, recorder):
-    recorder.record_turn("lights on", "Done.", route="keyword:philips_hue", user_id="555")
+    recorder.record_turn("lights on", "Done.", route="router:philips_hue", user_id="555")
     assert recorder.feedback_markup("555", "Done.") is None
 
 

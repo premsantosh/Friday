@@ -46,9 +46,6 @@ class FakeWorkflows:
     def __init__(self, workflows=None):
         self.workflows = workflows or {}
 
-    def find_matching_workflow(self, text):
-        return None
-
 
 class FakeContext:
     def enrich(self, text):
@@ -133,3 +130,31 @@ async def test_workflow_success_marks_outcome_success():
     assert reply == "Done, sir."
     assert a.last_outcome == "success"
     assert llm.calls == [], "a successful workflow needs no LLM call"
+
+
+@pytest.mark.asyncio
+async def test_free_text_never_executes_a_workflow_without_the_router():
+    """The Step-1 keyword fast-path is gone. "Good night my friend" used to
+    substring-match hue_lights ("good night") and toggle every light with
+    empty entities. Only the router/agent may pick a workflow now; a null
+    classification means the LLM provider answers."""
+
+    class HueLike:
+        name = "hue_lights"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, intent, entities):
+            self.calls += 1
+            return WorkflowResult(
+                status=WorkflowStatus.SUCCESS,
+                message="I've toggled the all lights, sir.")
+
+    hue = HueLike()
+    llm = FakeLLM(reply="Good night, sir.")
+    a = _assistant(llm, FakeRouter(workflow_name=None),
+                   workflows=FakeWorkflows({"hue_lights": hue}))
+    assert await a.process_input("Good night my friend") == "Good night, sir."
+    assert hue.calls == 0
+    assert a.last_route == "chat"

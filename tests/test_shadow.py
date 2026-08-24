@@ -86,7 +86,7 @@ def test_exchange_without_snapshot_is_skipped(store):
         raise AssertionError("should not post without a snapshot")
 
     runner = ShadowRunner(store, poster=poster)
-    eid = store.record_exchange("hi", "Hello.", route="keyword:time")
+    eid = store.record_exchange("hi", "Hello.", route="router:time")
     runner._process(eid)
     assert store.counts()["shadow_responses"] == 0
 
