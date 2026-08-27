@@ -25,6 +25,7 @@ import re
 
 if TYPE_CHECKING:
     from core.conversation.session import Session, TurnResult
+    from introspection.registry import CheckResult
 
 
 class WorkflowStatus(Enum):
@@ -114,6 +115,22 @@ Description: {self.description}
 Example commands:
 {examples_text}
 """
+
+    # ------------------------------------------------------------ introspection
+    # Optional self-awareness hooks (see introspection/README.md). Any workflow
+    # that implements them is automatically part of "what's your status?" and
+    # every self-diagnosis the moment it is registered — the introspection
+    # aggregators iterate the WorkflowManager, so there is nothing to wire up.
+    # Both must obey the introspection invariants: read-only, text-free
+    # (counts/ids/versions, never user text), and never raise.
+
+    def status_snapshot(self) -> Optional[Dict[str, Any]]:
+        """A small text-free dict of this ability's own state, or None."""
+        return None
+
+    def health_checks(self) -> List["CheckResult"]:
+        """Subsystem-specific doctor checks (introspection.CheckResult rows)."""
+        return []
 
 
 # =============================================================================

@@ -71,6 +71,11 @@ class PersonalityConfig:
     # background knowledge (e.g. "coffee machine takes 20 min to warm up").
     home_context: str = ""
 
+    # What Friday knows about itself: identity, engine, channels, the nightly
+    # learning loop, and the instruction to use self_status rather than guess.
+    # Populated at startup by main._build_self_context().
+    self_context: str = ""
+
     # Custom phrases the assistant likes to use
     favorite_phrases: list = field(default_factory=lambda: [
         "Indeed",

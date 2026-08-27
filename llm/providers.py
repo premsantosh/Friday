@@ -139,6 +139,9 @@ Helpful first, entertaining second. Brevity is the soul of wit."""
     if config.home_context.strip():
         prompt += f"\n\nHOME & APPLIANCES:\n{config.home_context}"
 
+    if config.self_context.strip():
+        prompt += f"\n\nSELF-KNOWLEDGE:\n{config.self_context}"
+
     return prompt
 
 

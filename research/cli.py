@@ -1,4 +1,4 @@
-"""Research CLI: python -m research {status,harvest,eval,rate,trace,nightly,protocol,revert}
+"""Research CLI: python -m research {status,doctor,harvest,eval,rate,trace,nightly,protocol,revert}
 
 Standalone of the running assistant — operates directly on research.db and the
 artifact directories. The nightly orchestrator (research/nightly.py) drives the
@@ -70,7 +70,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     art_dir = _artifacts_dir(args)
     print("artifacts:")
-    for arm in ("memory", "lora", "prompt"):
+    # The classic arms first, then anything else discovered on disk — a new
+    # arm shows up here (and in self_status/doctor) with no code change.
+    arms = ["memory", "lora", "prompt"]
+    if art_dir.exists():
+        from introspection.providers import discover_arms
+
+        arms += [a for a in discover_arms(art_dir) if a not in arms]
+    for arm in arms:
         current = artifacts.current_version(arm, art_dir)
         n_versions = len(artifacts.list_versions(arm, art_dir))
         print(f"  {arm:8} current={current or '-'} ({n_versions} version(s))")
@@ -106,6 +113,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     except Exception:
         pass
     return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Self-diagnosis check suite — the same checks Friday runs when asked to
+    'run a self-diagnosis' (workflows/introspection.py). Exit 1 on any FAIL."""
+    import os
+    from pathlib import Path
+
+    from introspection import CheckStatus, Paths, format_report, run_doctor
+
+    db_path = Path(args.db).expanduser()
+    state_dir = db_path.parent
+    paths = Paths(
+        state_dir=state_dir,
+        research_db=db_path,
+        artifacts_dir=_artifacts_dir(args),
+        audit_db=Path(os.getenv("FRIDAY_AUDIT_DB",
+                                state_dir / "audit.db")).expanduser(),
+    )
+    results = run_doctor(paths)
+    print("self-diagnosis:")
+    print(format_report(results))
+    return 1 if any(r.status is CheckStatus.FAIL for r in results) else 0
 
 
 def cmd_trace(args: argparse.Namespace) -> int:
@@ -408,26 +438,29 @@ def cmd_nightly(args: argparse.Namespace) -> int:
     for stage, note in status.items():
         print(f"  {stage:8} {note}")
         failed = failed or note.startswith("FAILED")
+    if failed and not args.dry_run:
+        # launchd discards this exit code, so a broken loop used to be
+        # invisible until someone ran `research status`. Best-effort ping;
+        # a silent no-op without a Telegram token.
+        from introspection.alerts import format_nightly_alert, send_telegram
+
+        message = format_nightly_alert(status)
+        if message and send_telegram(message):
+            print("failure alert sent to Telegram")
     return 1 if failed else 0
 
 
 def cmd_revert(args: argparse.Namespace) -> int:
-    from research import artifacts
+    # Shared with the self_repair workflow so a revert is one code path and
+    # one artifact.advanced event, whoever asks for it.
+    from research.ops import revert_arm
 
-    art_dir = _artifacts_dir(args)
-    versions = artifacts.list_versions(args.arm, art_dir)
-    if args.to not in versions:
-        print(f"unknown version {args.to!r} for arm {args.arm!r}; "
-              f"available: {', '.join(versions) or 'none'}")
+    try:
+        revert_arm(args.arm, args.to, artifacts_dir=_artifacts_dir(args),
+                   db_path=args.db, via="manual revert")
+    except ValueError as e:
+        print(e)
         return 1
-    previous = artifacts.current_version(args.arm, art_dir)
-    artifacts.advance_current(args.arm, args.to, art_dir)
-    store = ResearchStore(args.db)
-    store.emit("artifact.advanced", subject_type="artifact",
-               subject_id=f"{args.arm}/{args.to}", arm=args.arm,
-               artifact_version=f"{args.arm}/{args.to}",
-               detail={"previous": previous, "via": "manual revert"})
-    store.close()
     print(f"{args.arm}: current -> {args.to}")
     return 0
 
@@ -448,6 +481,8 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status", help="DB counts and recent activity")
+
+    sub.add_parser("doctor", help="self-diagnosis check suite (exit 1 on any FAIL)")
 
     p_harvest = sub.add_parser("harvest", help="mine implicit feedback signals")
     p_harvest.add_argument("--hours", type=float, default=36.0,
@@ -491,10 +526,12 @@ def main(argv=None) -> int:
                             choices=("curated", "replay", "harvested"))
 
     p_revert = sub.add_parser("revert", help="repoint an arm's current artifact")
-    p_revert.add_argument("--arm", required=True, choices=("memory", "lora", "prompt"))
+    p_revert.add_argument("--arm", required=True,
+                          help="arm name (memory, lora, prompt, or any arm on disk)")
     p_revert.add_argument("--to", required=True, help="version name, e.g. v20260718")
 
     args = parser.parse_args(argv)
-    return {"status": cmd_status, "harvest": cmd_harvest, "eval": cmd_eval,
-            "rate": cmd_rate, "trace": cmd_trace, "nightly": cmd_nightly,
-            "protocol": cmd_protocol, "revert": cmd_revert}[args.command](args)
+    return {"status": cmd_status, "doctor": cmd_doctor, "harvest": cmd_harvest,
+            "eval": cmd_eval, "rate": cmd_rate, "trace": cmd_trace,
+            "nightly": cmd_nightly, "protocol": cmd_protocol,
+            "revert": cmd_revert}[args.command](args)

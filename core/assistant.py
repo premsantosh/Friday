@@ -131,6 +131,18 @@ class VoiceAssistant:
         # them; None means Step 3 of process_input uses the legacy router.
         self.agent_engine = self._build_agent_engine()
 
+        # Self-awareness: give self_status live hooks into this assistant
+        # (session counters, active engine, ephemeral mode) — same late-injection
+        # idiom as session_store above.
+        _self_status = self.workflows.get_workflow("self_status")
+        if _self_status is not None and hasattr(_self_status, "bind_runtime"):
+            _self_status.bind_runtime(
+                llm_stats_fn=self.llm.get_stats,
+                engine_label_fn=lambda: self.engine_label,
+                ephemeral=self.config.llm.ephemeral,
+            )
+        self._append_runtime_self_context()
+
         # Drives WAITING sessions + expiry sweep (+ agent wake-ups); started in
         # run(), stopped in stop(). Not started for ephemeral one-shot
         # interactions (--test / --chat).
@@ -219,6 +231,28 @@ class VoiceAssistant:
     @property
     def engine_label(self) -> str:
         return "langgraph" if self.agent_engine is not None else "legacy router"
+
+    _RUNTIME_SELF_MARKER = "- Right now you are running"
+
+    def _append_runtime_self_context(self):
+        """Extend the SELF-KNOWLEDGE prompt block with facts that only exist
+        once the assistant is constructed: the engine actually in use, the
+        model, and the live capability registry — so even a no-tool "what can
+        you do?" tracks abilities registered after this code was written.
+        Idempotent: reconstructing an assistant on the same config replaces
+        the runtime lines rather than stacking them."""
+        personality = self.config.personality
+        if not personality.self_context.strip():
+            return
+        base = personality.self_context.split(self._RUNTIME_SELF_MARKER)[0].rstrip()
+        names = sorted(self.workflows.list_workflows())
+        runtime = (
+            f"{self._RUNTIME_SELF_MARKER} the {self.engine_label} engine on "
+            f"{getattr(self.config.llm, 'anthropic_model', 'a Claude model')}"
+            f"{' in ephemeral mode (no persistence)' if self.config.llm.ephemeral else ''}.\n"
+            f"- Your {len(names)} registered capabilities: {', '.join(names)}."
+        )
+        personality.self_context = f"{base}\n{runtime}"
     
     async def _maybe_start_session(self, workflow, text: str, entities: dict, user_id: str):
         """If `workflow` is conversational, open a multi-turn session and return its

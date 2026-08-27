@@ -59,6 +59,7 @@ class ActionKind(Enum):
     MINT_CARD = "mint_card"
     RUN_UNTRUSTED_CODE = "run_untrusted_code"
     DEVICE_CONTROL = "device_control"   # physical-world device actions gated by the agent engine (e.g. unlock)
+    SELF_REPAIR = "self_repair"         # Friday operating on its own state (workflows/introspection.py)
 
 
 def hash_plan(plan: Mapping[str, Any]) -> str:
