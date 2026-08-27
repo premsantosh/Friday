@@ -132,6 +132,27 @@ class _GateSession:
 
 # ------------------------------------------------------------- tool makers
 
+DATA_BLOCK_HEADER = "DATA (for your reasoning — do not read it aloud verbatim):"
+
+
+def append_data_block(workflow, result, text: str) -> str:
+    """For workflows that opt in (`expose_data_to_agent`), append the result's
+    structured data as JSON so the model can reason over it and answer
+    follow-ups — the spoken `message` alone can't carry a record series. Only
+    successful results: a FAILURE's data is diagnostics, not an answer."""
+    if (not getattr(workflow, "expose_data_to_agent", False)
+            or not result or not getattr(result, "data", None)
+            or result.status == WorkflowStatus.FAILURE):
+        return text
+    import json
+
+    try:
+        payload = json.dumps(result.data, default=str)
+    except (TypeError, ValueError):
+        return text
+    return f"{text}\n\n{DATA_BLOCK_HEADER}\n{payload}"
+
+
 def workflow_to_tool(workflow) -> StructuredTool:
     async def _run(intent: str, entities: Optional[Dict[str, Any]] = None) -> str:
         """Run the workflow.
@@ -142,7 +163,7 @@ def workflow_to_tool(workflow) -> StructuredTool:
                 door, temperature, duration). Empty when there are none.
         """
         result = await workflow.execute(intent, dict(entities or {}))
-        return format_result(result)
+        return append_data_block(workflow, result, format_result(result))
 
     return StructuredTool.from_function(
         coroutine=_run,
