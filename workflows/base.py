@@ -70,7 +70,13 @@ class Workflow(ABC):
     Base class for all workflows.
     Implement this to add new capabilities to your assistant.
     """
-    
+
+    # Opt-in: when True, the agent engine appends WorkflowResult.data to the
+    # tool message as JSON so the model can reason over it (agent/tools.py
+    # append_data_block). The legacy engine still speaks only `message`. Keep
+    # such data compact and safe to show the model.
+    expose_data_to_agent: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str:

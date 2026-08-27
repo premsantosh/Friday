@@ -35,6 +35,22 @@ appear in snapshots without code changes, and workflow hooks must be merged.
 - **Never raise.** The aggregators turn a crashing provider into a FAIL
   check, but degrade to WARN/SKIP yourself where you can.
 
+## records.py — history access (the one text-free carve-out)
+
+`records.py` serves Friday's *historical* records: eval series and the
+pre-registered bar (results/eval.csv via `research.protocol`), nightly run
+history, artifact/manifest series (dataset growth), feedback stats, and
+searches over the owner's own conversation transcript (`research.db
+exchanges`, falling back to dated `memory.db` summaries). It backs the
+`evals`/`history`/`insights` topics of `self_status` and the
+`recall_conversation` workflow.
+
+It is not a provider on purpose: providers stay text-free, while recall
+necessarily returns the owner's own words. The boundary holds because the
+module is still strictly read-only (never creates state; safe in ephemeral
+modes), excerpts are length-capped, and the data goes nowhere except
+Friday's reply to its owner.
+
 ## Adding a StatusProvider
 
 ```python

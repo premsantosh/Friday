@@ -51,6 +51,7 @@ from .coffee_machine import (
 from .introspection import (
     SelfStatusWorkflow,
     SelfRepairWorkflow,
+    RecallConversationWorkflow,
 )
 
 __all__ = [
@@ -105,4 +106,5 @@ __all__ = [
     # Self-awareness
     "SelfStatusWorkflow",
     "SelfRepairWorkflow",
+    "RecallConversationWorkflow",
 ]

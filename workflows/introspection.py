@@ -35,12 +35,19 @@ from workflows.base import (
 logger = logging.getLogger(__name__)
 
 TOPICS = ("overview", "nightly", "model", "activity", "jobs", "health",
-          "capabilities")
+          "capabilities", "evals", "history", "insights")
 
-# intent keyword → topic, first match wins (checked in order).
+# intent keyword → topic, first match wins (checked in order). Insights and
+# evals come before nightly so "how is your training trending?" and "the
+# results of your training" beat the bare "train" hint.
 _TOPIC_HINTS = (
     (("diagnos", "health", "doctor", "check yourself", "self-check",
       "self check"), "health"),
+    (("insight", "trend", "improving", "getting better", "analysis",
+      "analy", "progress", "how is your training"), "insights"),
+    (("eval", "win rate", "result", "score", "benchmark", "beat"), "evals"),
+    (("history", "past run", "previous run", "over time", "how many runs",
+      "dataset"), "history"),
     (("lora", "train", "learn", "nightly", "last night", "fine-tun",
       "fine tun"), "nightly"),
     (("what can you do", "capabilit", "abilities", "skills"), "capabilities"),
@@ -55,15 +62,37 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
 
+def _fmt_day(raw: str) -> str:
+    """'20260823' / '2026-08-23' → '2026-08-23' (already-readable passes through)."""
+    s = str(raw)
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
+def _dataset_growth(versions: List[Dict[str, Any]]):
+    """(first, latest) training-set sizes across a version series, or None."""
+    sizes = [v["dataset"].get("n_train") for v in versions
+             if isinstance(v.get("dataset"), dict)
+             and v["dataset"].get("n_train") is not None]
+    return (sizes[0], sizes[-1]) if sizes else None
+
+
 class SelfStatusWorkflow(Workflow):
-    """Report on Friday's own state. Read-only; safe on every engine and mode."""
+    """Report on Friday's own state and records. Read-only; safe on every
+    engine and mode. On the agent engine the structured records behind each
+    answer ride along as a DATA block, so the model can compute trends and
+    answer follow-ups from the actual numbers."""
 
     read_only = True
+    expose_data_to_agent = True
 
-    def __init__(self, workflow_manager=None, paths=None, probes=None):
+    def __init__(self, workflow_manager=None, paths=None, probes=None,
+                 results_dir=None):
         self._manager = workflow_manager
         self._paths = paths        # introspection.Paths; None → defaults
         self._probes = probes      # introspection.Probes; None → defaults
+        self._results_dir = results_dir   # repo results/ dir; None → default
         self._llm_stats_fn: Optional[Callable[[], str]] = None
         self._engine_label_fn: Optional[Callable[[], str]] = None
         self._ephemeral = False
@@ -81,20 +110,22 @@ class SelfStatusWorkflow(Workflow):
 
     @property
     def description(self) -> str:
-        return ("Report on Friday's own state: nightly learning runs and LoRA "
-                "training, scheduled jobs, recent actions, self-diagnosis, "
-                "and what it can do")
+        return ("Report on Friday's own state and records: nightly learning "
+                "runs and LoRA training, past eval results and win rates, "
+                "training trends and insights, scheduled jobs, recent "
+                "actions, self-diagnosis, and what it can do")
 
     @property
     def trigger(self) -> WorkflowTrigger:
         return WorkflowTrigger(
             examples=[
                 "Did the LoRA run last night?",
+                "What were the results of your last eval?",
+                "How is your training trending?",
                 "What did you do today?",
                 "Run a self-diagnosis",
                 "What's your status?",
                 "What can you do?",
-                "Is your nightly training healthy?",
             ]
         )
 
@@ -137,6 +168,12 @@ class SelfStatusWorkflow(Workflow):
 
         if topic == "capabilities":
             return self._capabilities()
+        if topic == "evals":
+            return self._evals_report()
+        if topic == "history":
+            return self._history_report()
+        if topic == "insights":
+            return self._insights_report()
 
         status = gather_status(self._paths, self._probes,
                                workflow_manager=self._manager)
@@ -175,6 +212,156 @@ class SelfStatusWorkflow(Workflow):
             except Exception:
                 pass
         return message, data
+
+    # -------------------------------------------------------- record topics
+    def _record_paths(self):
+        from introspection import Paths
+
+        return self._paths or Paths.default()
+
+    def _eval_csv(self):
+        from pathlib import Path
+
+        return (Path(self._results_dir) / "eval.csv"
+                if self._results_dir else None)
+
+    def _evals_report(self):
+        from introspection import records
+
+        hist = records.eval_history(self._eval_csv())
+        if not hist.get("available"):
+            return ("I have no evaluation results on record yet, sir — "
+                    "the weekly judged eval has not produced any.", {})
+        reports = records.nightly_reports(self._results_dir, limit=2)
+        last_date = hist["eval_dates"][-1] if hist["eval_dates"] else "unknown"
+        parts = [f"My most recent evaluation was on {_fmt_day(last_date)}, sir."]
+        for arm, bar in sorted(hist["bars"].items()):
+            latest = self._latest_entry(hist["series"], arm)
+            if latest and latest.get("win_rate") is not None:
+                parts.append(f"{arm}: {latest['win_rate']:.0%} win rate over "
+                             f"{latest.get('n_prompts') or '?'} prompts — "
+                             f"bar: {bar['summary']}.")
+            else:
+                parts.append(f"{arm}: bar {bar['summary']}.")
+        return " ".join(parts), {"evals": hist, "reports": reports}
+
+    @staticmethod
+    def _latest_entry(series, arm):
+        for key in (f"{arm}/curated", f"{arm}/replay", f"{arm}/harvested"):
+            if series.get(key):
+                return series[key][-1]
+        return None
+
+    def _history_report(self):
+        from introspection import records
+        from introspection.providers import discover_arms
+
+        paths = self._record_paths()
+        runs = records.runs_history(paths.research_db)
+        arms: Dict[str, Any] = {}
+        art_dir = paths.artifacts_dir
+        if art_dir.exists():
+            for arm in discover_arms(art_dir):
+                hist = records.artifact_history(arm, art_dir)
+                if hist.get("available"):
+                    arms[arm] = hist
+        if not runs.get("available") and not arms:
+            return self._records_unavailable(), {}
+        parts = []
+        if runs.get("available") and runs["total"]:
+            line = f"I have {_plural(runs['total'], 'learning run')} on record"
+            if runs["runs_with_failures"]:
+                line += (f", {runs['runs_with_failures']} with a failed stage"
+                         f" (most often {runs['most_common_failing_stage']})")
+            parts.append(line + ", sir.")
+        for arm, hist in sorted(arms.items()):
+            versions = hist["versions"]
+            line = f"{arm}: {_plural(len(versions), 'version')}"
+            growth = _dataset_growth(versions)
+            if growth:
+                line += f", training set {growth[0]} → {growth[1]} examples"
+            gated = sum(1 for v in versions if v["gated"])
+            if gated:
+                line += f", {gated} held back by the quality gate"
+            parts.append(line + ".")
+        if not parts:
+            parts.append("No runs or artifacts recorded yet, sir.")
+        return " ".join(parts), {"runs": runs, "artifacts": arms}
+
+    def _insights_report(self):
+        from introspection import records
+        from introspection.providers import discover_arms
+
+        paths = self._record_paths()
+        hist = records.eval_history(self._eval_csv())
+        runs = records.runs_history(paths.research_db)
+        feedback = records.feedback_stats(paths.research_db)
+        lines: List[str] = []
+        data: Dict[str, Any] = {"evals": hist, "runs": runs,
+                                "feedback": feedback}
+
+        if hist.get("available"):
+            for arm, bar in sorted(hist["bars"].items()):
+                series = hist["series"].get(f"{arm}/curated") or []
+                rated = [e for e in series if e.get("win_rate") is not None]
+                if len(rated) >= 2:
+                    first, last = rated[0]["win_rate"], rated[-1]["win_rate"]
+                    verb = ("improving" if last > first
+                            else "slipping" if last < first else "flat")
+                    lines.append(
+                        f"{arm}'s win rate went {first:.0%} → {last:.0%} "
+                        f"across {_plural(len(rated), 'eval')} ({verb}).")
+                elif len(rated) == 1:
+                    lines.append(f"{arm} has a single eval on record "
+                                 f"({rated[0]['win_rate']:.0%}) — too early "
+                                 f"to call a trend.")
+                if not bar["improved"]:
+                    failing = [c["number"] for c in bar["conditions"]
+                               if c["passed"] is False]
+                    if failing:
+                        lines.append(f"{arm} still fails bar condition(s) "
+                                     f"{failing}.")
+        else:
+            lines.append("No judged evals on record yet — "
+                         "trends will appear once the weekly eval runs.")
+
+        if runs.get("available") and runs["total"]:
+            if runs["runs_with_failures"]:
+                lines.append(
+                    f"{runs['runs_with_failures']} of "
+                    f"{_plural(runs['total'], 'nightly run')} failed a stage, "
+                    f"most often {runs['most_common_failing_stage']}.")
+            else:
+                lines.append(f"All {_plural(runs['total'], 'nightly run')} "
+                             f"on record completed cleanly.")
+
+        art_dir = paths.artifacts_dir
+        if art_dir.exists():
+            for arm in discover_arms(art_dir):
+                arm_hist = records.artifact_history(arm, art_dir)
+                if not arm_hist.get("available"):
+                    continue
+                data.setdefault("artifacts", {})[arm] = arm_hist
+                growth = _dataset_growth(arm_hist["versions"])
+                if growth and growth[0] != growth[1]:
+                    lines.append(f"{arm}'s training set grew "
+                                 f"{growth[0]} → {growth[1]} examples.")
+                gated = sum(1 for v in arm_hist["versions"] if v["gated"])
+                if gated:
+                    lines.append(
+                        f"{gated} of {arm}'s "
+                        f"{_plural(len(arm_hist['versions']), 'version')} "
+                        f"were held back by the quality gate.")
+
+        if feedback.get("available") and (feedback["positive"]
+                                          or feedback["negative"]):
+            lines.append(f"Feedback in the last {feedback['window_days']} "
+                         f"days: {feedback['positive']} positive, "
+                         f"{feedback['negative']} negative.")
+
+        if not lines:
+            return (self._records_unavailable(), data)
+        return "A few observations, sir. " + " ".join(lines), data
 
     def _records_unavailable(self) -> str:
         if self._ephemeral:
@@ -318,6 +505,170 @@ class SelfStatusWorkflow(Workflow):
 # Which gather_status keys back each topic's structured data slice.
 _SLICES = {"nightly": ("nightly", "arms"), "model": ("arms",),
            "activity": ("activity",), "jobs": ("jobs",)}
+
+
+# ==================================================== conversation recall
+
+# The past-date resolver's fuzzy fallback is only safe on a phrase we already
+# believe is a date — running it on a whole sentence would happily read
+# "about 2 things" as the 2nd of the month — so _find_date_phrase extracts
+# the date-ish fragment first.
+_RECALL_STOPWORDS = frozenset(
+    "what when where who how did do does we i you me my your the a an about"
+    " talk talked talking discuss discussed discussing say said mention"
+    " mentioned tell told ask asked chat chatted conversation speak spoke"
+    " last on in at of for to was were is are it that this and or with"
+    " yesterday today week tonight morning evening afternoon night any"
+    " anything something remember recall".split())
+
+_WEEKDAY_WORDS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                  "saturday", "sunday")
+
+
+def _find_date_phrase(text: str) -> Optional[str]:
+    import re
+
+    t = text.lower()
+    for phrase in ("yesterday", "today", "last week", "this week"):
+        if phrase in t:
+            return phrase
+    for day in _WEEKDAY_WORDS:
+        if re.search(rf"\b{day}\b", t):
+            return f"last {day}"
+    iso = re.search(r"\b\d{4}-\d{2}-\d{2}\b", t)
+    if iso:
+        return iso.group(0)
+    month = re.search(
+        r"\b(january|february|march|april|may|june|july|august|september"
+        r"|october|november|december)\s+\d{1,2}\b", t)
+    if month:
+        return month.group(0)
+    return None
+
+
+def _extract_keyword(text: str) -> Optional[str]:
+    """The most distinctive content word of a recall question — good enough
+    for a LIKE search over the transcript ('When did I last mention the
+    dentist?' → 'dentist'). The agent engine usually passes an explicit
+    `query` entity instead."""
+    import re
+
+    words = [w for w in re.findall(r"[a-z']+", text.lower())
+             if w not in _RECALL_STOPWORDS and len(w) > 2]
+    return max(words, key=len) if words else None
+
+
+class RecallConversationWorkflow(Workflow):
+    """Search Friday's own transcript of past conversations with the owner.
+
+    Reads the permanent record in research.db (exchanges), falling back to
+    dated memory.db summaries. Read-only; the owner's own words go nowhere
+    but back to the owner.
+    """
+
+    read_only = True
+    expose_data_to_agent = True
+
+    def __init__(self, research_db=None, memory_db=None):
+        from pathlib import Path
+
+        state = Path("~/.friday").expanduser()
+        self._research_db = Path(research_db) if research_db else state / "research.db"
+        self._memory_db = Path(memory_db) if memory_db else state / "memory.db"
+        self._ephemeral = False
+
+    def bind_runtime(self, *, ephemeral: bool = False, **_ignored) -> None:
+        self._ephemeral = ephemeral
+
+    @property
+    def name(self) -> str:
+        return "recall_conversation"
+
+    @property
+    def description(self) -> str:
+        return ("Search past conversations with the user: what was discussed "
+                "on a given day, or when something was last mentioned")
+
+    @property
+    def trigger(self) -> WorkflowTrigger:
+        return WorkflowTrigger(
+            examples=[
+                "What did we talk about yesterday?",
+                "When did I last mention the dentist?",
+                "What did we discuss last Tuesday?",
+                "Did I say anything about the trip last week?",
+            ]
+        )
+
+    async def execute(self, intent: str, entities: Dict[str, Any]) -> WorkflowResult:
+        from datetime import datetime
+
+        from introspection import records
+
+        query = str(entities.get("query") or "").strip() or None
+        date_text = str(entities.get("date") or "").strip() or None
+
+        now = datetime.now()
+        window = None
+        if date_text:
+            window = records.past_date(date_text, now)
+        else:
+            phrase = _find_date_phrase(intent)
+            if phrase:
+                window = records.past_date(phrase, now)
+        if query is None:
+            query = _extract_keyword(intent)
+
+        since_ts, until_ts = window if window else (None, None)
+        try:
+            found = records.conversation_search(
+                self._research_db, query=query, since_ts=since_ts,
+                until_ts=until_ts, limit=15, memory_db=self._memory_db)
+        except Exception as exc:
+            logger.warning("recall_conversation failed", exc_info=True)
+            return WorkflowResult(
+                status=WorkflowStatus.SUCCESS,
+                message="I tried to consult my records and hit a snag, sir — "
+                        f"{type(exc).__name__}. My apologies.",
+                data={"error": type(exc).__name__})
+
+        data = {"query": query, "window": window, **found}
+        if not found.get("available"):
+            if self._ephemeral:
+                message = ("My conversation records are not attached in this "
+                           "mode, sir.")
+            else:
+                message = ("I have no conversation records yet, sir — "
+                           "my transcript begins once the research substrate "
+                           "is enabled.")
+            return WorkflowResult(status=WorkflowStatus.SUCCESS,
+                                  message=message, data=data)
+
+        matches = found.get("matches") or []
+        if not matches:
+            scope = []
+            if query:
+                scope.append(f"mentioning '{query}'")
+            if window:
+                scope.append("in that period")
+            message = (f"I find nothing {' '.join(scope) or 'matching that'} "
+                       f"in my records, sir.")
+            return WorkflowResult(status=WorkflowStatus.SUCCESS,
+                                  message=message, data=data)
+
+        latest = matches[-1]
+        total = found.get("total_matches", len(matches))
+        parts = [f"I have {_plural(total, 'exchange')} on record"]
+        if query:
+            parts.append(f"mentioning '{query}'")
+        if window:
+            parts.append(f"for that period")
+        snippet = (latest.get("user") or latest.get("summary") or "")[:80]
+        message = (" ".join(parts)
+                   + f", sir. Most recently, on {latest.get('day')}: "
+                     f"“{snippet}”.")
+        return WorkflowResult(status=WorkflowStatus.SUCCESS, message=message,
+                              data=data)
 
 
 # ============================================================== self-repair

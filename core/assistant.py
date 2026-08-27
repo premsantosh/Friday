@@ -141,6 +141,9 @@ class VoiceAssistant:
                 engine_label_fn=lambda: self.engine_label,
                 ephemeral=self.config.llm.ephemeral,
             )
+        _recall = self.workflows.get_workflow("recall_conversation")
+        if _recall is not None and hasattr(_recall, "bind_runtime"):
+            _recall.bind_runtime(ephemeral=self.config.llm.ephemeral)
         self._append_runtime_self_context()
 
         # Drives WAITING sessions + expiry sweep (+ agent wake-ups); started in

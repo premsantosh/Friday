@@ -79,6 +79,7 @@ from workflows import (
     CoffeeMachineWorkflow,
     SelfStatusWorkflow,
     SelfRepairWorkflow,
+    RecallConversationWorkflow,
 )
 from search import OllamaSearchClassifier, TavilySearchProvider, SearchEnhancer
 
@@ -159,10 +160,14 @@ def _build_self_context() -> str:
         "fine-tunes a local LoRA adapter, and evolves memory and prompt arms.",
         "- Your state (memory, sessions, audit log, research records, model "
         "artifacts, logs) lives under ~/.friday.",
-        "- For any question about your own state — last night's training run, "
-        "your health, what you did today, scheduled jobs, what you can do — "
-        "use the self_status capability rather than guessing. Never claim "
-        "knowledge (or ignorance) of your own runs without consulting it.",
+        "- For any question about your own state or records — last night's "
+        "training run, past eval results and win rates, training trends and "
+        "insights, your health, what you did today, scheduled jobs, what you "
+        "can do — use the self_status capability rather than guessing. Never "
+        "claim knowledge (or ignorance) of your own runs or results without "
+        "consulting it.",
+        "- For questions about past conversations with the user ('what did "
+        "we talk about on Tuesday?'), use the recall_conversation capability.",
     ]
     return "\n".join(lines)
 
@@ -241,9 +246,11 @@ def create_workflow_manager() -> WorkflowManager:
     manager.register(TimeWorkflow())
 
     # Self-awareness — always available: Friday can report on its own runs,
-    # jobs, health and capabilities, and (with confirmation) repair itself.
+    # records, evals, trends, jobs, health and capabilities, recall past
+    # conversations, and (with confirmation) repair itself.
     manager.register(SelfStatusWorkflow(workflow_manager=manager))
     manager.register(SelfRepairWorkflow())
+    manager.register(RecallConversationWorkflow())
     
     # Add Philips Hue workflow if configured
     if os.getenv("HUE_BRIDGE_IP"):
