@@ -130,3 +130,82 @@ def test_agent_tool_is_generated_with_standard_schema():
     tool = next(t for t in ts.tools if t.name == "self_status")
     assert "Did the LoRA run last night?" in tool.description
     assert set(tool.args) == {"intent", "entities"}
+
+
+# --------------------------------------------------------- record topics (v2)
+
+CSV_HEADER = ("date,run_id,arm,opponent,artifact_version,judge,split,"
+              "n_prompts,n_decisive,wins,losses,win_rate,p_value,"
+              "n_control,control_win_rate,arm_style,opponent_style\n")
+
+
+@pytest.fixture
+def results_dir(tmp_path):
+    rdir = tmp_path / "results"
+    (rdir / "nightly").mkdir(parents=True)
+    (rdir / "nightly" / "20260824.md").write_text("# Nightly 20260824\n"
+                                                  "per-category detail here\n")
+    (rdir / "eval.csv").write_text(
+        CSV_HEADER
+        + "20260817,2,memory,base,v20260817,sonnet:x,curated,32,22,9,13,0.409,0.700,6,0.500,0.95,0.95\n"
+        + "20260824,3,memory,base,v20260824,sonnet:x,curated,32,24,14,10,0.583,0.041,6,0.500,0.96,0.95\n")
+    return rdir
+
+
+@pytest.mark.asyncio
+async def test_evals_topic_reports_win_rate_and_bar(paths, results_dir):
+    wf = SelfStatusWorkflow(paths=paths, probes=make_probes(),
+                            results_dir=results_dir)
+    result = await wf.execute("What were the results of your last eval?", {})
+    assert result.data["topic"] == "evals"
+    assert "2026-08-24" in result.message
+    assert "58%" in result.message
+    assert "memory" in result.message
+    # The structured records ride along for the agent model to mine.
+    series = result.data["evals"]["series"]["memory/curated"]
+    assert [e["date"] for e in series] == ["20260817", "20260824"]
+    assert result.data["reports"]["reports"][0]["name"] == "20260824.md"
+
+
+@pytest.mark.asyncio
+async def test_history_topic_reports_runs_and_versions(paths, results_dir):
+    wf = SelfStatusWorkflow(paths=paths, probes=make_probes(),
+                            results_dir=results_dir)
+    result = await wf.execute("How many runs have you done over time?", {})
+    assert result.data["topic"] == "history"
+    assert "1 learning run" in result.message
+    assert "lora: 1 version" in result.message
+    assert result.data["runs"]["total"] == 1
+    assert "lora" in result.data["artifacts"]
+
+
+@pytest.mark.asyncio
+async def test_insights_topic_computes_trend(paths, results_dir):
+    wf = SelfStatusWorkflow(paths=paths, probes=make_probes(),
+                            results_dir=results_dir)
+    result = await wf.execute("How is your training trending?", {})
+    assert result.data["topic"] == "insights"
+    assert "41% → 58%" in result.message
+    assert "improving" in result.message
+    assert result.data["evals"]["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_insights_single_eval_is_honest_about_trends(paths, tmp_path):
+    rdir = tmp_path / "results-one"
+    rdir.mkdir()
+    (rdir / "eval.csv").write_text(
+        CSV_HEADER
+        + "20260824,3,memory,base,v20260824,sonnet:x,curated,32,24,14,10,0.583,0.041,6,0.500,0.96,0.95\n")
+    wf = SelfStatusWorkflow(paths=paths, probes=make_probes(), results_dir=rdir)
+    result = await wf.execute("any insights on your learning?", {})
+    assert "too early" in result.message
+
+
+@pytest.mark.asyncio
+async def test_evals_topic_without_csv_degrades(paths, tmp_path):
+    wf = SelfStatusWorkflow(paths=paths, probes=make_probes(),
+                            results_dir=tmp_path / "empty-results")
+    result = await wf.execute("what were your eval results?", {})
+    assert result.status == WorkflowStatus.SUCCESS
+    assert "no evaluation results" in result.message
