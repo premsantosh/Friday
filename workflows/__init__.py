@@ -48,6 +48,11 @@ from .coffee_machine import (
     CoffeeMachineWorkflow,
 )
 
+from .introspection import (
+    SelfStatusWorkflow,
+    SelfRepairWorkflow,
+)
+
 __all__ = [
     # Base classes
     "Workflow",
@@ -96,4 +101,8 @@ __all__ = [
     "CoffeeMonitorConfig",
     "CoffeeMachineMonitor",
     "CoffeeMachineWorkflow",
+
+    # Self-awareness
+    "SelfStatusWorkflow",
+    "SelfRepairWorkflow",
 ]

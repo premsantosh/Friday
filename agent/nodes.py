@@ -53,6 +53,7 @@ TOOL_GUIDANCE = """TOOLS:
 - A result starting with "DECLINED:" or "REFUSED:" means the action was not carried out: acknowledge and stop. Do not retry, do not ask again.
 - Chain tool calls when a request needs several steps (look something up, then act on it). One tool call at a time.
 - `start_task` hands the conversation to a multi-turn task; after calling it, stop.
+- Questions about yourself (your status, last night's training or LoRA run, your health, what you did, your jobs) → call self_status; do not answer them from memory.
 - Answer general questions and small talk directly, without tools. Keep spoken replies short."""
 
 

@@ -77,6 +77,8 @@ from workflows import (
     TimeWorkflow,
     ShellyWorkflow,
     CoffeeMachineWorkflow,
+    SelfStatusWorkflow,
+    SelfRepairWorkflow,
 )
 from search import OllamaSearchClassifier, TavilySearchProvider, SearchEnhancer
 
@@ -134,6 +136,37 @@ def _build_home_context() -> str:
     return "\n\n".join(parts)
 
 
+def _build_self_context() -> str:
+    """
+    What Friday knows about itself, injected into the system prompt on both
+    engines. Static facts only — the live parts (active engine, model,
+    registered capabilities) are appended by VoiceAssistant once they exist.
+    Deep questions ("did the LoRA run last night?") are answered by the
+    self_status workflow, not from here.
+    """
+    channels = ["voice (wake word)", "terminal text"]
+    if os.getenv("TELEGRAM_BOT_TOKEN"):
+        channels.append("Telegram")
+    if os.getenv("VOICE_PE_DEVICES"):
+        channels.append("Voice PE room satellites")
+
+    lines = [
+        "- You are Friday, a self-hosted AI assistant running on the owner's "
+        "Mac Mini; your reasoning is a Claude model via API.",
+        f"- You listen on: {', '.join(channels)}.",
+        "- You improve yourself nightly: a launchd job (com.friday.nightly, "
+        "03:30) runs a learning loop that harvests the day's conversations, "
+        "fine-tunes a local LoRA adapter, and evolves memory and prompt arms.",
+        "- Your state (memory, sessions, audit log, research records, model "
+        "artifacts, logs) lives under ~/.friday.",
+        "- For any question about your own state — last night's training run, "
+        "your health, what you did today, scheduled jobs, what you can do — "
+        "use the self_status capability rather than guessing. Never claim "
+        "knowledge (or ignorance) of your own runs without consulting it.",
+    ]
+    return "\n".join(lines)
+
+
 def create_custom_config(args) -> AssistantConfig:
     """Create configuration based on command line arguments."""
 
@@ -169,6 +202,7 @@ def create_custom_config(args) -> AssistantConfig:
             use_british_vocabulary=True,
             use_contractions=False,
             home_context=_build_home_context(),
+            self_context=_build_self_context(),
         ),
         tts=TTSConfig(
             provider=tts_provider,
@@ -205,6 +239,11 @@ def create_workflow_manager() -> WorkflowManager:
 
     # Time workflow - always available
     manager.register(TimeWorkflow())
+
+    # Self-awareness — always available: Friday can report on its own runs,
+    # jobs, health and capabilities, and (with confirmation) repair itself.
+    manager.register(SelfStatusWorkflow(workflow_manager=manager))
+    manager.register(SelfRepairWorkflow())
     
     # Add Philips Hue workflow if configured
     if os.getenv("HUE_BRIDGE_IP"):
