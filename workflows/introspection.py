@@ -113,7 +113,12 @@ class SelfStatusWorkflow(Workflow):
         return ("Report on Friday's own state and records: nightly learning "
                 "runs and LoRA training, past eval results and win rates, "
                 "training trends and insights, scheduled jobs, recent "
-                "actions, self-diagnosis, and what it can do")
+                "actions, self-diagnosis, and what it can do. The DATA block "
+                "carries per-stage outcomes and durations, eval win rates, the "
+                "current LoRA adapter version, gate status, dataset and params, "
+                "and the train-log tail; call again with entities.topic "
+                "(nightly, evals, model, history, insights) when the user "
+                "wants more detail")
 
     @property
     def trigger(self) -> WorkflowTrigger:
@@ -371,6 +376,9 @@ class SelfStatusWorkflow(Workflow):
                 "has not produced any.")
 
     def _nightly_message(self, status: Dict[str, Any]) -> str:
+        # Spoken summary. The train/eval notes carry the numbers people ask
+        # for ("advanced to v..., 43 train ex", "lora: 37.5%"); failed stages
+        # carry the error. Everything else stays in DATA for the agent.
         nightly = status.get("nightly", {})
         if not nightly.get("available"):
             return self._records_unavailable()
@@ -395,6 +403,9 @@ class SelfStatusWorkflow(Workflow):
             stages = last.get("stages") or {}
             parts.append(f"Yes, sir — my last learning run completed {when}, "
                          f"all {_plural(len(stages), 'stage')} in order.")
+        detail = _stage_detail(last.get("stages") or {}, last["failed_stages"])
+        if detail:
+            parts.append(detail)
         lora = (status.get("arms", {}).get("arms") or {}).get("lora")
         if lora:
             if lora.get("gated"):
@@ -500,6 +511,24 @@ class SelfStatusWorkflow(Workflow):
                          f"registered.")
         parts.append("Ask for a self-diagnosis if you would like the full picture.")
         return " ".join(parts)
+
+
+_NOTE_CHARS = 120
+
+
+def _stage_detail(stages: Dict[str, Any], failed: List[str]) -> str:
+    """One speakable sentence from the stage notes that matter most."""
+    picks = [s for s in ("train", "eval") if s in stages]
+    picks += [s for s in failed if s not in picks]
+    bits = []
+    for stage in picks:
+        note = str(stages.get(stage) or "").strip()
+        if not note:
+            continue
+        if len(note) > _NOTE_CHARS:
+            note = note[:_NOTE_CHARS - 3] + "..."
+        bits.append(f"{stage}: {note}")
+    return "; ".join(bits) + "." if bits else ""
 
 
 # Which gather_status keys back each topic's structured data slice.

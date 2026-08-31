@@ -114,6 +114,8 @@ def test_every_store_write_emits_an_event(store):
     store.upsert_feedback(eid, kind="explicit", signal=1, source="telegram_button")
     store.add_shadow_response(eid, arm="base", mode="live", response_text="hi")
     store.add_shadow_response(eid, arm="lora", mode="replay", response_text="hi")
+    store.add_curated_response(None, "style-01", "lora", "Indeed, sir.",
+                               artifact_version="v20260830")
 
     assert [e["event"] for e in _events(store)] == [
         "exchange.recorded",
@@ -123,6 +125,7 @@ def test_every_store_write_emits_an_event(store):
         "feedback.upserted",
         "shadow.generated",
         "replay.generated",
+        "eval.candidate_recorded",
     ]
 
 
@@ -130,7 +133,7 @@ def test_write_methods_are_all_covered_by_the_guard():
     """Guard on the guard: catches a new write method the test above misses."""
     driven = {
         "record_exchange", "update_exchange", "add_feedback", "upsert_feedback",
-        "add_shadow_response",
+        "add_shadow_response", "add_curated_response",
     }
     # Generic escape hatches; callers own their own events (nightly/eval writes).
     exempt = {"execute", "emit", "emit_all", "backup_to", "set_run_context", "close"}

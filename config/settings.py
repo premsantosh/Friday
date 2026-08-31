@@ -211,6 +211,7 @@ class IntentCacheConfig:
     path: str = "~/.friday/intent_cache"
     similarity_threshold: float = 0.75
     collection_name: str = "intents"
+    ttl_days: float = 30
 
 
 @dataclass

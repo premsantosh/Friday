@@ -110,6 +110,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         if n_todo:
             print(f"eval set: {n_todo} curated probe(s) still marked FILL-IN "
                   f"(curated split will refuse to run)")
+        from research.evalset import count_drafts
+
+        n_drafts = count_drafts()
+        if n_drafts:
+            print(f"eval set: {n_drafts} draft probe(s) awaiting your "
+                  f"annotations (research/data/evalset/curated.yaml)")
     except Exception:
         pass
     return 0
@@ -275,9 +281,10 @@ def cmd_eval(args: argparse.Namespace) -> int:
     from research.report import append_csv_row, write_run_markdown
 
     store = ResearchStore(args.db)
-    if args.split == "curated":
+    if args.split in ("curated", "reserve"):
         try:
-            prompts = load_curated(allow_placeholders=args.allow_placeholders)
+            prompts = load_curated(allow_placeholders=args.allow_placeholders,
+                                   reserve_only=args.split == "reserve")
         except ValueError as e:
             print(f"{e}\n\nRe-run with --allow-placeholders for a smoke run "
                   f"(results will be noise on those probes).")
@@ -347,11 +354,30 @@ def cmd_protocol(args: argparse.Namespace) -> int:
         for c in bar.conditions:
             mark = {True: "PASS", False: "FAIL", None: "PENDING"}[c.passed]
             print(f"  {c.number}. {mark:8} {c.name:34} {c.detail}")
+
+    if getattr(args, "pooled", False):
+        print("\nPooled primary endpoint "
+              f"(last {protocol.POOL_WINDOW} weekly evals, Holm over study arms):")
+        pooled = {arm: protocol.evaluate_pooled(rows, arm=arm, split=args.split)
+                  for arm in arms}
+        adjusted = protocol.holm({a: p.p_value for a, p in pooled.items()
+                                  if a in protocol.STUDY_ARMS_FOR_HOLM and p.dates})
+        for arm in arms:
+            p = pooled[arm]
+            line = f"  {arm}: {p.summary()}"
+            if arm in adjusted:
+                line += f", Holm-adjusted p={adjusted[arm]:.4f}"
+            print(line)
     return 0
 
 
 def cmd_rate(args: argparse.Namespace) -> int:
-    """Human anchor: rate real (production reply vs shadow reply) pairs.
+    """Human anchor: rate anonymized response pairs.
+
+    --mode shadow (default): production reply vs live shadow reply.
+    --mode arm-base: the pre-registered anchor — arm vs base pairs from the
+    most recent judged eval run, so judge-human agreement is computed on the
+    same tournament the judge scored.
 
     Presentation order is randomized per pair and the mapping recorded, so
     these ratings can calibrate the LLM judges. Aggregates only in the repo;
@@ -359,6 +385,9 @@ def cmd_rate(args: argparse.Namespace) -> int:
     """
     import random
     import time as _time
+
+    if getattr(args, "mode", "shadow") == "arm-base":
+        return _rate_arm_base(args)
 
     store = ResearchStore(args.db)
     rows = store.query(
@@ -409,6 +438,154 @@ def cmd_rate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pair_texts(store, run_id: int, arm: str, prompt_id: str,
+                curated_prompts: dict):
+    """(user prompt, arm response, base response) for one judged pair, or None."""
+    if prompt_id.isdigit():
+        e = store.get_exchange(int(prompt_id))
+        if not e:
+            return None
+        texts = {}
+        for side in (arm, "base"):
+            rows = store.query(
+                "SELECT response_text FROM shadow_responses WHERE exchange_id = ?"
+                " AND arm = ? AND mode = 'replay' ORDER BY id DESC LIMIT 1",
+                (int(prompt_id), side))
+            if not rows:
+                return None
+            texts[side] = rows[0]["response_text"]
+        return e["user_text"], texts[arm], texts["base"]
+    prompt_text = curated_prompts.get(prompt_id)
+    if not prompt_text:
+        return None
+    texts = {}
+    for side in (arm, "base"):
+        rows = store.query(
+            "SELECT response_text FROM curated_responses WHERE run_id = ?"
+            " AND prompt_id = ? AND arm = ? ORDER BY id DESC LIMIT 1",
+            (run_id, prompt_id, side))
+        if not rows:
+            return None
+        texts[side] = rows[0]["response_text"]
+    return prompt_text, texts[arm], texts["base"]
+
+
+def _rate_arm_base(args: argparse.Namespace) -> int:
+    """Rate arm-vs-base pairs from the most recent judged run; report
+    judge-human direction agreement and append it to that run's digest."""
+    import random
+    import time as _time
+    from datetime import datetime
+
+    store = ResearchStore(args.db)
+    runs = store.query(
+        "SELECT run_id FROM eval_results WHERE judge LIKE 'sonnet%'"
+        " AND run_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+    if not runs:
+        print("no judged eval runs yet — nothing to rate")
+        return 1
+    run_id = runs[0]["run_id"]
+
+    sonnet = {(r["arm"], r["prompt_id"]): r["winner"] for r in store.query(
+        "SELECT arm, prompt_id, winner FROM eval_results"
+        " WHERE run_id = ? AND judge LIKE 'sonnet%'", (run_id,))}
+    done = {(r["arm"], r["prompt_id"]) for r in store.query(
+        "SELECT arm, prompt_id FROM eval_results"
+        " WHERE run_id = ? AND judge = 'human'", (run_id,))}
+    candidates = sorted(set(sonnet) - done)
+    if not candidates:
+        print(f"every pair from run {run_id} is already rated")
+        return 0
+
+    curated_prompts = {}
+    try:
+        from research.evalset import load_curated
+        curated_prompts = {p.id: p.prompt for p in load_curated()}
+    except Exception:
+        pass
+
+    random.Random(run_id).shuffle(candidates)
+    rated = 0
+    agree = decisive = 0
+    for arm, prompt_id in candidates:
+        if rated >= args.pairs:
+            break
+        pair = _pair_texts(store, run_id, arm, prompt_id, curated_prompts)
+        if pair is None:
+            continue
+        prompt_text, arm_text, base_text = pair
+        rng = random.Random(f"{run_id}:{arm}:{prompt_id}")
+        first_is_arm = rng.random() < 0.5
+        first, second = (arm_text, base_text) if first_is_arm else (base_text, arm_text)
+        print(f"\n--- pair {rated + 1}/{min(args.pairs, len(candidates))} ---")
+        print(f"PROMPT: {prompt_text}\n")
+        print(f"  [1] {first}\n")
+        print(f"  [2] {second}\n")
+        choice = input("Better for you? 1 / 2 / t(ie) / s(kip) / q(uit): ").strip().lower()
+        if choice == "q":
+            break
+        if choice == "s" or choice not in ("1", "2", "t"):
+            continue
+        if choice == "t":
+            winner = "tie"
+        else:
+            picked_first = choice == "1"
+            winner = "arm" if picked_first == first_is_arm else "base"
+        store.execute(
+            "INSERT INTO eval_results (run_id, arm, prompt_id, opponent, winner,"
+            " judge, scores, ts) VALUES (?, ?, ?, 'base', ?, 'human', NULL, ?)",
+            (run_id, arm, prompt_id, winner, _time.time()),
+        )
+        subject_type = "exchange" if prompt_id.isdigit() else "prompt"
+        store.emit("judge.verdict", subject_type=subject_type, subject_id=prompt_id,
+                   arm=arm, detail={"judge": "human", "opponent": "base",
+                                    "winner": winner, "run_id": run_id})
+        rated += 1
+        s_winner = sonnet.get((arm, prompt_id))
+        if winner != "tie" and s_winner in ("arm", "base"):
+            decisive += 1
+            agree += winner == s_winner
+
+    print(f"\nrated {rated} pair(s) from run {run_id}")
+    if decisive:
+        rate = agree / decisive
+        line = (f"Human anchor (run {run_id}): {rated} pairs rated, "
+                f"judge-human agreement {rate:.0%} over {decisive} decisive.")
+        print(line)
+        try:
+            from research.report import RESULTS_DIR
+            row = store.query("SELECT started_ts FROM runs WHERE id = ?", (run_id,))
+            date_str = datetime.fromtimestamp(row[0]["started_ts"]).strftime("%Y%m%d")
+            digest = RESULTS_DIR / "nightly" / f"{date_str}.md"
+            if digest.exists():
+                digest.write_text(digest.read_text().rstrip() + f"\n\n{line}\n")
+                print(f"appended to {digest}")
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "could not append human-anchor line to digest", exc_info=True)
+    return 0
+
+
+def cmd_paper(args: argparse.Namespace) -> int:
+    """Emit paper-ready tables and figures into results/paper/."""
+    from pathlib import Path
+
+    from research.paper import build_paper_outputs
+    from research.report import RESULTS_DIR
+
+    out_dir = Path(args.out) if args.out else RESULTS_DIR / "paper"
+    store = ResearchStore(args.db)
+    try:
+        written = build_paper_outputs(out_dir=out_dir, store=store)
+    except FileNotFoundError:
+        print("no results/eval.csv yet — run an eval first")
+        return 1
+    for p in written:
+        print(f"wrote {p}")
+    return 0
+
+
 def cmd_nightly(args: argparse.Namespace) -> int:
     import fcntl
     import logging
@@ -447,6 +624,18 @@ def cmd_nightly(args: argparse.Namespace) -> int:
         message = format_nightly_alert(status)
         if message and send_telegram(message):
             print("failure alert sent to Telegram")
+
+    # Weekly human-anchor nudge (PROTOCOL.md): the anchor only exists if the
+    # user actually rates pairs, so remind them right after the Sunday eval.
+    from datetime import datetime as _dt
+    weekly = args.weekly if args.weekly is not None else _dt.now().weekday() == 6
+    if weekly and not args.dry_run and not status.get("eval", "").startswith("FAILED"):
+        try:
+            from introspection.alerts import send_telegram
+            send_telegram("Weekly eval judged. Please rate this week's pairs: "
+                          "python -m research rate --mode arm-base (~20 pairs, ~10 min).")
+        except Exception:
+            pass
     return 1 if failed else 0
 
 
@@ -490,15 +679,21 @@ def main(argv=None) -> int:
 
     p_eval = sub.add_parser("eval", help="pairwise-judge arms vs base")
     p_eval.add_argument("--arms", default="base", help="comma-separated arm names")
-    p_eval.add_argument("--split", choices=("curated", "harvested"), default="curated")
+    p_eval.add_argument("--split", choices=("curated", "harvested", "reserve"),
+                        default="curated",
+                        help="reserve: the held-out probes, for the final "
+                             "paper numbers only")
     p_eval.add_argument("--judge", choices=("fake", "local", "sonnet"), default="fake")
     p_eval.add_argument("--after-ts", type=float, default=0.0,
                         help="harvested split: only prompts newer than this epoch ts")
     p_eval.add_argument("--allow-placeholders", action="store_true",
                         help="curated split: run despite FILL-IN annotations (noise)")
 
-    p_rate = sub.add_parser("rate", help="human-rate production vs shadow pairs")
+    p_rate = sub.add_parser("rate", help="human-rate anonymized response pairs")
     p_rate.add_argument("--pairs", type=int, default=20)
+    p_rate.add_argument("--mode", choices=("shadow", "arm-base"), default="shadow",
+                        help="shadow: production vs live shadow; arm-base: the "
+                             "pre-registered anchor over the latest eval run")
 
     p_trace = sub.add_parser(
         "trace", help="provenance: what the loop used to improve itself, and when")
@@ -522,6 +717,9 @@ def main(argv=None) -> int:
     p_protocol = sub.add_parser(
         "protocol", help="where each arm stands against the pre-registered bar")
     p_protocol.add_argument("--arm", default=None, help="default: every arm with rows")
+    p_protocol.add_argument("--pooled", action="store_true",
+                            help="also print the pooled primary endpoint with "
+                                 "Wilson CIs and Holm-adjusted p-values")
     p_protocol.add_argument("--split", default="curated",
                             choices=("curated", "replay", "harvested"))
 
@@ -530,8 +728,13 @@ def main(argv=None) -> int:
                           help="arm name (memory, lora, prompt, or any arm on disk)")
     p_revert.add_argument("--to", required=True, help="version name, e.g. v20260718")
 
+    p_paper = sub.add_parser(
+        "paper", help="paper-ready tables and figures from the accumulated results")
+    p_paper.add_argument("--out", default=None,
+                         help="output dir (default: results/paper)")
+
     args = parser.parse_args(argv)
     return {"status": cmd_status, "doctor": cmd_doctor, "harvest": cmd_harvest,
             "eval": cmd_eval, "rate": cmd_rate, "trace": cmd_trace,
             "nightly": cmd_nightly, "protocol": cmd_protocol,
-            "revert": cmd_revert}[args.command](args)
+            "revert": cmd_revert, "paper": cmd_paper}[args.command](args)

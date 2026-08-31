@@ -38,6 +38,19 @@ from utils import (
 )
 
 
+# Entity keys whose cached values are tied to the moment of the original
+# utterance; replaying them from the intent cache produces yesterday's date.
+VOLATILE_ENTITY_KEYS = frozenset({
+    "date", "time", "datetime", "day", "when", "duration", "delay",
+})
+
+# Workflows behind a confirmation gate on the agent path (agent/tools.py
+# GATE_SPECS — not importable here because legacy mode is the fallback when
+# langchain is absent; a sync test keeps the two sets equal). These must
+# never execute via the ungated intent-cache path, nor be written back to it.
+GATED_WORKFLOW_NAMES = frozenset({"hass_locks"})
+
+
 class AssistantState(Enum):
     """Current state of the assistant."""
     IDLE = "idle"           # Waiting for wake word
@@ -88,6 +101,7 @@ class VoiceAssistant:
             path=cache_cfg.path,
             collection_name=cache_cfg.collection_name,
             similarity_threshold=cache_cfg.similarity_threshold,
+            ttl_days=cache_cfg.ttl_days,
         ) if cache_cfg.enabled else None
         self.intent_router = IntentRouter(self.config.llm)
 
@@ -209,6 +223,11 @@ class VoiceAssistant:
             from core.harness import redact_text
             print(f"[Debug] {redact_text(message)}")
 
+    @staticmethod
+    def _data_bearing(workflow) -> bool:
+        """Workflows whose answer lives in WorkflowResult.data, not the message."""
+        return bool(getattr(workflow, "expose_data_to_agent", False))
+
     def _build_agent_engine(self):
         """Construct the LangGraph AgentEngine when the config asks for it and
         the libraries are installed; otherwise None (legacy router). Any failure
@@ -307,7 +326,23 @@ class VoiceAssistant:
                 )
             except Exception:
                 self._log("Research recorder failed for turn.")
-        return reply
+        # Delivery boundary: substitute {{identity}} placeholders only in the
+        # outbound string. Everything recorded above keeps the placeholder
+        # form, since it gets replayed into later LLM prompts.
+        return self._resolve_placeholders(reply)
+
+    def _resolve_placeholders(self, reply: str) -> str:
+        """Never raises; on any failure the reply passes through unchanged."""
+        if not reply or "{{" not in reply:
+            return reply
+        try:
+            from .placeholders import PlaceholderResolver
+            store = getattr(self.llm, "store", None)
+            return PlaceholderResolver(store=store).resolve(reply)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "placeholder resolution failed", exc_info=True)
+            return reply
 
     async def _process_input_inner(self, text: str, user_id: str = "default") -> str:
         """
@@ -364,9 +399,36 @@ class VoiceAssistant:
         # Step 1: semantic intent cache
         if self.intent_cache:
             cached = self.intent_cache.query(text)
+            if cached and cached[0] in GATED_WORKFLOW_NAMES:
+                # Self-heal: a gated workflow cached via the legacy writeback
+                # would execute here without its confirmation gate.
+                self._log(f"Cache hit for gated workflow {cached[0]}: purging, routing normally")
+                self.intent_cache.delete_workflow(cached[0])
+                cached = None
             if cached:
                 workflow_name, entities = cached
+                entities = {k: v for k, v in entities.items()
+                            if k not in VOLATILE_ENTITY_KEYS}
                 workflow = self.workflows.workflows.get(workflow_name)
+                if workflow and self._data_bearing(workflow) and self.agent_engine is not None:
+                    # Direct execution would speak only the template and leave
+                    # the thread without the turn. Instead the engine pre-runs
+                    # the tool and one model call composes from its DATA.
+                    # entities={} on purpose: these workflows derive topic/date
+                    # from the utterance, and a cached topic from a merely
+                    # similar phrasing would override the current question.
+                    try:
+                        self._log(f"Cache hit for {workflow_name}: composing via agent")
+                        reply = await self.agent_engine.handle_cached_tool(
+                            text, user_id, workflow_name=workflow_name, entities={})
+                        self.last_route = f"cache+agent:{workflow_name}"
+                        self.last_outcome = "success"
+                        return reply
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(
+                            "Cached-tool turn failed; routing normally: %s", e, exc_info=True)
+                        self._log(f"Cached-tool turn error: {e}")
+                        workflow = None
                 if workflow:
                     self._log(f"Cache hit: {workflow_name}")
                     self.last_route = f"cache:{workflow_name}"
@@ -416,7 +478,8 @@ class VoiceAssistant:
                     # it against the raw text permanently poisons the cache (e.g.
                     # "hey" → time after a time query). Follow-ups are context-
                     # dependent by nature and shouldn't be cached anyway.
-                    if self.intent_cache and enriched == text:
+                    if (self.intent_cache and enriched == text
+                            and route.workflow_name not in GATED_WORKFLOW_NAMES):
                         self.intent_cache.store(text, route.workflow_name, route.entities)
                     self.context.update(route.workflow_name, route.entities, text)
                     return result.message
@@ -443,8 +506,11 @@ class VoiceAssistant:
             text: Text to speak
         """
         self._set_state(AssistantState.SPEAKING)
-        
+
         try:
+            # Agent wake-up replies reach here without passing process_input;
+            # resolution is idempotent, so an already-resolved reply is a no-op.
+            text = self._resolve_placeholders(text)
             # Generate audio
             audio_bytes = self.tts.synthesize(text)
             

@@ -289,3 +289,126 @@ def test_run_lifecycle_events_record_a_stage_failure(store, art_dir, monkeypatch
     assert json.loads(
         [e for e in events if e["event"] == "run.finished"][0]["detail"]
     )["failed"] == ["harvest"]
+
+
+# --------------------------------------------- prospective temporal split (W2)
+
+def test_stage_order_is_prospective():
+    """Replay/eval must run before any learner so artifacts are judged on
+    exchanges they never saw; report/publish come last."""
+    from research.nightly import STAGES
+
+    order = [name for name, _ in STAGES]
+    assert order == ["harvest", "replay", "eval", "reflect", "evolve", "train",
+                     "report", "publish"]
+
+
+def test_replay_excludes_exchanges_seen_by_learners(store, art_dir):
+    import time as _time
+
+    now = _time.time()
+    _chat(store, "seen by trainer", "Reply, sir.", now - 3000)
+    _chat(store, "also seen", "Reply, sir.", now - 2500)
+    # A learner consumed everything up to now-2000 (e.g. last night's train).
+    store.set_run_context(None, "train")
+    store.emit("dataset.built", subject_type="dataset", subject_id="d1",
+               detail={"ts_marker": True})
+    store.execute("UPDATE events SET ts = ? WHERE event = 'dataset.built'",
+                  (now - 2000,))
+    store.set_run_context(None, "live")
+    unseen = _chat(store, "fresh question", "Reply, sir.", now - 1000)
+
+    status = run_nightly(store, dry_run=True, date_str="20260901",
+                         artifacts_dir=art_dir, stages=["replay"])
+    assert "cutoff" in status["replay"]
+    replayed = {r["exchange_id"] for r in
+                store.query("SELECT DISTINCT exchange_id FROM shadow_responses")}
+    assert replayed == {unseen}
+
+
+def test_report_stamps_versions_captured_at_replay_time(store, art_dir, tmp_path):
+    """After the reorder, `current` pointers advance between eval and report;
+    CSV rows must carry the version that was actually judged."""
+    import csv as _csv
+    import time as _time
+
+    from research import artifacts, nightly
+
+    v1 = artifacts.new_version("prompt", "20260830", art_dir)
+    (v1 / "block.md").write_text("- tea, not coffee")
+    artifacts.advance_current("prompt", v1.name, art_dir)
+
+    now = _time.time()
+    _chat(store, "question", "Answer, sir.", now - 600)
+
+    # A fake learner stage advances the pointer after eval, before report.
+    def fake_train(ctx):
+        v2 = artifacts.new_version("prompt", "20260831", art_dir)
+        (v2 / "block.md").write_text("- changed")
+        artifacts.advance_current("prompt", v2.name, art_dir)
+        return "advanced"
+
+    original = nightly.STAGES
+    patched = [(n, fake_train if n == "train" else fn) for n, fn in original]
+    try:
+        nightly.STAGES = patched
+        status = run_nightly(store, dry_run=True, date_str="20260831",
+                             artifacts_dir=art_dir, weekly=False,
+                             results_dir=tmp_path / "results",
+                             stages=["replay", "eval", "train", "report"])
+    finally:
+        nightly.STAGES = original
+    assert not any(v.startswith("FAILED") for v in status.values()), status
+
+    with open(tmp_path / "results" / "eval.csv", newline="") as f:
+        rows = [r for r in _csv.DictReader(f) if r["arm"] == "prompt"]
+    assert rows and all(r["artifact_version"] == "v20260830" for r in rows)
+    assert artifacts.current_version("prompt", art_dir) == "v20260831"
+
+
+def test_facts_context_hash_emitted(store, art_dir):
+    import time as _time
+
+    _chat(store, "question", "Answer, sir.", _time.time() - 600)
+    run_nightly(store, dry_run=True, date_str="20260901",
+                artifacts_dir=art_dir, stages=["replay"])
+    events = store.query("SELECT arm, detail FROM events WHERE event = 'replay.context'")
+    assert events and events[0]["arm"] == "facts"
+    detail = json.loads(events[0]["detail"])
+    assert set(detail) == {"block_sha256", "n_lines", "empty"}
+    assert len(detail["block_sha256"]) == 64
+
+
+# ---------------------------------------------------- audit + provenance (W3/W4)
+
+def test_dry_run_records_audit_and_row_provenance(store, art_dir, tmp_path):
+    import csv as _csv
+    import time as _time
+
+    now = _time.time()
+    for i in range(5):
+        _chat(store, f"question {i}", f"Answer {i}, sir.", now - 3600 + i)
+
+    status = run_nightly(store, dry_run=True, date_str="20260901",
+                         artifacts_dir=art_dir, weekly=False,
+                         results_dir=tmp_path / "results",
+                         stages=["harvest", "replay", "eval", "report"])
+    assert not any(v.startswith("FAILED") for v in status.values()), status
+
+    with open(tmp_path / "results" / "eval.csv", newline="") as f:
+        rows = list(_csv.DictReader(f))
+    assert rows
+    for r in rows:
+        assert r["rubric"].startswith("r1:")
+        assert r["judge_temperature"] == "0"
+        assert r["notes"] == "prospective"
+        assert r["local_agreement"] != ""      # scripted FakeJudge auditor ran
+        assert int(r["n_audited"]) >= 0
+
+    # Audit verdicts persisted under the auditor's judge name (fake in dry-run),
+    # and primary verdicts carry per-row provenance in scores.
+    judges = {r["judge"] for r in store.query("SELECT judge FROM eval_results")}
+    assert judges == {"fake"}
+    scored = store.query("SELECT scores FROM eval_results WHERE scores IS NOT NULL")
+    meta = json.loads(scored[0]["scores"])
+    assert meta["rubric"].startswith("r1:") and meta["judge_temperature"] == 0.0

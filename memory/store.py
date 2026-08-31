@@ -1,9 +1,19 @@
 import sqlite3
 import json
 import hashlib
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+# Kept in sync with research/approaches/facts_baseline.py, which must keep
+# its own copy so the study arm stays self-describing.
+_SEARCH_STOPWORDS = {
+    "what", "when", "where", "which", "about", "should", "could", "would",
+    "have", "this", "that", "with", "from", "make", "give", "tell", "please",
+}
+MAX_SEARCH_FACTS = 6
+
 
 class FridayStore:
     """Persistent memory for Friday. All data stays local on your Mac Mini."""
@@ -52,8 +62,17 @@ class FridayStore:
     
     # --- Facts (long-term memory) ---
     
-    def remember(self, key: str, value: str, category: str = "general", 
+    def remember(self, key: str, value: str, category: str = "general",
                  confidence: float = 1.0):
+        # The extractor's LLM sometimes emits non-string values; sqlite can't
+        # bind them and the whole extraction thread used to die on it.
+        key = str(key).strip()
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v) for v in value)
+        elif isinstance(value, dict):
+            value = json.dumps(value)
+        elif not isinstance(value, str):
+            value = str(value)
         self.conn.execute("""
             INSERT INTO facts (key, value, category, confidence, updated_at)
             VALUES (?, ?, ?, ?, datetime('now'))
@@ -71,20 +90,29 @@ class FridayStore:
         self.conn.commit()
         return row[0] if row else None
     
-    def recall_by_category(self, category: str) -> dict[str, str]:
+    def recall_by_category(self, category: str, min_confidence: float = 0.5) -> dict[str, str]:
         rows = self.conn.execute(
-            "SELECT key, value FROM facts WHERE category = ? ORDER BY access_count DESC",
-            (category,)
+            "SELECT key, value FROM facts WHERE category = ? AND confidence >= ?"
+            " ORDER BY access_count DESC",
+            (category, min_confidence)
         ).fetchall()
         return {k: v for k, v in rows}
-    
-    def search_facts(self, query: str) -> list[tuple[str, str, str]]:
-        """Simple keyword search across facts. Upgrade to vector search later."""
-        rows = self.conn.execute(
-            "SELECT key, value, category FROM facts WHERE key LIKE ? OR value LIKE ?",
-            (f"%{query}%", f"%{query}%")
-        ).fetchall()
-        return rows
+
+    def search_facts(self, query: str, min_confidence: float = 0.5) -> list[tuple[str, str, str]]:
+        """Keyword search across facts. Splits the query into content words —
+        a whole-sentence LIKE pattern never matches anything."""
+        words = [w for w in re.findall(r"[a-zA-Z]{4,}", query.lower())
+                 if w not in _SEARCH_STOPWORDS]
+        seen: dict[str, tuple[str, str, str]] = {}
+        for word in words:
+            rows = self.conn.execute(
+                "SELECT key, value, category FROM facts"
+                " WHERE (key LIKE ? OR value LIKE ?) AND confidence >= ?",
+                (f"%{word}%", f"%{word}%", min_confidence)
+            ).fetchall()
+            for key, value, category in rows:
+                seen.setdefault(key, (key, value, category))
+        return list(seen.values())[:MAX_SEARCH_FACTS]
     
     # --- Conversation history ---
     

@@ -164,3 +164,76 @@ def test_fake_judge_rows_never_count_toward_the_bar():
     bar = evaluate_bar(rows, arm="lora")
     assert [_cond(bar, n).passed for n in (1, 2, 3, 4, 5)] == [True] * 5
     assert _cond(bar, 6).passed is not True
+
+
+# ----------------------------------------------- pooled primary endpoint (W7)
+def test_wilson_interval_known_values():
+    from research.protocol import wilson_interval
+
+    lo, hi = wilson_interval(70, 128)
+    assert (round(lo, 4), round(hi, 4)) == (0.4605, 0.6305)
+    lo, hi = wilson_interval(18, 32)
+    assert (round(lo, 4), round(hi, 4)) == (0.3933, 0.7183)
+    assert wilson_interval(0, 0) == (0.0, 1.0)
+
+
+def test_holm_hand_worked():
+    from research.protocol import holm
+
+    adjusted = holm({"a": 0.01, "b": 0.04, "c": 0.03})
+    # step-down: a: 3*0.01=0.03; c: max(0.03, 2*0.03)=0.06; b: max(0.06, 1*0.04)=0.06
+    assert adjusted == {"a": 0.03, "c": 0.06, "b": 0.06}
+    assert holm({}) == {}
+
+
+def test_evaluate_pooled_sums_weekly_curated_rows():
+    from research.protocol import evaluate_pooled
+
+    rows = [
+        _row(date="2026-08-03", n_prompts="32", n_decisive="24", wins="14", losses="10",
+             win_rate="0.560", n_control="10", control_win_rate="0.500"),
+        _row(date="2026-08-10", n_prompts="32", n_decisive="26", wins="16", losses="10",
+             win_rate="0.590", n_control="10", control_win_rate="0.520"),
+        # Same-week duplicate of the 08-10 eval: must be skipped.
+        _row(date="2026-08-11", n_prompts="32", n_decisive="30", wins="30", losses="0",
+             win_rate="0.990"),
+        _row(date="2026-08-17", n_prompts="36", n_decisive="28", wins="20", losses="8",
+             win_rate="0.610", n_control="10", control_win_rate="0.480"),
+        # FakeJudge row: never evidence.
+        _row(date="2026-08-18", judge="fake", wins="99", losses="0"),
+    ]
+    pooled = evaluate_pooled(rows, arm="lora", window=4)
+    # picked: 08-03, 08-11 (later of the same-week pair), 08-17
+    assert len(pooled.dates) == 3
+    assert pooled.n_prompts == 32 + 32 + 36
+    assert pooled.wins == 14 + 30 + 20
+    assert pooled.losses == 10 + 0 + 8
+    # every picked row carries the helper's default 10 control probes
+    assert pooled.n_control == 30
+    assert round(pooled.control_win_rate, 3) == round((0.5 * 20 + 0.48 * 10) / 30, 3)
+    assert 0 < pooled.wilson_low < pooled.decisive_win_rate < pooled.wilson_high <= 1
+    assert "pooled" in pooled.summary()
+
+
+def test_evaluate_pooled_replay_excludes_pre_prospective_rows():
+    from research.protocol import REPLAY_PROSPECTIVE_FROM, evaluate_pooled
+
+    assert REPLAY_PROSPECTIVE_FROM == "2026-08-31"
+    rows = [
+        _row(date="2026-08-25", split="replay", wins="4", losses="0"),   # contaminated
+        _row(date="2026-09-02", split="replay", n_prompts="4", n_decisive="3",
+             wins="2", losses="1", win_rate="0.620"),
+        _row(date="2026-09-03", split="replay", n_prompts="6", n_decisive="4",
+             wins="3", losses="1", win_rate="0.580"),
+    ]
+    pooled = evaluate_pooled(rows, arm="lora", split="replay")
+    assert pooled.dates == ["2026-09-02", "2026-09-03"]
+    assert pooled.wins == 5 and pooled.losses == 2
+
+
+def test_evaluate_pooled_no_data():
+    from research.protocol import evaluate_pooled
+
+    pooled = evaluate_pooled([], arm="lora")
+    assert pooled.summary() == "no pooled data yet"
+    assert pooled.n_prompts == 0

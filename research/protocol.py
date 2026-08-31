@@ -12,11 +12,13 @@ rows and never needs a model, a judge, or a database.
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from math import sqrt
 from pathlib import Path
 from typing import Optional
 
+from research.eval_runner import sign_test_p
 from research.report import RESULTS_DIR
 
 # Thresholds are the pre-registered ones. Changing a number here is a protocol
@@ -29,6 +31,15 @@ MAX_STYLE_REGRESSION = 0.05
 CONSECUTIVE_EVALS = 2
 EXCLUDED_JUDGES = frozenset({"fake"})  # dry-run rows, not evidence
 MIN_DAYS_BETWEEN_EVALS = 5  # "weekly", with slack for a run that slipped a day
+
+# Replay rows dated before this were produced under the old stage order
+# (artifacts trained the same night on the same exchanges) and are
+# non-evidential — see results/README.md and PROTOCOL.md changelog.
+REPLAY_PROSPECTIVE_FROM = "2026-08-31"
+# Amended primary endpoint (PROTOCOL.md changelog): pooled verdicts over this
+# many consecutive weekly curated evals.
+POOL_WINDOW = 4
+STUDY_ARMS_FOR_HOLM = ("prompt", "memory", "lora")
 
 
 @dataclass
@@ -60,6 +71,132 @@ class BarResult:
         if pending:
             parts.append(f"pending {pending}")
         return "; ".join(parts) or "no verdict"
+
+
+def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score 95% CI for a binomial proportion (wins out of n)."""
+    if n == 0:
+        return (0.0, 1.0)
+    p = wins / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = (z / denom) * sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (max(0.0, center - margin), min(1.0, center + margin))
+
+
+def holm(pvals: dict[str, float]) -> dict[str, float]:
+    """Holm step-down adjusted p-values for a family of comparisons."""
+    m = len(pvals)
+    ordered = sorted(pvals.items(), key=lambda kv: kv[1])
+    adjusted: dict[str, float] = {}
+    running = 0.0
+    for i, (key, p) in enumerate(ordered):
+        running = max(running, (m - i) * p)
+        adjusted[key] = min(1.0, running)
+    return adjusted
+
+
+@dataclass
+class PooledResult:
+    """Amended primary endpoint: verdicts pooled over consecutive weekly evals."""
+    arm: str
+    split: str
+    dates: list[str] = field(default_factory=list)
+    n_prompts: int = 0
+    n_decisive: int = 0
+    wins: int = 0
+    losses: int = 0
+    win_rate: float = 0.0            # tie-inclusive, pooled
+    decisive_win_rate: float = 0.0   # wins / (wins + losses)
+    wilson_low: float = 0.0
+    wilson_high: float = 1.0
+    p_value: float = 1.0
+    n_control: int = 0
+    control_win_rate: Optional[float] = None
+    style_delta: Optional[float] = None
+
+    def summary(self) -> str:
+        if not self.dates:
+            return "no pooled data yet"
+        ci = f"[{self.wilson_low:.1%}, {self.wilson_high:.1%}]"
+        ctrl = (f", control {self.control_win_rate:.1%}"
+                if self.control_win_rate is not None else "")
+        return (f"{len(self.dates)} evals pooled (n={self.n_prompts}, "
+                f"decisive {self.n_decisive}): win rate {self.win_rate:.1%}, "
+                f"decisive {self.decisive_win_rate:.1%} {ci}, "
+                f"p={self.p_value:.4f}{ctrl}")
+
+
+def evaluate_pooled(rows: list[dict], *, arm: str, split: str = "curated",
+                    window: int = POOL_WINDOW) -> PooledResult:
+    """Pool the last `window` weekly rows for (arm, split) into one result.
+
+    Curated: the last `window` rows at least MIN_DAYS_BETWEEN_EVALS apart
+    (same-week duplicates skipped). Replay: all prospective rows (date >=
+    REPLAY_PROSPECTIVE_FROM) within the trailing `window` weeks.
+    """
+    cutoff = datetime.strptime(REPLAY_PROSPECTIVE_FROM, "%Y-%m-%d")
+    matching = [r for r in rows
+                if r.get("arm") == arm and r.get("split") == split
+                and r.get("judge") not in EXCLUDED_JUDGES]
+    matching = [(d, r) for r in matching if (d := _date(r)) is not None]
+    if split == "replay":
+        matching = [(d, r) for d, r in matching if d >= cutoff]
+    matching.sort(key=lambda dr: dr[0])
+
+    picked: list[tuple[datetime, dict]] = []
+    if split == "replay":
+        if matching:
+            newest = matching[-1][0]
+            span = timedelta(days=window * 7)
+            picked = [(d, r) for d, r in matching if newest - d <= span]
+    else:
+        for d, r in reversed(matching):
+            if len(picked) >= window:
+                break
+            if picked and (picked[-1][0] - d).days < MIN_DAYS_BETWEEN_EVALS:
+                continue  # same week: keep the later row only
+            picked.append((d, r))
+        picked.reverse()
+
+    out = PooledResult(arm=arm, split=split)
+    if not picked:
+        return out
+    out.dates = [r.get("date", "") for _, r in picked]
+    score_sum = 0.0
+    control_sum = 0.0
+    style_sum = 0.0
+    style_n = 0
+    for _, r in picked:
+        n = _i(r, "n_prompts")
+        out.n_prompts += n
+        out.n_decisive += _i(r, "n_decisive")
+        out.wins += _i(r, "wins")
+        out.losses += _i(r, "losses")
+        wr = _f(r, "win_rate")
+        if wr is not None:
+            score_sum += wr * n
+        nc = _i(r, "n_control")
+        cw = _f(r, "control_win_rate")
+        if nc and cw is not None:
+            out.n_control += nc
+            control_sum += cw * nc
+        a_style, o_style = _f(r, "arm_style"), _f(r, "opponent_style")
+        if a_style is not None and o_style is not None:
+            style_sum += (a_style - o_style) * n
+            style_n += n
+    if out.n_prompts:
+        out.win_rate = score_sum / out.n_prompts
+    decisive = out.wins + out.losses
+    if decisive:
+        out.decisive_win_rate = out.wins / decisive
+        out.wilson_low, out.wilson_high = wilson_interval(out.wins, decisive)
+    out.p_value = sign_test_p(out.wins, out.losses)
+    if out.n_control:
+        out.control_win_rate = control_sum / out.n_control
+    if style_n:
+        out.style_delta = style_sum / style_n
+    return out
 
 
 def load_rows(csv_path: Path | None = None) -> list[dict]:

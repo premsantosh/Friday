@@ -88,6 +88,38 @@ async def test_start_task_opens_session_and_returns_opening_line_verbatim():
 
 
 @pytest.mark.asyncio
+async def test_handoff_keeps_the_models_bridge_text():
+    """The model's own text on the tool-calling message must precede the
+    session's opening line — dropping it made slot prompts land as
+    non-sequiturs (the 'For which date, sir?' incident)."""
+    sessions = SessionManager(InMemorySessionStore(), make_workflow_manager(FakeReminderWorkflow()))
+    model = ScriptedChatModel().push(
+        AIMessage(content="Very good, sir — one moment.", tool_calls=[
+            {"name": START_TASK,
+             "args": {"workflow_name": "reminder", "intent": "remind me", "entities": {}},
+             "id": "call_1", "type": "tool_call"}]))
+    engine = make_engine(workflows=[FakeReminderWorkflow()], model=model, sessions=sessions)
+    reply = await engine.handle("remind me about something")
+    assert reply == "Very good, sir — one moment. What should I remind you about, sir?"
+
+
+def test_start_task_and_guidance_forbid_purchases():
+    from agent.nodes import TOOL_GUIDANCE
+    wm = make_workflow_manager(FakeReminderWorkflow())
+    sessions = SessionManager(InMemorySessionStore(), wm)
+    ts = build_tools(wm, sessions=sessions)
+    start = next(t for t in ts.tools if t.name == START_TASK)
+    assert "Never for purchases" in start.description
+    assert "Purchases" in TOOL_GUIDANCE
+
+
+def test_gated_workflow_names_stay_in_sync_with_gate_specs():
+    from agent.tools import GATE_SPECS
+    from core.assistant import GATED_WORKFLOW_NAMES
+    assert set(GATE_SPECS) == set(GATED_WORKFLOW_NAMES)
+
+
+@pytest.mark.asyncio
 async def test_start_task_rejects_unknown_or_duplicate_tasks():
     sessions = SessionManager(InMemorySessionStore(), make_workflow_manager(FakeReminderWorkflow()))
     model = ScriptedChatModel().push(
@@ -145,6 +177,25 @@ async def test_intent_cache_writeback_only_for_single_simple_tool_on_raw_input()
     cache, _ = await run(cacheable=True,
                          script=[AIMessage(content="Just chatting.")], workflows=[EchoTimeWorkflow()])
     assert cache.stored == []                       # no tool used
+
+
+@pytest.mark.asyncio
+async def test_intent_cache_writeback_includes_data_bearing_workflows():
+    """self_status-style tools are cached like any simple tool; a hit later
+    goes through handle_cached_tool rather than direct execution."""
+    class DataTimeWorkflow(EchoTimeWorkflow):
+        expose_data_to_agent = True
+
+    cache = RecordingIntentCache()
+    context = RecordingContext()
+    model = ScriptedChatModel().push(
+        tool_call("time_check", {"intent": "time", "entities": {"topic": "nightly"}}),
+        AIMessage(content="Noon."))
+    engine = make_engine(workflows=[DataTimeWorkflow()], model=model,
+                         intent_cache=cache, context=context)
+    await engine.handle("how did the run go", cacheable=True)
+    assert cache.stored == [("how did the run go", "time_check", {"topic": "nightly"})]
+    assert context.updates == [("time_check", {"topic": "nightly"}, "how did the run go")]
 
 
 @pytest.mark.asyncio

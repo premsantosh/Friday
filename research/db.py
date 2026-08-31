@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS eval_results (
     ts REAL NOT NULL
 );
 
+-- Curated-split generations, persisted so the human anchor can re-present the
+-- exact pairs the judge saw and so a weekly eval is reproducible after the
+-- fact. (Replay generations live in shadow_responses; curated prompt ids are
+-- not exchange ids, hence a separate table.)
+CREATE TABLE IF NOT EXISTS curated_responses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES runs(id),
+    prompt_id TEXT NOT NULL,
+    arm TEXT NOT NULL,
+    artifact_version TEXT,
+    response_text TEXT,
+    ts REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -465,6 +479,32 @@ class ResearchStore:
                 "exchange", exchange_id, arm=arm, artifact_version=artifact_version,
                 detail={"shadow_response_id": row_id, "model_tag": model_tag,
                         "gen_ms": gen_ms, "chars": len(response_text or "")},
+            )
+            self.conn.commit()
+            return row_id
+
+    def add_curated_response(
+        self,
+        run_id: Optional[int],
+        prompt_id: str,
+        arm: str,
+        response_text: str,
+        *,
+        artifact_version: Optional[str] = None,
+    ) -> int:
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO curated_responses (run_id, prompt_id, arm,"
+                " artifact_version, response_text, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, prompt_id, arm, artifact_version, response_text,
+                 time.time()),
+            )
+            row_id = int(cur.lastrowid)
+            self._emit_locked(
+                "eval.candidate_recorded", "prompt", prompt_id, arm=arm,
+                artifact_version=artifact_version,
+                detail={"curated_response_id": row_id,
+                        "chars": len(response_text or "")},
             )
             self.conn.commit()
             return row_id

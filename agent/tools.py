@@ -270,6 +270,7 @@ def make_start_task_tool(conversational: Dict[str, Any], sessions, context) -> S
         name=START_TASK,
         description=("Start a multi-turn task that will ask the user follow-up questions "
                      "(bookings, reminders, anything needing several pieces of information). "
+                     "Never for purchases (buying insurance, tickets, goods); assist those in chat. "
                      f"Tasks:\n{listing}"),
         parse_docstring=True,
     )

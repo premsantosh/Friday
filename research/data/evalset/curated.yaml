@@ -72,6 +72,7 @@ prompts:
     annotations: "Commits to a recommendation with a one-line reason rather than 'it depends'; may note the one condition that would flip it; concise."
   - id: style-15
     category: style
+    reserve: true
     prompt: "Sorry to bother you again, could you check my calendar for tomorrow?"
     annotations: "No effusive reassurance; a composed acknowledgement and straight to the task; addresses the user as sir."
 
@@ -148,5 +149,79 @@ prompts:
     annotations: "Interest earned on both principal and accumulated interest."
   - id: control-10
     category: generic_control
+    reserve: true
     prompt: "Which planet is closest to the sun?"
     annotations: "Mercury."
+
+  # ----------------------------------------------------------- draft skeletons
+  # `draft: true` probes never load into any split (and are exempt from the
+  # FILL-IN refusal), so they cannot poison a verdict. To activate one: write
+  # the prompt/annotations from your real preferences, then delete the draft
+  # flag. `reserve: true` ones stay held out for the final paper numbers
+  # (`research eval --split reserve`). Same PII rule as the header.
+  - id: pref-05
+    category: preference_recall
+    draft: true
+    prompt: "FILL-IN: a natural question whose good answer depends on a food/drink preference you actually hold"
+    annotations: "FILL-IN: the preference, stated as a fact the judge can check the answer against"
+  - id: pref-06
+    category: preference_recall
+    draft: true
+    prompt: "FILL-IN: a question that should be answered with your media/entertainment taste in mind (what to watch/play/read)"
+    annotations: "FILL-IN: the actual taste/franchise/genre preference"
+  - id: pref-07
+    category: preference_recall
+    draft: true
+    prompt: "FILL-IN: a shopping or booking question where your usual brand/vendor/seating/table preference should surface"
+    annotations: "FILL-IN: the usual choice and when it applies"
+  - id: pref-08
+    category: preference_recall
+    draft: true
+    reserve: true
+    prompt: "FILL-IN: a travel-planning question whose good answer uses a preference you've expressed in chat (airline seat, hotel type, pace)"
+    annotations: "FILL-IN: the preference"
+  - id: pref-09
+    category: preference_recall
+    draft: true
+    reserve: true
+    prompt: "FILL-IN: a gift/recommendation question about your spouse or family where a known fact should be used"
+    annotations: "FILL-IN: the family fact, in general terms per the PII rule (no names of others beyond what you're comfortable committing)"
+  - id: routine-03
+    category: routine
+    draft: true
+    prompt: "FILL-IN: a scheduling question whose answer depends on your actual weekly routine (gym, standup, errands)"
+    annotations: "FILL-IN: the routine, days/times in general terms"
+  - id: routine-04
+    category: routine
+    draft: true
+    prompt: "FILL-IN: a morning/evening question where your actual wake/sleep/commute pattern matters"
+    annotations: "FILL-IN: the pattern"
+  - id: routine-05
+    category: routine
+    draft: true
+    prompt: "FILL-IN: a reminder-phrasing question where Friday should already know when you usually do the thing"
+    annotations: "FILL-IN: the habitual timing"
+  - id: routine-06
+    category: routine
+    draft: true
+    reserve: true
+    prompt: "FILL-IN: a weekend-planning question that a model knowing your typical weekend would answer differently from a generic one"
+    annotations: "FILL-IN: the typical weekend shape"
+  - id: correct-02
+    category: correction_persistence
+    draft: true
+    reserve: true
+    prompt: "FILL-IN: re-ask something Friday once got wrong about you and you corrected (fact about you)"
+    annotations: "FILL-IN: the corrected fact; the pre-correction answer must lose"
+  - id: correct-03
+    category: correction_persistence
+    draft: true
+    reserve: true
+    prompt: "FILL-IN: a request where Friday once used the wrong format/tone and you corrected it"
+    annotations: "FILL-IN: the corrected behaviour; the old behaviour must lose"
+  - id: correct-04
+    category: correction_persistence
+    draft: true
+    reserve: true
+    prompt: "FILL-IN: a task Friday once refused or misrouted and you told it how to handle"
+    annotations: "FILL-IN: the corrected handling; refusing/misrouting must lose"

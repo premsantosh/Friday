@@ -41,6 +41,7 @@ from langchain_core.messages import (
 )
 
 from llm.providers import generate_personality_prompt
+from memory.context_builder import should_cache_response
 
 from .tracing import CONTEXT_CLOSE, CONTEXT_OPEN
 from .tools import FAILURE_PREFIXES, ToolSet
@@ -53,7 +54,8 @@ TOOL_GUIDANCE = """TOOLS:
 - A result starting with "DECLINED:" or "REFUSED:" means the action was not carried out: acknowledge and stop. Do not retry, do not ask again.
 - Chain tool calls when a request needs several steps (look something up, then act on it). One tool call at a time.
 - `start_task` hands the conversation to a multi-turn task; after calling it, stop.
-- Questions about yourself (your status, last night's training or LoRA run, your eval results, trends and insights, your health, what you did, your jobs) → call self_status; do not answer them from memory. Questions about past conversations ("what did we talk about on Tuesday?") → call recall_conversation.
+- Purchases (insurance policies, flights, tickets, retail orders) are not bookings and no tool can buy them. Do not start the reservations task for one; help in chat instead: gather the details, then give the exact site or link and what to enter there. Never claim you can complete a purchase.
+- Questions about yourself (your status, last night's training or LoRA run, your eval results, trends and insights, your health, what you did, your jobs) → call self_status; do not answer them from memory. When the user asks for more detail about a run, eval or adapter, call self_status again with the matching `topic` entity (nightly, evals, model, history, insights) and answer from its DATA block: it holds per-stage outcomes and durations, eval win rates, the adapter version, gate status and the train-log tail. Never say you lack a tool for details about yourself. Questions about past conversations ("what did we talk about on Tuesday?") → call recall_conversation.
 - Some tool results carry a DATA block of JSON records: use it to ground your answer, compute trends, and answer follow-up questions — never read the JSON aloud.
 - Answer general questions and small talk directly, without tools. Keep spoken replies short."""
 
@@ -141,8 +143,19 @@ def trim_plan(messages: Sequence[AnyMessage], max_messages: int) -> List[RemoveM
 
 # ------------------------------------------------------------------- nodes
 
-def build_system_prompt(personality, context_block: str, has_tools: bool) -> str:
+def build_system_prompt(personality, context_block: str, has_tools: bool,
+                        store=None) -> str:
     parts = [generate_personality_prompt(personality)]
+    try:
+        # Lazy: importing core.placeholders at module level would cycle
+        # through core/__init__ -> core.assistant -> agent.
+        from core.placeholders import identity_block
+        identity = identity_block(store=store)
+    except Exception:
+        logger.debug("identity block unavailable", exc_info=True)
+        identity = ""
+    if identity:
+        parts.append(identity)
     if has_tools:
         parts.append(TOOL_GUIDANCE)
     if context_block:
@@ -203,7 +216,8 @@ def make_nodes(deps, tool_set: ToolSet) -> SimpleNamespace:
 
     async def agent(state) -> Dict[str, Any]:
         system = SystemMessage(content=build_system_prompt(
-            llm.personality, state.get("context_block", ""), has_tools))
+            llm.personality, state.get("context_block", ""), has_tools,
+            store=llm.store))
         response = await model.ainvoke([system, *state["messages"]])
         llm.stats["llm_calls"] += 1
         update: Dict[str, Any] = {"messages": [response]}
@@ -256,7 +270,7 @@ def make_nodes(deps, tool_set: ToolSet) -> SimpleNamespace:
             if reply:
                 llm.store.log_turn("assistant", reply)
                 used_tools = bool(turn_tool_calls(messages))
-                if not used_tools and llm.context_builder is not None:
+                if not used_tools and llm.context_builder is not None and should_cache_response(text):
                     llm.cache.cache_response(llm.context_builder.query_fingerprint(text), reply)
                 threading.Thread(target=llm._extract_and_store, args=(text, reply),
                                  daemon=True).start()

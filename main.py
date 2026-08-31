@@ -484,7 +484,12 @@ def _run_headless_channel(config: AssistantConfig, channel, label: str,
     assistant = VoiceAssistant(config, workflow_manager)
     assistant.llm.search_enhancer = create_search_enhancer(config)
 
-    notify_owner = (lambda msg: channel.send(msg, owner)) if owner else (lambda msg: None)
+    # Placeholder resolution: wake-up/session notifications bypass
+    # process_input's delivery boundary, so resolve here too (idempotent).
+    notify_owner = (
+        (lambda msg: channel.send(assistant._resolve_placeholders(msg), owner))
+        if owner else (lambda msg: None)
+    )
 
     # Re-point session (and agent wake-up) notifications at the channel, since
     # there's no speaker in this mode (the assistant built its runner wired to speak()).

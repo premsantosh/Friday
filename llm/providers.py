@@ -20,8 +20,19 @@ _SARCASM_DOWN = {"less sarcastic", "dial down", "decrease sarcasm", "less sarcas
 _SARCASM_NONE = {"no sarcasm", "stop being sarcastic", "be serious", "be professional"}
 _SARCASM_MAX = {"maximum sarcasm", "full sarcasm", "glados", "max sarcasm"}
 from memory.cache import FridayCache
-from memory.context_builder import ContextBuilder
+from memory.context_builder import ContextBuilder, should_cache_response
 from memory.extractor import FactExtractor
+
+# Extractor output the store should never keep: ephemeral context the model
+# mistakes for durable facts (current_time in particular gets replayed later
+# as stale truth), plus transcript echoes.
+JUNK_FACT_KEYS = frozenset({
+    "current_time", "current_date", "time", "date", "salutation", "greeting",
+    "weather", "user_query", "assistant_response", "request", "question",
+    "inquiry_type",
+})
+# Below this the fact isn't worth disk; retrieval additionally floors at 0.5.
+MIN_STORE_CONFIDENCE = 0.4
 
 
 def generate_personality_prompt(config: PersonalityConfig) -> str:
@@ -206,6 +217,15 @@ class LLMProvider(ABC):
     def _refresh_system_prompt(self):
         """Regenerate system prompt so current date/time stays accurate."""
         self.system_prompt = generate_personality_prompt(self.personality)
+        try:
+            # Lazy: core.placeholders at module level would cycle through
+            # core/__init__ -> core.assistant -> llm.
+            from core.placeholders import identity_block
+            block = identity_block(store=getattr(self, "store", None))
+            if block:
+                self.system_prompt += "\n\n" + block
+        except Exception:
+            logger.debug("identity block unavailable", exc_info=True)
 
     def _trim_history(self):
         """Trim conversation history to max_history limit."""
@@ -300,8 +320,9 @@ class LLMProvider(ABC):
 
         user_turn_id = self.store.log_turn("user", user_input)
         self.store.log_turn("assistant", response)
-        fp = self.context_builder.query_fingerprint(user_input)
-        self.cache.cache_response(fp, response)
+        if should_cache_response(user_input):
+            fp = self.context_builder.query_fingerprint(user_input)
+            self.cache.cache_response(fp, response)
 
         # Research substrate: record the exchange with the exact context the LLM
         # saw, so the nightly replay can regenerate it fairly. Must never break
@@ -313,6 +334,15 @@ class LLMProvider(ABC):
                     # history[-1] is the assistant reply; replay input is
                     # everything up to and including the current user message.
                     "messages": [dict(m) for m in self.conversation_history[:-1]],
+                    # Additive provenance (snapshot_format 2): which ingress
+                    # built this snapshot and how production generated.
+                    "snapshot_format": 2,
+                    "engine": "provider",
+                    "production": {
+                        "model": self.get_name(),
+                        "temperature": getattr(self.config, "temperature", None),
+                        "max_tokens": getattr(self.config, "max_tokens", None),
+                    },
                 }
                 self.research_recorder.record_chat(
                     user_input,
@@ -336,17 +366,32 @@ class LLMProvider(ABC):
         ).start()
 
     def _extract_and_store(self, user_input: str, response: str):
-        """Run fact extraction in background and persist results."""
-        self.stats["ollama_extractions"] += 1
-        facts = self.extractor.extract(user_input, response)
-        self.stats["facts_stored"] += len(facts)
-        for fact in facts:
-            self.store.remember(
-                key=fact["key"],
-                value=fact["value"],
-                category=fact["category"],
-                confidence=fact["confidence"],
-            )
+        """Run fact extraction in background and persist results.
+
+        Runs on a daemon thread with no supervisor, so it must never raise:
+        one bad fact used to kill the thread and lose the rest of the batch.
+        """
+        try:
+            self.stats["ollama_extractions"] += 1
+            facts = self.extractor.extract(user_input, response)
+            for fact in facts:
+                try:
+                    key = str(fact["key"]).lower().strip()
+                    if key in JUNK_FACT_KEYS:
+                        continue
+                    if fact["confidence"] < MIN_STORE_CONFIDENCE:
+                        continue
+                    self.store.remember(
+                        key=key,
+                        value=fact["value"],
+                        category=fact["category"],
+                        confidence=fact["confidence"],
+                    )
+                    self.stats["facts_stored"] += 1
+                except Exception:
+                    logger.warning("Skipping unstorable fact: %r", fact, exc_info=True)
+        except Exception:
+            logger.warning("Fact extraction failed.", exc_info=True)
 
     def get_stats(self) -> str:
         s = self.stats

@@ -12,6 +12,8 @@ import logging
 import re
 from typing import Optional
 
+# NOTE: production FridayStore.search_facts now word-splits and applies a
+# confidence floor itself, matching what this baseline always did per-word.
 from memory.store import FridayStore
 
 logger = logging.getLogger(__name__)

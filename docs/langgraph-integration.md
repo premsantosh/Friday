@@ -17,7 +17,7 @@ Unchanged: active legacy sessions (Step 0), intent cache (Step 1), the reservati
 
 1. Active legacy session owns the turn (global escape cancels it).
 2. Pending agent confirmation owns the turn (global escape abandons it). This sits before routing on purpose: "yes please" must answer the question, not be routed as a new request.
-3. Intent cache → 4. agent engine → on error, legacy router.
+3. Intent cache (direct execution; a hit for a data-bearing workflow such as `self_status` becomes a single-call cached-tool turn on the agent thread, route `cache+agent:<workflow>`) → 4. agent engine → on error, legacy router.
 
 ## Module map (`agent/`)
 
@@ -42,6 +42,7 @@ Caveats to know about:
 - The keyword fast-path (old Step 1) was removed after it misrouted real traffic ("Good night my friend" toggled the lights). With the engine ON, a plainly phrased "unlock the back door" now reaches `hass_locks` through the gated agent tool and asks for confirmation — intended hardening. With the engine OFF, the legacy router executes it directly, as before.
 - Only `hass_locks` has a `GateSpec` today; every other workflow is bound ungated, exactly as the legacy router executes it. Add entries to `GATE_SPECS` to gate more.
 - Gated successes are never written to the intent cache (a cache hit would bypass the confirmation).
+- Data-bearing workflows (`expose_data_to_agent`: `self_status`, `recall_conversation`) are cached like any simple tool, but a hit does not bypass the agent: `AgentEngine.handle_cached_tool` pre-executes the tool, seeds Human / AI(tool_call) / ToolMessage onto the thread and one model call composes the answer from the DATA block. Roughly half the latency of a fresh two-call turn, and follow-ups keep full context.
 - Tool calls run one at a time (`parallel_tool_calls=False`) so an interrupt can't replay a side-effecting sibling.
 
 ## Failure containment
