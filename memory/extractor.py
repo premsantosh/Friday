@@ -54,10 +54,19 @@ class FactExtractor:
             if start == -1 or end == 0:
                 return []
             facts = json.loads(raw[start:end])
-            valid = [
-                f for f in facts
-                if isinstance(f, dict) and "key" in f and "value" in f and "category" in f
-            ]
+            valid = []
+            for f in facts:
+                if not (isinstance(f, dict) and "key" in f and "value" in f and "category" in f):
+                    continue
+                if not isinstance(f["key"], str):
+                    continue
+                # Small local models sometimes emit list/dict values; sqlite
+                # can't bind those.
+                if isinstance(f["value"], (list, tuple)):
+                    f["value"] = ", ".join(str(v) for v in f["value"])
+                elif isinstance(f["value"], dict):
+                    continue
+                valid.append(f)
         except Exception:
             return []
 

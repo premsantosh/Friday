@@ -34,8 +34,9 @@ def paths(tmp_path):
     store.execute(
         "INSERT INTO runs (started_ts, finished_ts, stage_status) VALUES (?, ?, ?)",
         (NOW - 5 * 3600, NOW - 5 * 3600 + 240,
-         json.dumps({"harvest": "ok (1s)", "train": "ok (240s)",
-                     "eval": "ok (30s)"})))
+         json.dumps({"harvest": "ok (1s)",
+                     "train": "ok (240s): advanced to v20260826 (43 train ex)",
+                     "eval": "ok (30s): facts: 62.5% (n=4), lora: 37.5% (n=4)"})))
     store.close()
     lora = art_dir / "lora"
     (lora / "v20260826").mkdir(parents=True)
@@ -57,6 +58,17 @@ async def test_lora_question_answers_from_runs(paths):
     assert result.data["topic"] == "nightly"
     assert "completed" in result.message
     assert "v20260826" in result.message
+    # The spoken line carries the train/eval numbers, not just pass/fail,
+    # and the raw stage notes stay intact in DATA for the agent.
+    assert "advanced to v20260826" in result.message
+    assert "62.5%" in result.message
+    stages = result.data["status"]["nightly"]["runs"][0]["stages"]
+    assert stages["train"] == "ok (240s): advanced to v20260826 (43 train ex)"
+
+
+def test_tool_description_mentions_data_detail():
+    desc = SelfStatusWorkflow().description
+    assert "per-stage" in desc and "topic" in desc
 
 
 @pytest.mark.asyncio
@@ -70,6 +82,7 @@ async def test_failed_run_is_reported(paths):
     store.close()
     result = await make_workflow(paths).execute("did your training run last night?", {})
     assert "train" in result.message and "failed" in result.message.lower()
+    assert "RuntimeError: boom" in result.message      # the failing stage's note
 
 
 @pytest.mark.asyncio

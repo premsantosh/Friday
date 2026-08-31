@@ -100,6 +100,9 @@ class FakeStore:
     def remember(self, **kw):
         self.facts[kw["key"]] = kw
 
+    def recall_by_category(self, category, min_confidence=0.5):
+        return {}
+
 
 class FakeContextBuilder:
     def __init__(self, cache, *, preferences: str = "", keys=None):
@@ -282,14 +285,22 @@ class FakeReminderWorkflow(ConversationalWorkflow):
 
 
 class RecordingIntentCache:
-    def __init__(self):
+    """IntentCache stand-in: `hit` is what query() returns, writes are recorded."""
+
+    def __init__(self, hit=None):
+        self.hit = hit
         self.stored: List[tuple] = []
+        self.deleted: List[str] = []
 
     def query(self, text):
-        return None
+        return self.hit
 
     def store(self, text, workflow_name, entities):
         self.stored.append((text, workflow_name, dict(entities)))
+
+    def delete_workflow(self, workflow_name):
+        self.deleted.append(workflow_name)
+        return 0
 
 
 class RecordingContext:

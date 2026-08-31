@@ -25,10 +25,11 @@ class AgentState(TypedDict):
     # Per-turn memory/search context (from ContextBuilder + SearchEnhancer);
     # hidden from traces, see agent/tracing.py.
     context_block: str
-    # Set by the `start_task` handoff tool: the legacy session's opening line,
-    # returned to the user verbatim (slot prompts / confirmation summaries must
-    # reach the user exactly as written — ActionGate approval hashing depends
-    # on what was shown).
+    # Set by the `start_task` handoff tool: the legacy session's opening line.
+    # Returned to the user unaltered — the model's bridge text may be prepended,
+    # but the message itself is never edited (slot prompts / confirmation
+    # summaries must reach the user exactly as written — ActionGate approval
+    # hashing depends on what was shown).
     handoff_message: str
     # Tool round-trips taken this turn; capped by AgentConfig.max_tool_iterations.
     tool_iterations: int

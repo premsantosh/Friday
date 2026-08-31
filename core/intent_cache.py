@@ -30,8 +30,10 @@ class IntentCache:
         path: str = "~/.friday/intent_cache",
         collection_name: str = "intents",
         similarity_threshold: float = 0.75,
+        ttl_days: float = 30,
     ):
         self.threshold = similarity_threshold
+        self.ttl_days = ttl_days
         self._collection = None
         self._db_path = str(Path(path).expanduser())
         self._collection_name = collection_name
@@ -88,6 +90,19 @@ class IntentCache:
             metadata = results["metadatas"][0][0]
             doc_id = results["ids"][0][0]
 
+            # TTL by created_at, not last_used: routing/entity decisions decay
+            # with the codebase, and hits shouldn't immortalize an entry.
+            if self.ttl_days and metadata.get("created_at"):
+                try:
+                    age = datetime.now() - datetime.fromisoformat(metadata["created_at"])
+                    if age.total_seconds() > self.ttl_days * 86400:
+                        collection.delete(ids=[doc_id])
+                        logger.info("Intent cache: expired entry for %s (age %dd)",
+                                    metadata.get("workflow_name"), age.days)
+                        return None
+                except ValueError:
+                    pass
+
             # Increment hit count
             collection.update(
                 ids=[doc_id],
@@ -131,6 +146,27 @@ class IntentCache:
 
         except Exception:
             logger.exception("Intent cache store failed, skipping")
+
+    def delete_workflow(self, workflow_name: str) -> int:
+        """Drop every cached intent that routes to `workflow_name`.
+
+        Maintenance hook (e.g. after a workflow is renamed or its entity schema
+        changes). Returns the number of entries removed, 0 on any failure.
+        """
+        try:
+            collection = self._get_collection()
+            before = collection.count()
+            if before == 0:
+                return 0
+            collection.delete(where={"workflow_name": workflow_name})
+            removed = before - collection.count()
+            if removed:
+                logger.info("Intent cache: removed %d entr%s for %s",
+                            removed, "y" if removed == 1 else "ies", workflow_name)
+            return removed
+        except Exception:
+            logger.exception("Intent cache delete failed for %s", workflow_name)
+            return 0
 
     def count(self) -> int:
         """Return total number of cached intents."""

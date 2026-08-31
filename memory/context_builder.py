@@ -4,6 +4,30 @@ from typing import Optional
 from memory.cache import FridayCache
 from memory.store import FridayStore
 
+# Words that mean the utterance leans on conversation context ("give me more
+# details", "explain that again") — replaying a cached reply for those is a
+# non-sequitur.
+_ANAPHORA_WORDS = {
+    "it", "that", "this", "those", "them", "again", "else", "details",
+}
+_FILLER_WORDS = {"the", "a", "an", "me", "my", "please", "sir", "you", "your",
+                 "i", "is", "are", "was", "do", "did", "can", "could",
+                 "for", "to", "of", "in", "on", "at", "and"}
+
+
+def should_cache_response(text: str) -> bool:
+    """Whether a reply to `text` is safe to serve verbatim later.
+
+    The response cache is keyed on the utterance alone (600s TTL), so only
+    cache self-contained questions: enough content words, no anaphora.
+    """
+    words = re.findall(r"[a-z']+", text.lower())
+    if any(w in _ANAPHORA_WORDS for w in words):
+        return False
+    content_words = [w for w in words if w not in _FILLER_WORDS]
+    return len(content_words) >= 3
+
+
 class ContextBuilder:
     """Decides what memory context to inject for each user query.
     
@@ -95,5 +119,9 @@ class ContextBuilder:
         if context.get("summaries"):
             summaries = "\n".join(context["summaries"])
             parts.append(f"\n<conversation_history_summary>\n{summaries}\n</conversation_history_summary>")
-        
+
+        if context.get("relevant_facts"):
+            lines = "\n".join(f"- {k}: {v}" for k, v, _cat in context["relevant_facts"])
+            parts.append(f"\n<relevant_facts>\n{lines}\n</relevant_facts>")
+
         return "\n".join(parts)

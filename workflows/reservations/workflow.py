@@ -352,7 +352,9 @@ class ReservationWorkflow(ConversationalWorkflow):
             "a clinic or therapist consultation, a haircut, a massage, a repair "
             "estimate, a test drive. Looks the business up, works out how they take "
             "bookings (OpenTable, Resy, their own web form, phone or email), fills "
-            "in their form, and arranges it. Also handles a URL the user pastes."
+            "in their form, and arranges it. Also handles a URL the user pastes. "
+            "Bookings only: NOT for purchases (insurance policies, flights, "
+            "tickets, retail orders) — nothing here can buy things."
         )
 
     @property
@@ -438,6 +440,12 @@ class ReservationWorkflow(ConversationalWorkflow):
                      "booking_kind", "target_url"):
             if entities.get(name):
                 out[name] = entities[name]
+        known = set(SLOT_SPECS_BY_NAME) | {"location", "email", "phone",
+                                           "special_requests", "booking_kind",
+                                           "target_url"}
+        dropped = sorted(set(entities) - known)
+        if dropped:
+            logger.info("reservations: ignoring unrecognized entities %s", dropped)
         return out
 
     def _inherit_recent(self, session: Session, extracted: Dict[str, Any]) -> Dict[str, Any]:

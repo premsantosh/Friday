@@ -1690,3 +1690,19 @@ def test_opentable_confirmed_regex_recognizes_confirmation_page():
     # genuine "sign in to complete" prompt should.
     assert not _LOGIN_RE.search("Home  Restaurants  Sign in  My reservations")
     assert _LOGIN_RE.search("Sign in to complete your reservation")
+
+
+def test_merge_entities_logs_dropped_unrecognized_keys(caplog):
+    """The whitelist stays (unknown entities are dropped, not guessed), but
+    silently losing them made the IMG-insurance handoff undebuggable — the
+    drop must at least be visible in the log."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="workflows.reservations.workflow"):
+        out = ReservationWorkflow._merge_entities({
+            "party_size": "4",
+            "departure_date": "2026-09-03",
+            "travelers": "Alice, Bob",
+        })
+    assert "departure_date" not in out and "travelers" not in out
+    assert "departure_date" in caplog.text and "travelers" in caplog.text

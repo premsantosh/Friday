@@ -21,13 +21,21 @@ handle():
      turn is processed fresh.
   2. Response-cache fast path (LLM-free); the exchange is appended to the
      thread so history stays coherent.
+  2b. handle_cached_tool(): an intent-cache hit for a data-bearing workflow
+     (expose_data_to_agent) skips the tool-selection call. The engine runs
+     the tool itself, seeds Human + AI(tool_call) + ToolMessage onto the
+     thread and lets one model call compose the reply from the DATA block,
+     so follow-ups see the full exchange.
   3. Otherwise ainvoke. Interrupted → return the question; handoff → return it
-     verbatim; else the last AI text.
+     unaltered, prefixed by the model's own bridge text when it wrote one;
+     else the last AI text.
   4. Post-run: Layer-A context update + intent-cache writeback — only when the
      run resolved via exactly one successful *simple* (ungated) workflow tool
      on un-enriched input, preserving the cache-poisoning guard in
      core/assistant.py. Gated tools are never cached: a cache hit at Step 2
-     would execute the workflow directly and bypass the confirmation.
+     would execute the workflow directly and bypass the confirmation. Data-
+     bearing workflows are cached like any other simple tool; their hits go
+     through handle_cached_tool (2b) rather than direct execution.
 
 Failure containment: if a run raises *after* a tool already executed, the
 engine does not re-raise (the legacy fallback would re-execute the request);
@@ -42,6 +50,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from uuid import uuid4
 from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -55,7 +64,7 @@ from .graph import build_graph
 from .nodes import (build_system_prompt, last_ai_text, last_human_text,
                     succeeded, turn_tool_calls)
 from .store import AgentStore, Wake
-from .tools import DECLINED_PREFIX, ToolSet, build_tools
+from .tools import DECLINED_PREFIX, ERROR_PREFIX, ToolSet, build_tools
 from .tracing import trace_config
 
 logger = logging.getLogger(__name__)
@@ -142,7 +151,7 @@ def _snapshot_messages(messages) -> List[Dict[str, str]]:
 
 class AgentEngine:
     # What the last handle() turn was: "chat" | "tools" | "interrupt" |
-    # "handoff" | "cached" | "confirm" | "error". VoiceAssistant maps this to
+    # "handoff" | "cached" | "cached_tool" | "confirm" | "error". VoiceAssistant maps this to
     # the research route; turns are serialized by its _turn_lock, so a plain
     # attribute is safe.
     last_turn_kind: Optional[str] = None
@@ -227,22 +236,12 @@ class AgentEngine:
             state = await app.aget_state(self._cfg(thread_id))
             prefix = ""
 
-            pending = _pending_interrupt(state)
+            pending, prefix = await self._prepare_turn(app, thread_id, state, text)
             if pending is not None:
-                if self._expired(pending):
-                    await self._close_pending(app, thread_id, state, pending, "let it lapse")
-                    prefix = f"That confirmation lapsed, {self._title}, so I set it aside. "
-                else:
-                    self.last_turn_kind = "confirm"
-                    return await self._answer_pending(app, thread_id, state, pending, text, user_id)
-            else:
-                await self._repair_orphans(app, thread_id, state)
+                self.last_turn_kind = "confirm"
+                return await self._answer_pending(app, thread_id, state, pending, text, user_id)
 
-            # Mirrors LLMProvider._prepare_request: sarcasm sliders and the request
-            # counter move even on a response-cache hit.
             llm = self.deps.llm
-            llm._check_sarcasm_command(text)
-            llm.stats["total_requests"] += 1
             cached = self._cached_response(text)
             if cached is not None:
                 llm.stats["cache_hits"] += 1
@@ -280,6 +279,80 @@ class AgentEngine:
                 self.last_turn_kind = "chat"
                 self._record_research(out, text, reply)
             return prefix + reply
+
+    async def _prepare_turn(self, app, thread_id: str, state, text: str):
+        """Shared turn preamble. Returns (live_pending_interrupt | None, prefix).
+
+        A live confirmation is returned untouched (before any stats move) so
+        the caller can hand the turn to it; an expired one is closed and
+        reported through `prefix`. Otherwise orphaned tool calls are repaired.
+        Mirrors LLMProvider._prepare_request: sarcasm sliders and the request
+        counter move even on a response-cache hit.
+        """
+        prefix = ""
+        pending = _pending_interrupt(state)
+        if pending is not None:
+            if not self._expired(pending):
+                return pending, prefix
+            await self._close_pending(app, thread_id, state, pending, "let it lapse")
+            prefix = f"That confirmation lapsed, {self._title}, so I set it aside. "
+        else:
+            await self._repair_orphans(app, thread_id, state)
+        llm = self.deps.llm
+        llm._check_sarcasm_command(text)
+        llm.stats["total_requests"] += 1
+        return None, prefix
+
+    async def handle_cached_tool(self, text: str, user_id: str = "default", *,
+                                 workflow_name: str, entities: Dict[str, Any]) -> str:
+        """Intent-cache hit for a data-bearing workflow: run the tool ourselves,
+        seed the exchange onto the thread and let one model call compose the
+        reply from its DATA block (see module docstring, 2b).
+
+        Raises only before anything ran (unknown/gated tool), so the caller can
+        fall back to handle(). A live confirmation delegates to handle().
+        """
+        thread_id = self.thread_id(user_id)
+        async with self._checkpoints.open() as saver:
+            app = self._graph.compile(checkpointer=saver)
+            state = await app.aget_state(self._cfg(thread_id))
+            pending = _pending_interrupt(state)
+            if pending is None or self._expired(pending):
+                tool = self.tool_set.by_name(workflow_name)
+                if tool is None or workflow_name not in self.tool_set.simple_names:
+                    raise LookupError(f"{workflow_name} is not a simple agent tool")
+                _, prefix = await self._prepare_turn(app, thread_id, state, text)
+
+                args = {"intent": text, "entities": dict(entities)}
+                try:
+                    result_text = await tool.ainvoke(args)
+                except Exception as exc:
+                    # Same surface a ToolNode failure would give the model.
+                    result_text = f"{ERROR_PREFIX} {type(exc).__name__}: {exc}"
+                call_id = f"cached_{uuid4().hex[:12]}"
+                seeded = [
+                    HumanMessage(content=text),
+                    AIMessage(content="", tool_calls=[{"name": workflow_name, "args": args,
+                                                       "id": call_id, "type": "tool_call"}]),
+                    ToolMessage(content=str(result_text), tool_call_id=call_id,
+                                name=workflow_name),
+                ]
+                try:
+                    out = await app.ainvoke(
+                        {"messages": seeded, "user_id": user_id,
+                         "handoff_message": "", "tool_iterations": 1},
+                        self._cfg(thread_id, user_id=user_id, run_kind="cached_tool"))
+                except Exception:
+                    recovered = await self._recover_after_error(app, thread_id, text)
+                    if recovered is None:
+                        raise
+                    self.last_turn_kind = "error"
+                    return prefix + recovered
+                reply = self._reply_from(out)
+                self._post_run(out, text, cacheable=True)
+                self.last_turn_kind = "cached_tool"
+                return prefix + reply
+        return await self.handle(text, user_id, cacheable=False)
 
     async def has_pending_interrupt(self, user_id: str = "default") -> bool:
         thread_id = self.thread_id(user_id)
@@ -459,12 +532,25 @@ class AgentEngine:
         try:
             system_prompt = build_system_prompt(
                 self.deps.llm.personality, out.get("context_block", ""),
-                bool(self.tool_set.tools))
+                bool(self.tool_set.tools),
+                store=getattr(self.deps.llm, "store", None))
+            cfg = getattr(self.deps.llm, "config", None)
             recorder.record_chat(
                 text, reply,
                 model=self.deps.llm.get_name(),
-                context_snapshot={"system_prompt": system_prompt,
-                                  "messages": _snapshot_messages(out.get("messages", []))},
+                context_snapshot={
+                    "system_prompt": system_prompt,
+                    "messages": _snapshot_messages(out.get("messages", [])),
+                    # Additive provenance (snapshot_format 2). Note: this
+                    # snapshot is REBUILT here, not captured from the request.
+                    "snapshot_format": 2,
+                    "engine": "langgraph",
+                    "production": {
+                        "model": self.deps.llm.get_name(),
+                        "temperature": getattr(cfg, "temperature", None),
+                        "max_tokens": getattr(cfg, "max_tokens", None),
+                    },
+                },
             )
         except Exception:
             logger.debug("research recorder failed for engine turn", exc_info=True)
@@ -489,7 +575,14 @@ class AgentEngine:
                 return str(value.get("question") or "Shall I proceed?")
             return str(value)
         if out.get("handoff_message"):
-            return str(out["handoff_message"])
+            handoff = str(out["handoff_message"])
+            # Keep the model's own bridge text ("I shall start the booking…")
+            # from the tool-calling message; dropping it made the workflow's
+            # first slot prompt land as a non-sequitur.
+            bridge = last_ai_text(out.get("messages", []))
+            if bridge and bridge.strip() and bridge.strip() != handoff.strip():
+                return f"{bridge.rstrip()} {handoff}"
+            return handoff
         text = last_ai_text(out.get("messages", []))
         return text or f"I'm afraid I have nothing useful to say to that, {self._title}."
 
