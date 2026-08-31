@@ -80,15 +80,22 @@ TRAIN = (                         # arm B
 REPLAY = (
     "replay.generated",
     "replay.failed",
+    "replay.context",             # hash of an unversioned arm's injected block
 )
 
 EVAL = (
     "judge.verdict",
     "eval.summary",
     "protocol.evaluated",
+    "eval.candidate_recorded",    # a curated-split generation persisted
 )
 
 REPORT = ("report.written",)
+
+PUBLISH = (
+    "results.committed",          # aggregates committed to git (never pushed)
+    "results.blocked",            # PII gate refused the commit
+)
 
 # Emitted by any stage that produces a versioned artifact.
 ARTIFACT = (
@@ -106,13 +113,13 @@ RUN = (
 
 KNOWN_EVENTS = frozenset(
     LIVE + HARVEST + REFLECT + EVOLVE + TRAIN + REPLAY + EVAL + REPORT
-    + ARTIFACT + RUN
+    + PUBLISH + ARTIFACT + RUN
 )
 
 # Valid `stage` values. 'live' is the running assistant; the rest are nightly.
 STAGES = frozenset({
     "live", "harvest", "reflect", "evolve", "train", "replay", "eval",
-    "report", "run",
+    "report", "publish", "run",
 })
 
 SUBJECT_TYPES = frozenset({

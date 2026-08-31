@@ -46,7 +46,7 @@ class EvalPrompt:
 
 
 def count_placeholders(path: Path = CURATED_PATH) -> int:
-    """How many curated probes still carry a FILL-IN annotation.
+    """How many NON-DRAFT curated probes still carry a FILL-IN annotation.
 
     Annotations are injected verbatim into the judge rubric as known facts about
     the user, so a placeholder does not merely fail to help — it tells the judge
@@ -57,11 +57,28 @@ def count_placeholders(path: Path = CURATED_PATH) -> int:
     except (OSError, yaml.YAMLError):
         return 0
     return sum(1 for item in raw.get("prompts", [])
-               if PLACEHOLDER_MARKER in str(item.get("annotations", "")))
+               if PLACEHOLDER_MARKER in str(item.get("annotations", ""))
+               and not item.get("draft"))
+
+
+def count_drafts(path: Path = CURATED_PATH) -> int:
+    """Skeleton probes (`draft: true`) awaiting the user's annotations.
+
+    Drafts never load into any split, so they cannot poison a verdict — but the
+    curated set stays undersized until they're written. Surfaced by `research
+    status` and the weekly digest.
+    """
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        return 0
+    return sum(1 for item in raw.get("prompts", []) if item.get("draft"))
 
 
 def load_curated(path: Path = CURATED_PATH, *,
-                 allow_placeholders: bool = False) -> list[EvalPrompt]:
+                 allow_placeholders: bool = False,
+                 include_reserve: bool = False,
+                 reserve_only: bool = False) -> list[EvalPrompt]:
     """Curated probes, refusing placeholder annotations by default.
 
     Annotations go verbatim into the judge rubric as "known facts about this
@@ -69,6 +86,14 @@ def load_curated(path: Path = CURATED_PATH, *,
     fail to help — it tells the judge that a known fact about the user is the
     string "FILL-IN: your actual coffee order", and every verdict on that probe
     is noise dressed as a measurement. Refusing beats warning.
+
+    Probe flags:
+      draft: true    — a skeleton the user hasn't annotated yet. Excluded from
+                       every load and exempt from the FILL-IN refusal, so
+                       adding skeletons can never kill the weekly eval.
+      reserve: true  — held-out probes for the final paper numbers only.
+                       Excluded unless include_reserve/reserve_only is set
+                       (`research eval --split reserve`).
     """
     raw = yaml.safe_load(path.read_text())
     prompts = []
@@ -79,6 +104,13 @@ def load_curated(path: Path = CURATED_PATH, *,
         if pid in seen_ids:
             raise ValueError(f"duplicate eval prompt id: {pid}")
         seen_ids.add(pid)
+        if item.get("draft"):
+            continue
+        is_reserve = bool(item.get("reserve"))
+        if reserve_only and not is_reserve:
+            continue
+        if is_reserve and not (include_reserve or reserve_only):
+            continue
         category = item["category"]
         if category not in VALID_CATEGORIES:
             raise ValueError(f"unknown category {category!r} for prompt {pid}")
@@ -90,6 +122,7 @@ def load_curated(path: Path = CURATED_PATH, *,
             prompt=item["prompt"],
             category=category,
             annotations=annotations,
+            meta={"reserve": is_reserve},
         ))
     if placeholders and not allow_placeholders:
         raise ValueError(

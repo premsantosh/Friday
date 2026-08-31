@@ -2,9 +2,14 @@
 
 Stages run in a fixed order, each isolated: a failing stage records its error
 in runs.stage_status and later independent stages still run (arm B failing to
-train must not stop arm C's eval). Heavy stages come after cheap ones.
+train must not stop arm C's eval).
 
-    harvest -> reflect(A) -> evolve(C) -> train(B) -> replay -> eval -> report
+    harvest -> replay -> eval -> reflect(A) -> evolve(C) -> train(B)
+            -> report -> publish
+
+Replay/eval run BEFORE the learners so each night evaluates the artifacts
+built the previous night on exchanges those artifacts never saw (prospective
+temporal split; see PROTOCOL.md changelog and the cutoff in stage_replay).
 
 Invoked by `python -m research nightly` (launchd at 03:30, or by hand).
 --dry-run swaps in the FakeJudge, skips training and paid API calls.
@@ -52,6 +57,7 @@ class NightlyContext:
     artifacts_dir: Path = artifacts.DEFAULT_ARTIFACTS_DIR
     results_dir: Optional[Path] = None  # None = the repo's results/
     results: dict = field(default_factory=dict)  # cross-stage handoff
+    git_rev: str = ""              # code version stamped on every eval row
     # Injected so tests and --dry-run can drive the real stage logic.
     replay_fn: Callable = None
     candidates_fn: Callable = None
@@ -148,15 +154,32 @@ def stage_train(ctx: NightlyContext) -> str:
                          correction_llm_fn=sonnet)
 
 
+def _prospective_cutoff(ctx: NightlyContext) -> float:
+    """Newest moment any learner consumed exchanges. Replay only evaluates
+    exchanges newer than this, so every judged prompt is provably unseen by
+    every artifact under evaluation (the stage order alone is not enough:
+    the 36h window overlaps last night's training inputs)."""
+    rows = ctx.store.query(
+        "SELECT MAX(ts) AS t FROM events WHERE event IN"
+        " ('memory.consumed', 'memory.observed', 'prompt.consumed',"
+        "  'dataset.built')")
+    consumed = (rows[0]["t"] if rows else None) or 0.0
+    return max(ctx.since_ts, consumed)
+
+
 def stage_replay(ctx: NightlyContext) -> str:
+    import hashlib
+
     from research.arms import build_arm_specs
     from research.generate import BASE_MODEL_TAG
 
+    cutoff = _prospective_cutoff(ctx)
     chat = [e for e in map(lambda r: ctx.store.get_exchange(r["id"]),
-                           ctx.store.exchanges_since(ctx.since_ts))
-            if e and e["route"] == "chat" and e.get("context_snapshot")]
+                           ctx.store.exchanges_since(cutoff))
+            if e and e["route"] == "chat" and e.get("context_snapshot")
+            and e["ts"] > cutoff]
     if not chat:
-        return "no chat exchanges with snapshots"
+        return "no unseen chat exchanges with snapshots (prospective split)"
     # Bounded work per night: generation is the expensive stage and the corpus
     # only grows. Most recent first so the window stays current.
     dropped = 0
@@ -165,9 +188,28 @@ def stage_replay(ctx: NightlyContext) -> str:
         chat = chat[-REPLAY_MAX_EXCHANGES:]
 
     specs, skipped = build_arm_specs(ctx.store, artifacts_dir=ctx.artifacts_dir)
+    # Versions captured NOW, before reflect/evolve/train advance the pointers:
+    # report/protocol must stamp rows with what was actually judged.
+    ctx.results["arm_versions"] = {s.name: s.artifact_version or "" for s in specs}
 
     generated = 0
     for spec in specs:
+        # Unversioned arms (facts) read live state; hash the injected block so
+        # baseline drift is at least visible in the trace. Hash only, no text.
+        # (dry-run: skip the live read but still emit, keeping tests hermetic
+        # while the taxonomy stays exercised.)
+        if spec.name == "facts" and getattr(spec, "block_for", None):
+            for e in chat:
+                try:
+                    block = "" if ctx.dry_run else (spec.block_for(e["user_text"]) or "")
+                except Exception:
+                    block = ""
+                ctx.store.emit(
+                    "replay.context", subject_type="exchange", subject_id=e["id"],
+                    arm=spec.name,
+                    detail={"block_sha256": hashlib.sha256(block.encode()).hexdigest(),
+                            "n_lines": block.count("\n") + 1 if block else 0,
+                            "empty": not block})
         responses = ctx.replay_fn(chat, spec)
         for e in chat:
             text = responses.get(e["id"])
@@ -186,8 +228,11 @@ def stage_replay(ctx: NightlyContext) -> str:
             generated += 1
     ctx.results["replay_exchange_ids"] = [e["id"] for e in chat]
     ctx.results["replay_arms"] = [s.name for s in specs]
+    cutoff_note = ""
+    if cutoff > ctx.since_ts:
+        cutoff_note = f", cutoff {datetime.fromtimestamp(cutoff).isoformat(timespec='seconds')}"
     note = (f"{generated} candidates over {len(chat)} exchanges, "
-            f"arms {[s.name for s in specs]}")
+            f"arms {[s.name for s in specs]}{cutoff_note}")
     if dropped:
         note += f", {dropped} older exchange(s) not replayed (cap {REPLAY_MAX_EXCHANGES})"
     if skipped:
@@ -197,13 +242,20 @@ def stage_replay(ctx: NightlyContext) -> str:
 
 def _record_outcomes(ctx: NightlyContext, result, judge_name: str) -> None:
     """Persist one pairwise result's per-prompt verdicts, with provenance."""
+    from research.judge import JUDGE_TEMPERATURE, rubric_id
+
+    # Row-level provenance rides in the free-form scores JSON: which code,
+    # which rubric text, which judge settings produced this verdict.
+    scores_meta = {"git_rev": ctx.git_rev, "rubric": rubric_id(),
+                   "judge_temperature": JUDGE_TEMPERATURE}
     for o in result.outcomes:
         winner = "arm" if o.score > 0.5 else ("base" if o.score < 0.5 else "tie")
         ctx.store.execute(
             "INSERT INTO eval_results (run_id, arm, prompt_id, opponent, winner,"
             " judge, scores, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (ctx.results.get("run_id"), result.arm, o.prompt_id, result.opponent,
-             winner, judge_name, json.dumps({"score": o.score}), time.time()),
+             winner, judge_name, json.dumps({"score": o.score, **scores_meta}),
+             time.time()),
         )
         # Harvested prompt ids are exchange ids, so the verdict lands on the
         # exchange's own trace; curated ids get their own prompt subject.
@@ -215,11 +267,48 @@ def _record_outcomes(ctx: NightlyContext, result, judge_name: str) -> None:
                                "category": o.category})
 
 
+def _audit_judge(ctx: NightlyContext):
+    """The agreement auditor for this run, or None when unavailable."""
+    from research.judge import FakeJudge, LocalJudge, ollama_available
+
+    if ctx.dry_run:
+        # A scripted second opinion so the disagreement path is exercised.
+        return FakeJudge(script=["A", "B", "tie"] * 50)
+    return LocalJudge() if ollama_available() else None
+
+
+def _run_audit(ctx: NightlyContext, prompts, arm_responses, base_responses,
+               primary, *, arm: str, split: str) -> None:
+    """Pre-registered agreement audit: a different-family local judge re-judges
+    a deterministic 20% sample; direction agreement is recorded per eval row.
+    Unavailable auditor -> fields stay None/0, never fake zeros."""
+    import random
+
+    from research.eval_runner import agreement_stats, run_pairwise
+
+    auditor = _audit_judge(ctx)
+    if auditor is None or not primary.outcomes:
+        return
+    rng = random.Random(f"{ctx.date_str}:{split}:{arm}")
+    judged = [p for p in prompts if any(o.prompt_id == p.id for o in primary.outcomes)]
+    sample = rng.sample(judged, max(1, len(judged) // 5))
+    local = run_pairwise(sample, arm_responses, base_responses, auditor,
+                         arm_name=arm, opponent_name="base")
+    if all(o.verdicts and all(v.winner == "error" for v in o.verdicts)
+           for o in local.outcomes):
+        return  # auditor effectively down mid-run: blank, not a measurement
+    _record_outcomes(ctx, local, auditor.name)
+    rate, n_shared = agreement_stats(primary, local)
+    primary.local_agreement = rate
+    primary.n_audited = n_shared
+
+
 def _eval_split(ctx: NightlyContext, prompts: list, responses_for, arms: list[str],
                 judge, split: str) -> list:
     """Judge every arm against base over one split; returns PairwiseResults."""
     from research.eval_runner import run_pairwise
 
+    arm_versions = ctx.results.get("arm_versions", {})
     base_responses = responses_for("base")
     results = []
     for arm in arms:
@@ -227,14 +316,19 @@ def _eval_split(ctx: NightlyContext, prompts: list, responses_for, arms: list[st
                               arm_name=arm, opponent_name="base")
         results.append(result)
         _record_outcomes(ctx, result, judge.name)
+        _run_audit(ctx, prompts, responses_for(arm), base_responses, result,
+                   arm=arm, split=split)
         ctx.store.emit("eval.summary", subject_type="run",
                        subject_id=ctx.results.get("run_id"), arm=arm,
-                       artifact_version=artifacts.current_version(arm, ctx.artifacts_dir),
+                       artifact_version=arm_versions.get(arm),
                        detail={"split": split, "n": len(result.outcomes),
                                "n_decisive": result.n_decisive,
                                "win_rate": round(result.win_rate, 4),
                                "p_value": round(result.p_value, 4),
-                               "judge": judge.name})
+                               "judge": judge.name,
+                               "local_agreement": result.local_agreement,
+                               "n_audited": result.n_audited,
+                               "prospective": split == "replay"})
     return results
 
 
@@ -300,9 +394,21 @@ def _eval_curated(ctx: NightlyContext, arms: list[str], judge) -> list:
 
     specs, _ = build_arm_specs(ctx.store, artifacts_dir=ctx.artifacts_dir,
                                arms=arms)
+    # Same capture rule as stage_replay: versions as judged, not as advanced.
+    versions = ctx.results.setdefault("arm_versions", {})
+    for s in specs:
+        versions.setdefault(s.name, s.artifact_version or "")
     candidates = {s.name: ctx.candidates_fn(prompts, s) for s in specs}
     if "base" not in candidates:
         return []
+
+    # Persist every candidate (base included): the human anchor re-presents
+    # these exact pairs, and a weekly eval stays reproducible after the fact.
+    for arm_name, responses in candidates.items():
+        for prompt_id, text in responses.items():
+            ctx.store.add_curated_response(
+                ctx.results.get("run_id"), prompt_id, arm_name, text,
+                artifact_version=versions.get(arm_name) or None)
 
     def responses_for(arm: str) -> dict[str, str]:
         return candidates.get(arm, {})
@@ -311,9 +417,11 @@ def _eval_curated(ctx: NightlyContext, arms: list[str], judge) -> list:
 
 
 def stage_report(ctx: NightlyContext) -> str:
+    from research.judge import JUDGE_TEMPERATURE, rubric_id
     from research.report import RESULTS_DIR, append_csv_row, write_run_markdown
 
     results_dir = ctx.results_dir or RESULTS_DIR
+    arm_versions = ctx.results.get("arm_versions", {})
     written = []
     for split in ("replay", "curated"):
         key = "pairwise" if split == "replay" else "pairwise_curated"
@@ -324,12 +432,37 @@ def stage_report(ctx: NightlyContext) -> str:
             append_csv_row(
                 r, split=split, date=ctx.date_str,
                 run_id=ctx.results.get("run_id"),
-                artifact_version=artifacts.current_version(r.arm, ctx.artifacts_dir) or "",
+                # Version captured at replay/eval time: reflect/evolve/train
+                # have advanced the pointers by now.
+                artifact_version=arm_versions.get(r.arm, ""),
+                extra={
+                    "git_rev": ctx.git_rev,
+                    "rubric": rubric_id(),
+                    "judge_temperature": f"{JUDGE_TEMPERATURE:g}",
+                    "local_agreement": (f"{r.local_agreement:.3f}"
+                                        if r.local_agreement is not None else ""),
+                    "n_audited": r.n_audited or "",
+                    "notes": "prospective" if split == "replay" else "",
+                },
                 results_dir=results_dir,
             )
+        notes = ""
+        if split == "curated":
+            try:
+                from research.evalset import count_drafts
+                n_drafts = count_drafts()
+                if n_drafts:
+                    notes = (f"Chore: {n_drafts} draft probe(s) awaiting your "
+                             f"annotations in research/data/evalset/curated.yaml — "
+                             f"the curated split stays undersized until they're written.")
+            except Exception:
+                pass
         path = write_run_markdown(
             results, split=split, date=ctx.date_str, results_dir=results_dir,
+            notes=notes,
             protocol_for=(lambda arm: _protocol_summary(arm, results_dir))
+            if split == "curated" else None,
+            pooled_for=(lambda arm: _pooled_summary(arm, results_dir))
             if split == "curated" else None)
         written.append(str(path))
         ctx.store.emit("report.written", subject_type="run",
@@ -341,6 +474,18 @@ def stage_report(ctx: NightlyContext) -> str:
 
     _evaluate_protocol(ctx)
     return ", ".join(written)
+
+
+def _pooled_summary(arm: str, results_dir: Path) -> str:
+    """One-line pooled-primary-endpoint summary for the markdown digest."""
+    from research import protocol
+
+    try:
+        rows = protocol.load_rows(Path(results_dir) / "eval.csv")
+        return protocol.evaluate_pooled(rows, arm=arm).summary()
+    except Exception:
+        logger.debug("pooled summary unavailable for %s", arm, exc_info=True)
+        return ""
 
 
 def _protocol_summary(arm: str, results_dir: Path) -> str:
@@ -365,6 +510,7 @@ def _evaluate_protocol(ctx: NightlyContext) -> None:
     except Exception:
         logger.debug("protocol evaluation skipped (no results csv)", exc_info=True)
         return
+    arm_versions = ctx.results.get("arm_versions", {})
     for arm in {r.arm for r in ctx.results.get("pairwise", [])}:
         try:
             bar = protocol.evaluate_bar(rows, arm=arm)
@@ -372,7 +518,7 @@ def _evaluate_protocol(ctx: NightlyContext) -> None:
             continue
         ctx.store.emit(
             "protocol.evaluated", subject_type="artifact",
-            subject_id=f"{arm}/{artifacts.current_version(arm, ctx.artifacts_dir) or '-'}",
+            subject_id=f"{arm}/{arm_versions.get(arm) or '-'}",
             arm=arm,
             detail={"improved": bar.improved,
                     "conditions": {c.number: c.passed for c in bar.conditions},
@@ -380,14 +526,50 @@ def _evaluate_protocol(ctx: NightlyContext) -> None:
         )
 
 
+def stage_publish(ctx: NightlyContext) -> str:
+    """Commit the night's aggregates to git behind the PII gate.
+
+    Never fails the run: a blocked or impossible commit is a note (plus a
+    Telegram alert for blocks), not an error.
+    """
+    from research.publish import commit_results, pii_findings, scan_targets
+    from research.report import RESULTS_DIR
+
+    results_dir = Path(ctx.results_dir or RESULTS_DIR)
+    targets = scan_targets(results_dir)
+    if not targets:
+        return "skipped: no result files"
+    findings = pii_findings(targets)
+    if findings:
+        ctx.store.emit("results.blocked", subject_type="run",
+                       subject_id=ctx.results.get("run_id"),
+                       detail={"findings": findings[:20], "n": len(findings)})
+        try:
+            from introspection.alerts import send_telegram
+            send_telegram(f"PII gate blocked the results commit: {len(findings)}"
+                          f" finding(s), e.g. {findings[0]}. Nothing committed.")
+        except Exception:
+            logger.debug("PII block alert failed", exc_info=True)
+        return f"BLOCKED: {len(findings)} PII finding(s), no commit"
+    if ctx.dry_run:
+        return "scan clean, skipped commit (dry-run)"
+    note = commit_results(results_dir, ctx.date_str)
+    if note.startswith("committed"):
+        ctx.store.emit("results.committed", subject_type="run",
+                       subject_id=ctx.results.get("run_id"),
+                       detail={"note": note, "files": [t.name for t in targets]})
+    return note
+
+
 STAGES: list[tuple[str, Callable[[NightlyContext], str]]] = [
     ("harvest", stage_harvest),
+    ("replay", stage_replay),
+    ("eval", stage_eval),
     ("reflect", stage_reflect),
     ("evolve", stage_evolve),
     ("train", stage_train),
-    ("replay", stage_replay),
-    ("eval", stage_eval),
     ("report", stage_report),
+    ("publish", stage_publish),
 ]
 
 
@@ -410,6 +592,12 @@ def run_nightly(store: ResearchStore, *, dry_run: bool = False,
         artifacts_dir=artifacts_dir,
         results_dir=results_dir,
     )
+    from research.provenance import git_rev
+
+    try:
+        ctx.git_rev = git_rev() or ""
+    except Exception:
+        ctx.git_rev = ""
     run_id = store.execute(
         "INSERT INTO runs (started_ts, stage_status) VALUES (?, '{}')", (time.time(),))
     ctx.results["run_id"] = run_id

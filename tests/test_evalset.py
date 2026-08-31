@@ -100,3 +100,77 @@ def test_harvested_respects_the_temporal_split(tmp_path):
         assert [p.prompt for p in prompts] == ["new"]
     finally:
         store.close()
+
+
+# ------------------------------------------------------ draft + reserve flags
+
+def _write_yaml_text(tmp_path, body: str):
+    p = tmp_path / "curated.yaml"
+    p.write_text(body)
+    return p
+
+
+_FLAGGED = """
+prompts:
+  - id: s1
+    category: style
+    prompt: "p1"
+    annotations: "a1"
+  - id: s2
+    category: style
+    reserve: true
+    prompt: "p2"
+    annotations: "a2"
+  - id: s3
+    category: style
+    draft: true
+    prompt: "FILL-IN: to be written"
+    annotations: "FILL-IN: to be written"
+"""
+
+
+def test_drafts_are_excluded_and_exempt_from_fill_in_refusal(tmp_path):
+    from research.evalset import count_drafts, count_placeholders, load_curated
+
+    path = _write_yaml_text(tmp_path, _FLAGGED)
+    prompts = load_curated(path)          # must NOT raise despite the FILL-IN
+    assert [p.id for p in prompts] == ["s1"]
+    assert count_drafts(path) == 1
+    assert count_placeholders(path) == 0  # drafts don't count as placeholders
+
+
+def test_reserve_loading_modes(tmp_path):
+    from research.evalset import load_curated
+
+    path = _write_yaml_text(tmp_path, _FLAGGED)
+    assert [p.id for p in load_curated(path)] == ["s1"]
+    assert [p.id for p in load_curated(path, reserve_only=True)] == ["s2"]
+    assert [p.id for p in load_curated(path, include_reserve=True)] == ["s1", "s2"]
+
+
+def test_fill_in_on_a_non_draft_probe_still_refuses(tmp_path):
+    import pytest
+
+    from research.evalset import load_curated
+
+    path = _write_yaml_text(tmp_path, """
+prompts:
+  - id: s1
+    category: style
+    prompt: "p1"
+    annotations: "FILL-IN: the user's actual preference"
+""")
+    with pytest.raises(ValueError, match="FILL-IN"):
+        load_curated(path)
+
+
+def test_repo_curated_yaml_loads_clean():
+    """The real file: weekly split loads, reserve exists, drafts pending."""
+    from research.evalset import count_drafts, load_curated
+
+    weekly = load_curated()
+    assert len(weekly) >= 30
+    assert all(not p.meta.get("reserve") for p in weekly)
+    reserve = load_curated(reserve_only=True)
+    assert len(reserve) >= 2
+    assert count_drafts() >= 0

@@ -171,3 +171,24 @@ def test_first_text_skips_thinking_blocks():
     assert first_text(resp) == "the answer"
     assert first_text(_Resp(_Block("thinking", thinking="…"))) == ""
     assert first_text(_Resp()) == ""
+
+
+def test_agreement_stats_counts_shared_decisive_only():
+    from research.eval_runner import PairwiseResult, PromptOutcome, agreement_stats
+
+    def result(scores):
+        return PairwiseResult(arm="a", opponent="base", judge="j",
+                              outcomes=[PromptOutcome(str(i), "style", s)
+                                        for i, s in enumerate(scores)],
+                              arm_style=1.0, opponent_style=1.0)
+
+    a = result([1.0, 0.0, 0.5, 1.0])
+    b = result([1.0, 1.0, 1.0, 0.5])
+    # shared decisive: prompts 0 (agree) and 1 (disagree); 2 is a tie for a,
+    # 3 is a tie for b.
+    rate, n = agreement_stats(a, b)
+    assert (rate, n) == (0.5, 2)
+
+    all_ties = result([0.5, 0.5, 0.5, 0.5])
+    rate, n = agreement_stats(a, all_ties)
+    assert rate is None and n == 0        # unmeasured, not 0%

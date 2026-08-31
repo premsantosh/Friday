@@ -12,6 +12,7 @@ Qwen3 base, so the audit stays independent; FakeJudge keeps tests hermetic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 JUDGE_MODEL_SONNET = "claude-sonnet-5"
 JUDGE_MODEL_LOCAL = "llama3.1"
+
+# Bump when _RUBRIC changes; tests/test_judge_rubric.py pins the sha so the
+# text cannot drift silently. rubric_id() is recorded on every eval row.
+RUBRIC_VERSION = "r1"
+JUDGE_TEMPERATURE = 0.0
 
 _RUBRIC = """You are judging which of two assistant responses better serves this specific user.
 
@@ -42,6 +48,20 @@ Response B:
 Judge which response is better for THIS user: correctness on the user's known preferences first, then house style, then helpfulness. A response that ignores a known preference loses to one that honors it. Do not reward length.
 
 Answer with only a JSON object: {{"winner": "A" | "B" | "tie", "reason": "<one sentence>"}}"""
+
+
+def rubric_id() -> str:
+    """Version + content hash of the rubric, e.g. 'r1:3f9a02bc'."""
+    return f"{RUBRIC_VERSION}:{hashlib.sha256(_RUBRIC.encode()).hexdigest()[:8]}"
+
+
+def ollama_available(base_url: str = "http://localhost:11434", timeout: float = 3.0) -> bool:
+    """Cheap probe so the audit records blank (not fake zeros) when Ollama is down."""
+    import requests
+    try:
+        return requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=timeout).ok
+    except Exception:
+        return False
 
 
 @dataclass
@@ -97,6 +117,7 @@ class SonnetJudge:
             resp = self._client.messages.create(
                 model=self.model,
                 max_tokens=200,
+                temperature=JUDGE_TEMPERATURE,
                 thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": content}],
             )

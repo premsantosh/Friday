@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import comb
+from typing import Optional
 
 from research.evalset import EvalPrompt
 from research.judge import Judge, Verdict
@@ -32,6 +33,10 @@ class PairwiseResult:
     outcomes: list[PromptOutcome]
     arm_style: float             # deterministic style compliance of the arm's responses
     opponent_style: float
+    # Local-judge agreement audit (PROTOCOL.md): None = audit didn't run
+    # (Ollama down / no shared decisive pairs) — never imputed as 0.0.
+    local_agreement: Optional[float] = None
+    n_audited: int = 0
 
     @property
     def n_decisive(self) -> int:
@@ -125,6 +130,12 @@ def run_pairwise(
 
 def agreement_rate(a: PairwiseResult, b: PairwiseResult) -> float:
     """Fraction of shared decisive prompts where two judges' directions agree."""
+    return agreement_stats(a, b)[0] or 0.0
+
+
+def agreement_stats(a: PairwiseResult, b: PairwiseResult) -> tuple[Optional[float], int]:
+    """(direction-agreement rate, n shared decisive). Rate is None when there
+    are no shared decisive pairs — an unmeasured audit must not read as 0%."""
     scores_b = {o.prompt_id: o.score for o in b.outcomes}
     shared = [
         (o.score, scores_b[o.prompt_id])
@@ -132,5 +143,5 @@ def agreement_rate(a: PairwiseResult, b: PairwiseResult) -> float:
         if o.prompt_id in scores_b and o.score != 0.5 and scores_b[o.prompt_id] != 0.5
     ]
     if not shared:
-        return 0.0
-    return sum(1 for x, y in shared if (x > 0.5) == (y > 0.5)) / len(shared)
+        return None, 0
+    return sum(1 for x, y in shared if (x > 0.5) == (y > 0.5)) / len(shared), len(shared)

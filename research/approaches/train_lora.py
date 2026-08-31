@@ -155,9 +155,21 @@ def train_nightly(
     if code != 0:
         return f"FAILED: mlx_lm lora exit {code} (see {version_dir}/train.log)"
 
+    def _pkg_version(name: str) -> str:
+        try:
+            import importlib.metadata
+            return importlib.metadata.version(name)
+        except Exception:
+            return "unknown"
+
     params = {
         "base_model": BASE_MODEL, "seed": SEED, "learning_rate": LEARNING_RATE,
         "num_layers": NUM_LAYERS, "max_seq": MAX_SEQ, "iters": iters,
+        # mlx-lm's default rank, not passed explicitly on the command line;
+        # recorded so the artifact stays identifiable if the default changes.
+        "lora_rank": 8,
+        "mlx_version": _pkg_version("mlx"),
+        "mlx_lm_version": _pkg_version("mlx-lm"),
         "git_rev": git_rev(),
     }
     (version_dir / "config.json").write_text(
